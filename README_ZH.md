@@ -81,7 +81,8 @@ English | **[简体中文](./README_ZH.md)**
 - 实时流式日志（stdout + stderr），支持自动滚动
 - 查看 PID、端口状态、启动时间
 - 侧边栏拖拽排序
-- 从 GitHub 仓库地址一键安装 Agent
+- **CLI 自动识别**：检测本机已安装的 Claude Code / Codex / Qoder / Kimi / Copilot 等 CLI，一键导入为 Agent——Agents 页与首次引导均可
+- **从 GitHub 安装**：粘贴仓库地址克隆并自动填充配置；设置里可选填 GitHub Token，支持私有仓库与限流缓解
 
 ### 内嵌 Web UI
 
@@ -91,9 +92,14 @@ English | **[简体中文](./README_ZH.md)**
 
 - 多标签页同时打开多个 Agent UI，标签栏高度可拖拽
 - 一键全屏
-- 支持 WebSocket Token 自动填充（openclaw 类型 Agent）
+- 按 Agent 配置 UI Token，打开时自动以 `#token=…` 附到地址上
 
 TUI 类 Agent（Claude Code、Codex CLI 等）在内嵌交互式终端中打开。
+
+### 首次引导与应用内更新
+
+- 首次启动向导：导入识别到的 CLI → 配置提取模型 → 完成；可随时从设置重新打开
+- 内置更新检查（启动自动检查 + 侧边栏手动检查）
 
 ---
 
@@ -221,10 +227,19 @@ brew install cloudflared
 
 ### 📥 自动沉淀（Agent → 记忆）
 
-- 支持 **Codex、Claude Code、Qoder、WorkBuddy、MiniMax Code、Kimi**，Hook 采集或本地转录扫描两种方式
+- 支持 **Codex、Claude Code、Qoder、WorkBuddy、MiniMax Code、Kimi、GitHub Copilot、ZCode** 八个来源——前四个装 Hook 采集，八个都支持本地转录扫描
 - 会话先落盘本地 SQLite 账本再异步提取——离线、模型未配置都不丢采集记录，失败会话可手动重跑
 - 「待提取记忆」「已整理对话」面板随时回看完整对话、提取进度与失败原因（失败原因附带模型原始输出，便于诊断）
-- L1 清洗与去重：本地 BGE 语义候选 + LLM 裁决，带可回滚检查点
+- L1 清洗与去重（「记忆清洗」）：本地 BGE 语义候选 + LLM 裁决，带可回滚检查点
+- **从文件夹导入**：指定任意转录文件夹，直接提取其中的记忆
+
+### 🔎 搜索、重要度与记忆引擎
+
+- **语义搜索**：记忆中心内直接对所有 L1 记忆做语义 + 关键词混合检索
+- **重要度评分**：每条记忆有分数与证据（支撑会话数 / 来源 Agent 数 / 召回次数），可置顶钉住
+- **记忆引擎**：可选的本地语义服务，记忆中心可查看状态并按需启停
+- 任意记忆可就地编辑 / 删除，也可手动新增条目
+- 支持一键重置 L1 重新提取（需要干净重建时）
 
 ### ⏱️ L2/L3 定时重算
 
@@ -250,12 +265,15 @@ brew install cloudflared
 
 ### 📚 共享 Skill 库与技能市场
 
-- **Skill 库**：扫描各 Agent 的 `SKILL.md` 汇入共享库，按内容哈希预览新增 / 更新 / 冲突后确认同步；「发布 + 装备」一步完成，支持批量操作与各 Agent 版本漂移检测
+- **Skill 库**：扫描各 Agent 的 `SKILL.md` 汇入共享库，按内容哈希预览新增 / 更新 / 冲突后确认同步；「发布 + 装备」一步完成，支持批量操作、各 Agent 版本漂移检测、最近一次发布一键回滚，以及「采纳本地」把某个 Agent 的本地修改升为共享新版
 - **技能市场**：浏览并安装来自 **OpenAI / Anthropic 官方仓库**的精选技能——下载体量受限、每个相对路径都经过校验、下载的脚本绝不执行
 
 ### 📊 Token 用量统计
 
-聚合各 Agent 本机转录的真实输入 / 输出 / 缓存用量，口径与供应商计费对齐；附注入看板：按来源统计会话 / 每轮注入次数、指纹门控命中率与估算 token 成本。
+聚合各 Agent 本机转录的真实输入 / 输出 / 缓存用量，口径与供应商计费对齐——覆盖 Codex、Claude Code、Qoder、WorkBuddy、MiniMax Code、Kimi、GitHub Copilot、Gemini CLI、OpenCode、OpenClaw 等：
+
+- 汇总看板 + 逐会话用量明细 + 实时会话动态
+- 注入看板：按来源统计会话 / 每轮注入次数、指纹门控命中率与估算 token 成本
 
 ### ☁️ 云保险库 —— 跨设备同步（可选）
 
@@ -426,6 +444,17 @@ MCP 解析与记忆提取都依赖 LLM。在 **设置 → LLM 与记忆提取** 
 ```
 
 `input_tokens` 必须是该会话完整输入总量，`cached_tokens` 仅作缓存命中明细展示（不要再加进总量）；同一 `source + session_id` 后续重报覆盖先前值而非叠加。
+
+### 外部任务派发
+
+同一个本机服务还能向任何支持 HTTP 的 Agent 推送任务并收集结果——外部系统不碰界面也能驱动你的 Agent：
+
+| 端点 | 用途 |
+|------|------|
+| `POST /agent/dispatch` | 把任务转发到 Agent 的 HTTP 地址（异步，202） |
+| `POST /agent/submit` | Agent 回报执行结果 |
+| `GET /agent/tasks` | 查看在途任务（已派发 / 已提交 / 失败） |
+| `GET /agent/results` | 查看已收集的结果 |
 
 ---
 

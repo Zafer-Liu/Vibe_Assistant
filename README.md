@@ -77,7 +77,8 @@ Pick a project directory and Vibe Assistant detects the stack and fills in the s
 - Streaming stdout + stderr logs with auto-scroll
 - PID, port status, and uptime at a glance
 - Drag-to-reorder in the sidebar
-- Install Agents directly from a GitHub repository URL
+- **Auto-detected CLIs**: installed Claude Code / Codex / Qoder / Kimi / Copilot CLIs are detected and can be imported as Agents in one click — on the Agents page and in the first-run wizard
+- **Install from GitHub**: paste a repository URL to clone and prefill the config; an optional GitHub token (Settings) supports private repos and rate limits
 
 ### Embedded Web UI
 
@@ -87,9 +88,14 @@ Agents with a web interface (Streamlit, Flask, FastAPI, …) open inside the app
 
 - Multiple Agent UIs in tabbed views with a resizable tab bar
 - One-click fullscreen
-- Automatic WebSocket-token fill (openclaw-type Agents)
+- Per-Agent UI token, appended automatically (`#token=…`) for web UIs that accept one
 
 TUI Agents (Claude Code, Codex CLI, …) open in an embedded interactive terminal.
+
+### First-run onboarding & updates
+
+- A first-run wizard walks through importing detected CLIs and configuring the extraction model; it can be reopened anytime from Settings
+- Built-in update checker (auto-check on launch, manual check from the sidebar)
 
 ---
 
@@ -217,10 +223,19 @@ Every coding Agent you use remembers your preferences, decisions, and current wo
 
 ### 📥 Automatic capture (Agents → memory)
 
-- Supports **Codex, Claude Code, Qoder, WorkBuddy, MiniMax Code, Kimi** via hooks or local transcript scanning
+- Supports **Codex, Claude Code, Qoder, WorkBuddy, MiniMax Code, Kimi, GitHub Copilot, and ZCode** — via hooks (the first four) or local transcript scanning (all eight)
 - Sessions land in a local SQLite ledger first, extraction runs async — nothing is lost when offline or before a model is configured; failed sessions can be re-run manually
 - **Pending Memories** and **Organized Conversations** panels show full conversations, extraction progress, and failure reasons
-- L1 cleaning & dedup: local BGE semantic candidates + LLM arbitration, with rollback checkpoints
+- L1 cleaning & dedup ("dreaming"): local BGE semantic candidates + LLM arbitration, with rollback checkpoints
+- **Import from a folder**: point the app at any transcript folder and extract memories from it directly
+
+### 🔎 Search, ranking & the memory engine
+
+- **Semantic search** across all L1 memories (hybrid semantic + keyword) right in the Memory Center
+- **Importance ranking**: every memory gets a score with its evidence (supporting sessions, Agents, recall count); pin what matters
+- **Memory engine**: the optional local semantic sidecar (status visible in the Memory Center) can be started / stopped on demand
+- Inline edit / delete of any memory, plus manually added entries
+- Reset-all-for-re-extraction when you want a clean rebuild of L1
 
 ### ⏱️ Scheduled L2/L3 refresh
 
@@ -246,12 +261,15 @@ Hand-written entries under the working-memory or long-term cards — only you ca
 
 ### 📚 Shared Skill library & marketplace
 
-- **Skill library**: scans each Agent's `SKILL.md` files into a shared library; content-hash previews of adds / updates / conflicts before you confirm a sync; "publish + equip" in one step, with bulk operations and per-Agent version drift detection
+- **Skill library**: scans each Agent's `SKILL.md` files into a shared library; content-hash previews of adds / updates / conflicts before you confirm a sync; "publish + equip" in one step, with bulk operations, per-Agent version drift detection, one-click rollback of the latest publish, and "adopt local" to take an Agent's local edit as the new shared version
 - **Marketplace**: browse and install curated skills from the official **OpenAI** and **Anthropic** skill repositories — downloads are size-bounded, every relative path validated, and downloaded scripts are never executed
 
 ### 📊 Token usage analytics
 
-Aggregates real input / output / cache usage from local transcripts across Agents, aligned with how providers bill. Includes an injection dashboard: per-source session/prompt injection counts, fingerprint-gate hit rate, and estimated token cost.
+Aggregates real input / output / cache usage from local transcripts across Agents — coverage includes Codex, Claude Code, Qoder, WorkBuddy, MiniMax Code, Kimi, GitHub Copilot, Gemini CLI, OpenCode, OpenClaw, and more — aligned with how providers bill:
+
+- Summary dashboard plus per-session usage records and live session activity
+- Injection dashboard: per-source session/prompt injection counts, fingerprint-gate hit rate, and estimated token cost
 
 ### ☁️ Cloud Memory Vault (optional)
 
@@ -421,6 +439,17 @@ Standard endpoint: `POST http://127.0.0.1:<hook-port>/telemetry/events/{codex|wo
 ```
 
 `input_tokens` must be the session's full input total; `cached_tokens` is display-only detail (do not add it into totals). Re-submissions for the same `source + session_id` overwrite instead of accumulate.
+
+### External task dispatch
+
+The same local server can push tasks to any HTTP-capable Agent and collect results — external systems drive your Agents without touching the UI:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /agent/dispatch` | Send a task to an Agent's HTTP URL (async, 202) |
+| `POST /agent/submit` | An Agent reports its result back |
+| `GET /agent/tasks` | List in-flight tasks (dispatched / submitted / failed) |
+| `GET /agent/results` | Collected results |
 
 ---
 
