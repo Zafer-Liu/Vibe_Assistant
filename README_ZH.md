@@ -109,6 +109,8 @@ TUI 类 Agent（Claude Code、Codex CLI 等）在内嵌交互式终端中打开�
 
 本机 MCP 服务器的统一目录——管理一次，处处分发。
 
+![MCP 服务器中心](Images/mcpcenter.png)
+
 **本地服务器管理：**
 
 - **本地扫描**：自动检测 npm 全局安装的 MCP 包
@@ -180,7 +182,7 @@ brew install cloudflared
 
 ### Port Manager 端口管理
 
-![port](Images/port.png)
+![Port Manager](Images/portcenter.png)
 
 - 查看当前机器上所有正在监听的端口：端口号、协议、PID、进程名
 - 一键终止占用指定端口的进程——排查「端口被占用导致启动失败」的最快路径
@@ -188,6 +190,8 @@ brew install cloudflared
 <a id="网络管理"></a>
 
 ### 网络管理
+
+![网络管理](Images/Internetcenter.png)
 
 - **实时流量**：按网卡逐口的下载 / 上传速率，带滚动曲线图
 - **网卡列表**：IPv4 / IPv6 地址、MAC、MTU
@@ -197,6 +201,8 @@ brew install cloudflared
 <a id="环境变量"></a>
 
 ### 环境变量
+
+![环境变量](Images/environmentvariable.png)
 
 等价于 Windows「编辑系统环境变量」对话框，但不用碰注册表编辑器：
 
@@ -215,6 +221,8 @@ brew install cloudflared
 让每个编码 Agent 记住你的偏好、决策与当前进展，并让其他所有 Agent 从中受益。
 
 <img src="./Images/diagram-memory.png" alt="记忆分层流水线" width="100%" />
+
+![记忆中心](Images/memorycentre.png)
 
 ### 🧬 四层记忆模型（L0–L3）
 
@@ -265,10 +273,14 @@ brew install cloudflared
 
 ### 📚 共享 Skill 库与技能市场
 
+![Skill 库](Images/skillcenter.png)
+
 - **Skill 库**：扫描各 Agent 的 `SKILL.md` 汇入共享库，按内容哈希预览新增 / 更新 / 冲突后确认同步；「发布 + 装备」一步完成，支持批量操作、各 Agent 版本漂移检测、最近一次发布一键回滚，以及「采纳本地」把某个 Agent 的本地修改升为共享新版
 - **技能市场**：浏览并安装来自 **OpenAI / Anthropic 官方仓库**的精选技能——下载体量受限、每个相对路径都经过校验、下载的脚本绝不执行
 
 ### 📊 Token 用量统计
+
+![Token 用量统计](Images/tokencenter.png)
 
 聚合各 Agent 本机转录的真实输入 / 输出 / 缓存用量，口径与供应商计费对齐——覆盖 Codex、Claude Code、Qoder、WorkBuddy、MiniMax Code、Kimi、GitHub Copilot、Gemini CLI、OpenCode、OpenClaw 等：
 

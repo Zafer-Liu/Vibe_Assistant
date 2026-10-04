@@ -20,6 +20,7 @@ mod proxy;
 mod pty;
 mod skill_registry;
 mod skill_marketplace;
+mod startup;
 mod telemetry_store;
 mod thinking;
 mod ui_window;
@@ -46,6 +47,7 @@ use updater::*;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(startup::parse_options(std::env::args()))
         .manage(agent::AgentStore::new())
         .manage(pty::PtyStore::new())
         .manage(ui_window::UiWebviewStore::new())
@@ -308,6 +310,7 @@ pub fn run() {
             env_manager::env_vars_list,
             env_manager::env_var_set,
             env_manager::env_var_delete,
+            startup::get_startup_options,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -105,6 +105,8 @@ TUI Agents (Claude Code, Codex CLI, …) open in an embedded interactive termina
 
 A single catalog for MCP servers on your machine — manage them once, distribute everywhere.
 
+![MCP Server Center](Images/mcpcenter.png)
+
 **Local server management**
 
 - **Local scan**: auto-detects npm-global MCP packages
@@ -128,8 +130,6 @@ No fixed IP, no domain, no server needed. Two paths from localhost to the public
 <img src="./Images/en/diagram-share.png" alt="Sharing flow" width="100%" />
 
 ### 🔗 Temporary sharing (recommended for demos)
-
-![agency](Images/Agency.png)
 
 One click generates a temporary public link:
 
@@ -176,7 +176,7 @@ For fixed domains and continuous availability:
 
 ### Port Manager
 
-![port](Images/port.png)
+![Port Manager](Images/portcenter.png)
 
 - Every listening port with protocol, PID, and process name
 - Kill the process occupying a port in one click — the fastest way to diagnose "port already in use" startup failures
@@ -184,6 +184,8 @@ For fixed domains and continuous availability:
 <a id="network"></a>
 
 ### Network Manager
+
+![Network Manager](Images/Internetcenter.png)
 
 - **Live throughput** per network interface, with a rolling download/upload chart
 - **Interface list** with IPv4 / IPv6 addresses, MAC, and MTU
@@ -193,6 +195,8 @@ For fixed domains and continuous availability:
 <a id="env"></a>
 
 ### Environment Variables
+
+![Environment Variables](Images/environmentvariable.png)
 
 The equivalent of Windows' "Edit environment variables" dialog, without opening the registry editor:
 
@@ -211,6 +215,8 @@ The equivalent of Windows' "Edit environment variables" dialog, without opening 
 Every coding Agent you use remembers your preferences, decisions, and current work — and every other Agent benefits from it.
 
 <img src="./Images/en/diagram-memory.png" alt="Memory pipeline" width="100%" />
+
+![Memory Center](Images/memorycentre.png)
 
 ### The L0–L3 memory model
 
@@ -261,10 +267,14 @@ Hand-written entries under the working-memory or long-term cards — only you ca
 
 ### 📚 Shared Skill library & marketplace
 
+![Skill Library](Images/skillcenter.png)
+
 - **Skill library**: scans each Agent's `SKILL.md` files into a shared library; content-hash previews of adds / updates / conflicts before you confirm a sync; "publish + equip" in one step, with bulk operations, per-Agent version drift detection, one-click rollback of the latest publish, and "adopt local" to take an Agent's local edit as the new shared version
 - **Marketplace**: browse and install curated skills from the official **OpenAI** and **Anthropic** skill repositories — downloads are size-bounded, every relative path validated, and downloaded scripts are never executed
 
 ### 📊 Token usage analytics
+
+![Token usage](Images/tokencenter.png)
 
 Aggregates real input / output / cache usage from local transcripts across Agents — coverage includes Codex, Claude Code, Qoder, WorkBuddy, MiniMax Code, Kimi, GitHub Copilot, Gemini CLI, OpenCode, OpenClaw, and more — aligned with how providers bill:
 

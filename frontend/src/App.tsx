@@ -27,6 +27,7 @@ import { useDocumentVisible, useVisiblePolling } from './hooks/useVisiblePolling
 import { UpdateChecker } from './components/UpdateChecker'
 import { Onboarding, needsOnboarding } from './components/Onboarding'
 import { useTheme } from './theme'
+import { setLanguage } from './i18n'
 import type { AgentState } from './types/agent'
 import { useResizable } from './hooks/useResizable'
 import { NativeWebviewPanel, type OpenTab } from './components/NativeWebviewPanel'
@@ -110,6 +111,35 @@ export default function App() {
   const [appVersion, setAppVersion] = useState('1.0.0')
   useEffect(() => {
     invoke<string>('get_app_version').then(setAppVersion).catch(() => {})
+  }, [])
+
+  // 启动参数（--page/--lang/--start/--open-ui，用于脚本化截图与自动化）：
+  // 页面校验后才切换；--open-ui 配合 --start 时先等 Agent 端口就绪再打开。
+  useEffect(() => {
+    let cancelled = false
+    interface StartupOptions { page?: string; lang?: string; select_agent?: string; start_agent?: string; open_ui?: string }
+    invoke<StartupOptions>('get_startup_options').then(async opts => {
+      if (cancelled) return
+      if (opts.lang === 'zh' || opts.lang === 'en') setLanguage(opts.lang)
+      const NAV_PAGES = ['agents', 'ports', 'network', 'env-vars', 'proxy', 'settings', 'memory', 'skills', 'published-skills', 'skill-marketplace', 'mcp-library', 'usage', 'pending-memories', 'organized-conversations', 'memory-injection']
+      if (opts.page && NAV_PAGES.includes(opts.page)) setPage(opts.page as NavPage)
+      const autoId = opts.select_agent ?? opts.start_agent ?? opts.open_ui
+      if (!autoId) return
+      await useAgentStore.getState().fetchAgents().catch(() => {})
+      if (opts.select_agent) selectAgent(autoId)
+      try {
+        if (opts.start_agent) await startAgent(autoId)
+      } catch { /* 启动失败也让截图流程继续 */ }
+      if (opts.open_ui) {
+        // 等 Agent 端口监听后再开内嵌 UI，避免 Webview 落在错误页。
+        await new Promise(resolve => { setTimeout(resolve, opts.start_agent ? 3000 : 500) })
+        const store = useAgentStore.getState()
+        const agent = store.agents.find(a => a.config.id === autoId)
+        if (agent) store.fetchAgents().then(() => { if (!cancelled) openAgentUI(agent) }).catch(() => {})
+      }
+    }).catch(() => {})
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const selectedAgent = agents.find(a => a.config.id === selectedId) ?? null
@@ -266,7 +296,7 @@ export default function App() {
         </div>
 
         {/* Nav */}
-        <div className="flex min-h-0 shrink flex-col gap-0.5 overflow-y-auto p-2 border-b border-gray-200 dark:border-gray-800">
+        <div className="flex max-h-[45%] min-h-0 shrink flex-col gap-0.5 overflow-y-auto p-2 border-b border-gray-200 dark:border-gray-800">
           {/* 智能体 */}
           <button
             onClick={() => setPage('agents')}
