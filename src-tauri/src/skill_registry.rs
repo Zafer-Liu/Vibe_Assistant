@@ -1424,53 +1424,65 @@ fn write_safely(path: &Path, content: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod origin_tests {
     use super::*;
-    use std::path::Path;
+    use std::path::PathBuf;
+
+    /// 测试夹具按 Windows 风格书写（真实数据形态），在非 Windows 运行器
+    /// （CI 的 Linux/macOS）上重组为当前平台的分隔符——否则整串是单个
+    /// path 组件，组件级分类逻辑无从匹配。
+    fn fixture(windows_style: &str) -> PathBuf {
+        let rest = windows_style.trim_start_matches(r"C:\");
+        let mut path = PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" });
+        for part in rest.split('\\') {
+            path.push(part);
+        }
+        path
+    }
 
     #[test]
     fn classifies_builtin_plugin_local_marketplace() {
-        let wb_builtin = Path::new(
+        let wb_builtin = fixture(
             r"C:\u\.workbuddy\plugins\cache\workbuddy-builtin\tencent-docx\5.6.2-wb.1\skills\html-review\SKILL.md",
         );
-        assert_eq!(classify_origin("workbuddy", wb_builtin), "builtin");
+        assert_eq!(classify_origin("workbuddy", &wb_builtin), "builtin");
 
-        let wb_installed = Path::new(
+        let wb_installed = fixture(
             r"C:\u\.workbuddy\plugins\cache\codebuddy-plugins-official\foo\1.0.0\skills\bar\SKILL.md",
         );
-        assert_eq!(classify_origin("workbuddy", wb_installed), "plugin");
+        assert_eq!(classify_origin("workbuddy", &wb_installed), "plugin");
 
-        let qoder_builtin = Path::new(r"C:\u\.qoder\plugins\cache\qoder-bundler\p\1.0\skills\s\SKILL.md");
-        assert_eq!(classify_origin("qoder", qoder_builtin), "builtin");
+        let qoder_builtin = fixture(r"C:\u\.qoder\plugins\cache\qoder-bundler\p\1.0\skills\s\SKILL.md");
+        assert_eq!(classify_origin("qoder", &qoder_builtin), "builtin");
 
-        let minimax_builtin = Path::new(r"C:\u\.minimax\.builtin-skills\code-review\SKILL.md");
-        assert_eq!(classify_origin("minimax", minimax_builtin), "builtin");
+        let minimax_builtin = fixture(r"C:\u\.minimax\.builtin-skills\code-review\SKILL.md");
+        assert_eq!(classify_origin("minimax", &minimax_builtin), "builtin");
 
-        let minimax_plugin = Path::new(r"C:\u\.minimax\plugins\some-plugin\skills\s\SKILL.md");
-        assert_eq!(classify_origin("minimax", minimax_plugin), "plugin");
+        let minimax_plugin = fixture(r"C:\u\.minimax\plugins\some-plugin\skills\s\SKILL.md");
+        assert_eq!(classify_origin("minimax", &minimax_plugin), "plugin");
 
-        let local = Path::new(r"C:\u\.claude\skills\hyperframes\SKILL.md");
-        assert_eq!(classify_origin("claude", local), "local");
+        let local = fixture(r"C:\u\.claude\skills\hyperframes\SKILL.md");
+        assert_eq!(classify_origin("claude", &local), "local");
 
-        let market = Path::new(r"C:\tmp\download\docx\SKILL.md");
-        assert_eq!(classify_origin("market-anthropic", market), "marketplace");
+        let market = fixture(r"C:\tmp\download\docx\SKILL.md");
+        assert_eq!(classify_origin("market-anthropic", &market), "marketplace");
     }
 
     #[test]
     fn detects_version_artifacts_and_managed_dirs() {
-        let version_root = Path::new(
+        let version_root = fixture(
             r"C:\u\.workbuddy\plugins\cache\workbuddy-builtin\tencent-docx\5.6.2-wb.39298511.g37a65c0b.he233403f909a\SKILL.md",
         );
-        let name = plugin_version_artifact(version_root).expect("version root is an artifact");
+        let name = plugin_version_artifact(&version_root).expect("version root is an artifact");
         assert_eq!(name, "5-6-2-wb-39298511-g37a65c0b-he233403f909a");
 
-        let real_skill = Path::new(
+        let real_skill = fixture(
             r"C:\u\.workbuddy\plugins\cache\workbuddy-builtin\tencent-docx\5.6.2-wb.1\skills\html-review\SKILL.md",
         );
-        assert!(plugin_version_artifact(real_skill).is_none());
+        assert!(plugin_version_artifact(&real_skill).is_none());
 
-        let managed = Path::new(
+        let managed = fixture(
             r"C:\u\.kimi\plugins\managed\agent-manager-skills\skills\docx\SKILL.md",
         );
-        assert!(is_agent_manager_managed(managed));
-        assert!(!is_agent_manager_managed(real_skill));
+        assert!(is_agent_manager_managed(&managed));
+        assert!(!is_agent_manager_managed(&real_skill));
     }
 }
