@@ -1,7 +1,7 @@
-/** Agent Manager 内置本地语义索引类型定义 */
+/** Vibe Assistant 内置本地语义索引类型定义 */
 
 export interface MemoryConfig {
-  /** Agent Manager 私有本机 sidecar 地址（仅内部使用） */
+  /** Vibe Assistant 私有本机 sidecar 地址（仅内部使用） */
   baseUrl: string
   /** API Key（Bearer 认证） */
   apiKey: string
@@ -242,6 +242,17 @@ export interface McpAccessLog {
   success: boolean
 }
 
+/** Per-agent injection-cost rollup over the audit window. `prompt_skips` counts
+ *  turns whose rendered context fingerprint was unchanged and were therefore
+ *  not re-injected — the hit rate of the per-turn injection gate. */
+export interface MemoryInjectionStats {
+  client_name: string
+  session_injections: number
+  prompt_injections: number
+  prompt_skips: number
+  injected_chars: number
+}
+
 export interface TelemetrySummary {
   events: number
   sessions: number
@@ -271,6 +282,24 @@ export interface TelemetryUsageBucket {
   record_count: number
 }
 
+export interface TelemetryUsageHeatCell {
+  /** Local-time weekday returned by SQLite: 0 = Sunday, 6 = Saturday. */
+  weekday: number
+  hour: number
+  input_tokens: number
+  output_tokens: number
+  record_count: number
+}
+
+export interface TelemetryUsageCostGroup {
+  source: string
+  model: string | null
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  estimated_tokens: number
+}
+
 export interface TelemetryUsageAnalytics {
   record_count: number
   input_tokens: number
@@ -278,9 +307,13 @@ export interface TelemetryUsageAnalytics {
   cached_tokens: number
   /** Tokens from estimated origins (optional: older backends omit it). */
   estimated_tokens?: number
+  /** False 当所选范围只有估算/远端总量行（无缓存计数）；旧后端缺省视为 true。 */
+  cache_capable?: boolean
   records: TelemetryUsageRecord[]
   truncated_records: boolean
   buckets: TelemetryUsageBucket[]
+  heatmap?: TelemetryUsageHeatCell[]
+  cost_groups?: TelemetryUsageCostGroup[]
   sources: string[]
 }
 
@@ -344,6 +377,10 @@ export interface SkillItem {
   assigned_agents: string[]
   /** Skill 目录内打包发布的全部文件（相对路径，含 SKILL.md） */
   files?: string[]
+  /** 技能性质：builtin（厂商内置）/ plugin（插件市场安装）/ local（本地
+   *  自建或 Vibe Assistant 部署）/ marketplace（技能市场导入）。旧数据缺省
+   *  时按 local 处理。 */
+  origin?: 'builtin' | 'plugin' | 'local' | 'marketplace'
 }
 
 export interface SkillSyncPreview {
@@ -392,9 +429,45 @@ export interface SkillAdoptResult {
   skipped: string[]
 }
 
+export interface MarketplaceSkill {
+  id: string
+  source: 'openai' | 'anthropic'
+  source_label: string
+  name: string
+  description: string
+  repository_url: string
+  skill_url: string
+  revision: string
+  files: string[]
+}
+
+export interface MarketplaceCatalog {
+  items: MarketplaceSkill[]
+  fetched_at: string
+  from_cache: boolean
+  warning: string | null
+}
+
+export interface MarketplaceSkillPreview {
+  item: MarketplaceSkill
+  content: string
+}
+
 // ── MCP 库 ───────────────────────────────────────────────────────────────────
 
 /** MCP 库的一个条目：跨 Agent 复用的 MCP 服务器定义（name 即服务器 id）。 */
+/** Runtime projection of the central MCP catalog. */
+export interface McpServer {
+  name: string
+  command: string
+  args: string[]
+  env: Record<string, string>
+  transport?: string
+  url?: string
+  headers?: Record<string, string>
+  description?: string
+}
+
 export interface McpCatalogEntry {
   name: string
   description: string
@@ -423,4 +496,13 @@ export interface McpImportCandidate {
   agent: string
   entry: McpCatalogEntry
   already_in_catalog: boolean
+}
+
+/** MCP 配置档案：已命名的一组启用服务器名（引用中央目录条目）。 */
+export interface McpProfile {
+  name: string
+  description: string
+  servers: string[]
+  created_at: string
+  updated_at: string
 }

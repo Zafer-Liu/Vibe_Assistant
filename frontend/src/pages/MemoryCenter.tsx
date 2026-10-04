@@ -8,6 +8,8 @@ import {
   ChevronRight, Plus,
 } from 'lucide-react'
 import { useMemoryStore } from '../store/memoryStore'
+import { useVisiblePolling } from '../hooks/useVisiblePolling'
+import { ErrorRecovery } from '../components/ErrorRecovery'
 import type { ConsolidationResult, MemoryImportance, MemoryImportResult, MemoryItem, MemoryLayerDocument } from '../types/memory'
 import { normalizeL2Document } from '../lib/thinking'
 import { MemoryMarkdown } from '../components/MemoryMarkdown'
@@ -60,6 +62,7 @@ function InlineActionError({ text }: { text: string }) {
   return (
     <div role="alert" aria-live="assertive" className="mt-2 whitespace-pre-wrap break-words rounded-md border border-red-200 bg-red-50 px-2.5 py-2 text-xs leading-5 text-red-800 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-200">
       {text}
+      <ErrorRecovery error={text} />
     </div>
   )
 }
@@ -219,7 +222,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
     let mounted = true
     // Render a bounded loading state while the local ledger opens. Semantic
     // and MCP checks remain deferred so the first paint never waits on CLIs.
-    void Promise.allSettled([listMemories(), checkIngest(), checkTelemetry(), loadMemoryLayers()]).finally(() => {
+    void Promise.allSettled([listMemories(), loadMemoryLayers()]).finally(() => {
       if (mounted) setBooting(false)
     })
     void checkEngine().then((online) => { if (online) void listMemories(true) })
@@ -240,21 +243,26 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // L2/L3 后台自动重算：重算完成事件到达时刷新已挂载页的文档（开关与
+  // 间隔在设置页）。
   useEffect(() => {
-    // 页面隐藏（keep-mounted）时暂停轮询；重新进入先刷一次再起定时器。
-    if (!active) return
-    void checkIngest()
-    void checkTelemetry()
-    const timer = window.setInterval(() => {
-      void checkIngest()
-      void checkTelemetry()
-    }, 10_000)
-    return () => window.clearInterval(timer)
-  }, [checkIngest, checkTelemetry, active])
+    let unlisten: (() => void) | undefined
+    void listen('memory-layers-updated', () => { void loadMemoryLayers() })
+      .then((dispose) => { unlisten = dispose })
+      .catch(() => {})
+    return () => unlisten?.()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const refreshSummary = useCallback(() => Promise.allSettled([
+    checkIngest(), checkTelemetry(),
+  ]), [checkIngest, checkTelemetry])
+  useVisiblePolling(refreshSummary, 10_000, active)
 
   const flash = useCallback((kind: 'ok' | 'err', text: string) => {
-    setNotice({ kind, text })
-    setTimeout(() => setNotice(null), 3500)
+    const next = { kind, text }
+    setNotice(next)
+    if (kind === 'ok') setTimeout(() => setNotice(current => current === next ? null : current), 3500)
   }, [])
 
   // 以下 useCallback 是 hook，必须位于 `if (booting)` 提前 return 之前；
@@ -624,6 +632,14 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
             return <button key={label} type="button" onClick={handler} className={`group rounded-lg border border-gray-200 bg-white px-3 py-2 text-left transition focus:outline-none focus-visible:ring-2 dark:border-gray-700 dark:bg-gray-800 ${tone}`}><div className="flex items-center justify-between gap-2"><p className="text-xs text-gray-400">{label}</p><ChevronRight size={14} className={`text-gray-300 transition group-hover:translate-x-0.5 dark:text-gray-600 ${arrowTone}`} /></div><p className="mt-1 inline-flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400"><Loader2 className="animate-spin motion-reduce:animate-none" size={13} />{t('memory.overviewLoading')}</p></button>
           })}
         </section>
+      )}
+
+      {notice?.kind === 'err' && <ErrorRecovery error={notice.text} />}
+      {ingestStatus && !ingestStatus.model_ready && (
+        <div className="rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
+          <p>{t('memory.modelMissing')}</p>
+          <ErrorRecovery fallback="settings" />
+        </div>
       )}
 
       {/* 自动沉淀：Hook 安装、会话启动注入与数据目录已统一到「记忆注入」面板。 */}

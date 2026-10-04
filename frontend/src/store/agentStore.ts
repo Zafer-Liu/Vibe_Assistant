@@ -83,26 +83,13 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
     try {
       const raw = await invoke<AgentState[]>('list_agents')
       const current = get()
-      // 去重：如果数据没变化则跳过更新
-      const prevJson = JSON.stringify(current.agents.map(a => ({
-        status: a.status,
-        pid: a.pid,
-        port_open: a.port_open,
-        restart_count: a.restart_count,
-        last_exit_code: a.last_exit_code,
-      })))
-      const newJson = JSON.stringify(raw.map(a => ({
-        status: a.status,
-        pid: a.pid,
-        port_open: a.port_open,
-        restart_count: a.restart_count,
-        last_exit_code: a.last_exit_code,
-      })))
-      if (prevJson === newJson) {
-        set({ loading: false })
-        return // 数据没变化，跳过更新
-      }
+      // Compare the reconciled list, including configuration and IDs. Otherwise
+      // saving a corrected command/worktree can leave the UI on its old config.
       const reconciled = reconcileOrder(raw, current.order, current.agents)
+      if (JSON.stringify(current.agents) === JSON.stringify(reconciled.agents)) {
+        set({ loading: false })
+        return
+      }
       saveOrder(reconciled.order)
       set({ agents: reconciled.agents, order: reconciled.order, loading: false })
     } catch {
@@ -112,7 +99,7 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
 
   selectAgent: (id) => {
     set({ selectedId: id })
-    get().fetchLogs(id)
+    void get().fetchLogs(id).catch(() => {})
   },
 
   reorderAgents: (newOrder) => {

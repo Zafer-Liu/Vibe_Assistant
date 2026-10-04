@@ -4,27 +4,27 @@ mod agent_sources;
 mod backup;
 mod cloud_sync;
 mod commands;
+mod env_manager;
 mod github;
 mod llm;
 mod mcp;
-mod mcp_agent;
 mod mcp_registry;
 mod memory_backend;
 mod memory_ingest;
 mod memory_mcp;
+mod mobile_status;
+mod network_info;
 mod ports;
 mod process_util;
 mod proxy;
 mod pty;
 mod skill_registry;
-mod sweeper;
+mod skill_marketplace;
 mod telemetry_store;
 mod thinking;
 mod ui_window;
 mod updater;
-mod workflow;
-mod workflow_events;
-mod workflow_store;
+mod worktree;
 
 use agent_http::*;
 use commands::*;
@@ -42,7 +42,6 @@ use tauri::{Emitter, Manager};
 use telemetry_store::*;
 use ui_window::*;
 use updater::*;
-use workflow::*;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -51,7 +50,6 @@ pub fn run() {
         .manage(pty::PtyStore::new())
         .manage(ui_window::UiWebviewStore::new())
         .manage(proxy::TunnelStore::new())
-        .manage(workflow_store::WorkflowRunStore::new())
         .manage(memory_backend::MemoryBackend::new())
         .manage(memory_ingest::IngestStore::new())
         .manage(telemetry_store::TelemetryStore::new().expect("initialize telemetry store"))
@@ -76,9 +74,6 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 agent_http::start_agent_http_server(agent_http::AGENT_HTTP_PORT, store).await;
             });
-
-            // 阶段三 3c：启动 Sweeper 巡检
-            sweeper::start_sweeper(_app.handle().clone());
 
             // Memory extraction is optional.  Keep event collection local and
             // durable even when its external vector/graph services are absent;
@@ -112,16 +107,25 @@ pub fn run() {
             let ingest2 = ingest.clone();
             // 静默会话节流巡检
             memory_ingest::start_idle_flusher(shared, ingest2);
+            // L2/L3 后台自动重算：有新 L1 证据且到期时重建，注入文档不再
+            // 依赖手动进记忆中心点「整理」。
+            memory_ingest::start_l2_l3_refresh_scheduler(_app.handle().clone());
+            // 用量账本周期性重扫：常开应用也能持续采集新会话的 Token 用量。
+            telemetry_store::start_usage_refresh_scheduler(_app.handle().clone());
             // 云端记忆库定时同步（每分钟检查设置，无需重启）
             cloud_sync::start_cloud_sync_scheduler();
+            tauri::async_runtime::spawn(mobile_status::start_mobile_status_server());
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             list_agents,
+            detect_agent_clis,
+            import_detected_agent_clis,
             start_agent,
             stop_agent,
             get_agent_logs,
+            resolve_agent_cwd,
             save_agent_config,
             delete_agent,
             get_port_status,
@@ -146,13 +150,6 @@ pub fn run() {
             ollama_config_get,
             ollama_config_set,
             test_ollama_connection,
-            // Workflow
-            list_workflows,
-            save_workflow,
-            delete_workflow,
-            list_mcp_tools,
-            run_workflow,
-            run_workflow_stream,
             // Agent HTTP spike (phase 4)
             dispatch_agent_task,
             list_agent_tasks,
@@ -227,6 +224,8 @@ pub fn run() {
             memory_ingest::local_memory_add_user,
             memory_ingest::memory_layer_document_update,
             memory_ingest::memory_short_term_consolidate,
+            memory_ingest::memory_auto_refresh_get,
+            memory_ingest::memory_auto_refresh_set,
             memory_ingest::memory_long_term_profile_draft,
             memory_ingest::memory_long_term_profile_publish,
             memory_ingest::memory_long_term_profile_delete_draft,
@@ -238,6 +237,8 @@ pub fn run() {
             memory_mcp_status,
             memory_mcp_install,
             memory_mcp_uninstall,
+            claude_desktop_mcp_config_get,
+            claude_desktop_mcp_config_set,
             // Usage and event telemetry
             telemetry_summary,
             telemetry_refresh_usage,
@@ -247,6 +248,7 @@ pub fn run() {
             telemetry_usage_analytics,
             telemetry_search_conversations,
             memory_mcp_access_logs,
+            memory_injection_stats,
             memory_ingest::telemetry_backfill_conversations,
             // Shared Skill registry
             skill_scan,
@@ -265,15 +267,23 @@ pub fn run() {
             skill_published_drift,
             skill_adopt_local,
             skill_sync_apply_one,
+            skill_marketplace::skill_marketplace_list,
+            skill_marketplace::skill_marketplace_preview,
+            skill_marketplace::skill_marketplace_install,
             // MCP registry (MCP 库)
             mcp_registry::mcp_catalog_list,
+            mcp_registry::mcp_catalog_migration_report,
             mcp_registry::mcp_catalog_upsert,
+            mcp_registry::mcp_catalog_import,
             mcp_registry::mcp_catalog_delete,
             mcp_registry::mcp_equip,
             mcp_registry::mcp_unequip,
             mcp_registry::mcp_status_all,
             mcp_registry::mcp_import_from_agents,
             mcp_registry::mcp_sync_agent,
+            mcp_registry::mcp_profile_list,
+            mcp_registry::mcp_profile_save,
+            mcp_registry::mcp_profile_delete,
             // Backup & restore
             backup::config_export,
             backup::config_import,
@@ -286,6 +296,18 @@ pub fn run() {
             cloud_sync::cloud_vault_status,
             cloud_sync::cloud_vault_list_conflicts,
             cloud_sync::cloud_vault_resolve_conflict,
+            mobile_status::mobile_status_get_settings,
+            mobile_status::mobile_status_set_enabled,
+            mobile_status::mobile_status_rotate_token,
+            // Network manager (网卡 / IP / 实时网速)
+            network_info::network_interfaces,
+            network_info::network_throughput,
+            network_info::network_public_ip,
+            network_info::network_speed_test,
+            // Env manager (系统环境变量)
+            env_manager::env_vars_list,
+            env_manager::env_var_set,
+            env_manager::env_var_delete,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

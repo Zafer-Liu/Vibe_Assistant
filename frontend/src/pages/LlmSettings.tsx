@@ -1,9 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useId, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { invoke } from '@tauri-apps/api/core'
 import { Plus, Trash2, CheckCircle, XCircle, Loader2, Eye, EyeOff, AlertCircle, Brain } from 'lucide-react'
 
-interface LlmProvider {
+export interface LlmProvider {
   id: string
   name: string
   base_url: string
@@ -41,8 +41,17 @@ const EMPTY_CUSTOM: LlmProvider = {
   context_window: 128000, max_output_tokens: 16384,
 }
 
-export function LlmSettings({ embedded = false }: { embedded?: boolean }) {
+export function LlmSettings({ embedded = false, onBusyChange, onReadinessChange }: {
+  embedded?: boolean
+  onBusyChange?: (busy: boolean) => void
+  onReadinessChange?: (ready: boolean) => void
+}) {
   const { t } = useTranslation()
+  const [loading, setLoading] = useState(true)
+  const [loaded, setLoaded] = useState(false)
+  const [ollamaBusy, setOllamaBusy] = useState(false)
+  const [ollamaReady, setOllamaReady] = useState(false)
+  const [builtinReadiness, setBuiltinReadiness] = useState<Record<string, boolean>>({})
   const [providers, setProviders] = useState<LlmProvider[]>([])
   const [showCustomForm, setShowCustomForm] = useState(false)
   const [editingCustom, setEditingCustom] = useState<LlmProvider | null>(null)
@@ -50,12 +59,34 @@ export function LlmSettings({ embedded = false }: { embedded?: boolean }) {
   const [testing, setTesting] = useState<string | null>(null)
   const [testResult, setTestResult] = useState<Record<string, { ok: boolean; msg: string }>>({})
   const [saving, setSaving] = useState(false)
-  const [error, setError] = useState('')
+  const [errors, setErrors] = useState<Record<string, string>>({})
   const [showKeys, setShowKeys] = useState<Record<string, boolean>>({})
   const [memoryConfig, setMemoryConfig] = useState<MemoryExtractionConfig>({ provider_id: null })
   const [savingMemoryConfig, setSavingMemoryConfig] = useState(false)
+  const busy = loading || saving || savingMemoryConfig || testing !== null || ollamaBusy
+  const hasErrors = Object.values(errors).some(Boolean)
+  const ready = loaded && !hasErrors && !showCustomForm && ollamaReady
+    && providers.filter(p => !p.is_custom).every(p => builtinReadiness[p.id] !== false)
 
-  async function load() {
+  const setError = useCallback((scope: string, message: string) => {
+    setErrors(previous => previous[scope] === message ? previous : { ...previous, [scope]: message })
+  }, [])
+
+  // Stable callbacks and no-op updates avoid card effect/render feedback loops.
+  const onBuiltinReadinessChange = useCallback((id: string, value: boolean) => {
+    setBuiltinReadiness(previous => previous[id] === value ? previous : { ...previous, [id]: value })
+  }, [])
+  const discardBuiltinError = useCallback((id: string) => setError(`provider:${id}`, ''), [setError])
+
+  useEffect(() => {
+    onBusyChange?.(busy)
+    return () => onBusyChange?.(false)
+  }, [busy, onBusyChange])
+
+  useEffect(() => { onReadinessChange?.(ready) }, [ready, onReadinessChange])
+
+  const load = useCallback(async () => {
+    setLoading(true)
     try {
       const [list, config] = await Promise.all([
         invoke<LlmProvider[]>('list_llm_providers'),
@@ -63,16 +94,39 @@ export function LlmSettings({ embedded = false }: { embedded?: boolean }) {
       ])
       setProviders(list)
       setMemoryConfig(config)
+      setLoaded(true)
+      setError('load', '')
     } catch (e) {
-      setError(String(e))
+      setError('load', String(e))
+      throw e
+    } finally {
+      setLoading(false)
     }
+  }, [setError])
+
+  useEffect(() => { void load().catch(() => { /* load already reports the error */ }) }, [load])
+
+  async function refresh() {
+    try {
+      await load()
+      // Explicitly reconcile failed operations with storage, retaining all drafts.
+      setErrors({})
+    } catch { /* load already reports the error */ }
   }
 
-  useEffect(() => { load() }, [])
-
-  async function saveBuiltin(p: LlmProvider) {
-    await invoke('save_llm_provider', { provider: p })
-    await load()
+  async function saveBuiltin(p: LlmProvider): Promise<boolean> {
+    setSaving(true)
+    try {
+      await invoke('save_llm_provider', { provider: p })
+      await load()
+      setError(`provider:${p.id}`, '')
+      return true
+    } catch (e) {
+      setError(`provider:${p.id}`, String(e))
+      return false
+    } finally {
+      setSaving(false)
+    }
   }
 
   async function testProvider(p: LlmProvider) {
@@ -88,41 +142,54 @@ export function LlmSettings({ embedded = false }: { embedded?: boolean }) {
   }
 
   async function saveCustom() {
-    if (!form.name.trim()) { setError(t('llm.nameRequired')); return }
-    if (!form.base_url.trim()) { setError(t('llm.baseUrlRequired')); return }
-    if (!form.model.trim()) { setError(t('llm.modelRequired')); return }
-    if (!form.api_key.trim()) { setError(t('llm.apiKeyRequired')); return }
+    if (!form.name.trim()) { setError('custom', t('llm.nameRequired')); return }
+    if (!form.base_url.trim()) { setError('custom', t('llm.baseUrlRequired')); return }
+    if (!form.model.trim()) { setError('custom', t('llm.modelRequired')); return }
+    if (!form.api_key.trim()) { setError('custom', t('llm.apiKeyRequired')); return }
 
-    const id = editingCustom?.id || `custom_${form.name.toLowerCase().replace(/\s+/g, '_')}_${Date.now()}`
+    const id = editingCustom?.id || form.id || `custom_${form.name.toLowerCase().replace(/\s+/g, '_')}_${Date.now()}`
+    // Retain the id if the write succeeds but the following reload fails.
+    setForm(f => ({ ...f, id }))
     setSaving(true)
-    setError('')
     try {
       await invoke('save_llm_provider', { provider: { ...form, id, is_custom: true } })
       await load()
+      setError('custom', '')
       setShowCustomForm(false)
       setEditingCustom(null)
       setForm({ ...EMPTY_CUSTOM })
     } catch (e) {
-      setError(String(e))
+      setError('custom', String(e))
     } finally {
       setSaving(false)
     }
   }
 
   async function deleteCustom(id: string) {
-    await invoke('delete_llm_provider', { id })
-    await load()
+    setSaving(true)
+    try {
+      await invoke('delete_llm_provider', { id })
+      if (memoryConfig.provider_id === id) {
+        await invoke('memory_extraction_config_set', { config: { provider_id: null } })
+      }
+      await load()
+      setError(`provider:${id}`, '')
+    } catch (e) {
+      setError(`provider:${id}`, String(e))
+    } finally {
+      setSaving(false)
+    }
   }
 
   async function saveMemoryConfig(providerId: string) {
     setSavingMemoryConfig(true)
-    setError('')
     try {
       const config = { provider_id: providerId || null }
       await invoke('memory_extraction_config_set', { config })
       setMemoryConfig(config)
+      setError('memory', '')
     } catch (e) {
-      setError(String(e))
+      setError('memory', String(e))
     } finally {
       setSavingMemoryConfig(false)
     }
@@ -132,7 +199,7 @@ export function LlmSettings({ embedded = false }: { embedded?: boolean }) {
   const customs = providers.filter(p => p.is_custom)
 
   return (
-    <div className={embedded ? 'space-y-3' : 'flex h-full flex-col overflow-y-auto bg-gray-50 p-6 space-y-6 dark:bg-gray-950'}>
+    <fieldset disabled={busy} className={embedded ? 'min-w-0 space-y-3' : 'flex h-full min-w-0 flex-col overflow-y-auto bg-gray-50 p-6 space-y-6 dark:bg-gray-950'}>
       {!embedded && <div>
         <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">{t('llm.title')}</h2>
         <p className="text-xs text-gray-500 mt-0.5">{t('llm.subtitle')}</p>
@@ -142,7 +209,7 @@ export function LlmSettings({ embedded = false }: { embedded?: boolean }) {
         <div className="flex items-center gap-2"><Brain size={15} className="text-violet-600 dark:text-violet-400" /><h3 className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('llm.memoryModelTitle')}</h3></div>
         <p className="text-xs leading-5 text-gray-600 dark:text-gray-300">{t('llm.memoryModelHint')}</p>
         <div className="flex flex-wrap items-center gap-2">
-          <select value={memoryConfig.provider_id ?? ''} onChange={(event) => { void saveMemoryConfig(event.target.value) }} disabled={savingMemoryConfig} className="min-w-60 rounded-md border border-gray-300 bg-white px-2.5 py-1.5 text-sm text-gray-800 outline-none focus:border-violet-500 disabled:opacity-50 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100">
+          <select aria-label={t('llm.memoryModelTitle')} value={memoryConfig.provider_id ?? ''} onChange={(event) => { void saveMemoryConfig(event.target.value) }} disabled={savingMemoryConfig} className="min-w-60 rounded-md border border-gray-300 bg-white px-2.5 py-1.5 text-sm text-gray-800 outline-none focus:border-violet-500 disabled:opacity-50 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100">
             <option value="">{t('llm.memoryModelNone')}</option>
             {providers.filter((provider) => provider.enabled && provider.api_key.trim()).map((provider) => <option key={provider.id} value={provider.id}>{provider.name} · {provider.model}</option>)}
           </select>
@@ -151,9 +218,13 @@ export function LlmSettings({ embedded = false }: { embedded?: boolean }) {
         </div>
       </section>
 
-      {error && (
-        <div className="flex items-center gap-2 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-600 dark:bg-red-900/20 dark:text-red-400">
-          <AlertCircle className="h-3.5 w-3.5 shrink-0" />{error}
+      {hasErrors && (
+        <div role="alert" className="flex items-center gap-2 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-600 dark:bg-red-900/20 dark:text-red-400">
+          <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+          <div className="min-w-0 flex-1 break-words">
+            {Object.entries(errors).filter(([, message]) => message).map(([scope, message]) => <p key={scope}>{message}</p>)}
+          </div>
+          <button onClick={() => { void refresh() }} className="shrink-0 underline">{t('common.refresh')}</button>
         </div>
       )}
 
@@ -170,20 +241,24 @@ export function LlmSettings({ embedded = false }: { embedded?: boolean }) {
             testing={testing === p.id}
             onSave={saveBuiltin}
             onTest={testProvider}
+            saveFailed={!!errors[`provider:${p.id}`]}
+            onDiscard={discardBuiltinError}
+            onReadinessChange={onBuiltinReadinessChange}
           />
         ))}
       </div>
 
       {/* Ollama local models */}
-      <OllamaPanel providers={providers} onChanged={load} />
+      <OllamaPanel providers={providers} onChanged={load} onBusyChange={setOllamaBusy} onReadinessChange={setOllamaReady} />
 
       {/* Custom providers */}
       <div className="space-y-3">
         <div className="flex items-center justify-between">
           <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500">{t('llm.custom')}</h3>
           <button
-            onClick={() => { setForm({ ...EMPTY_CUSTOM }); setEditingCustom(null); setShowCustomForm(true); setError('') }}
-            className="flex items-center gap-1 text-xs text-blue-600 hover:text-blue-500"
+            onClick={() => { setForm({ ...EMPTY_CUSTOM }); setEditingCustom(null); setShowCustomForm(true) }}
+            disabled={showCustomForm}
+            className="flex items-center gap-1 text-xs text-blue-600 hover:text-blue-500 disabled:opacity-50"
           >
             <Plus className="h-3.5 w-3.5" /> {t('llm.add')}
           </button>
@@ -205,13 +280,16 @@ export function LlmSettings({ embedded = false }: { embedded?: boolean }) {
                   {testing === p.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : t('llm.test')}
                 </button>
                 <button
-                  onClick={() => { setForm({ ...p }); setEditingCustom(p); setShowCustomForm(true); setError('') }}
-                  className="text-xs text-gray-500 hover:text-gray-700"
+                  onClick={() => { setForm({ ...p }); setEditingCustom(p); setShowCustomForm(true) }}
+                  disabled={showCustomForm}
+                  className="text-xs text-gray-500 hover:text-gray-700 disabled:opacity-50"
                 >{t('llm.edit')}</button>
-                <button onClick={() => deleteCustom(p.id)} className="text-gray-400 hover:text-red-500">
+                <button onClick={() => deleteCustom(p.id)} disabled={showCustomForm && (editingCustom?.id ?? form.id) === p.id}
+                  aria-label={`${t('common.delete')} ${p.name}`} className="text-gray-400 hover:text-red-500 disabled:opacity-50">
                   <Trash2 className="h-3.5 w-3.5" />
                 </button>
                 <EnableToggle
+                  name={p.name}
                   enabled={p.enabled}
                   onChange={v => saveBuiltin({ ...p, enabled: v })}
                 />
@@ -234,33 +312,35 @@ export function LlmSettings({ embedded = false }: { embedded?: boolean }) {
           </h4>
           <div className="grid grid-cols-2 gap-3">
             <Field label={t('llm.displayName')}>
-              <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
-                placeholder={t('llm.displayNamePlaceholder')} className="field-input" />
+              {id => <input id={id} value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
+                placeholder={t('llm.displayNamePlaceholder')} className="field-input" />}
             </Field>
             <Field label={t('llm.modelId')}>
-              <input value={form.model} onChange={e => setForm(f => ({ ...f, model: e.target.value }))}
-                placeholder={t('llm.modelIdPlaceholder')} className="field-input font-mono" />
+              {id => <input id={id} value={form.model} onChange={e => setForm(f => ({ ...f, model: e.target.value }))}
+                placeholder={t('llm.modelIdPlaceholder')} className="field-input font-mono" />}
             </Field>
           </div>
           <Field label={t('llm.baseUrl')}>
-            <input value={form.base_url} onChange={e => setForm(f => ({ ...f, base_url: e.target.value }))}
-              placeholder="https://api.deepseek.com" className="field-input font-mono" />
+            {id => <input id={id} value={form.base_url} onChange={e => setForm(f => ({ ...f, base_url: e.target.value }))}
+              placeholder="https://api.deepseek.com" className="field-input font-mono" />}
           </Field>
           <Field label={t('llm.apiKey')}>
-            <input type="password" value={form.api_key} onChange={e => setForm(f => ({ ...f, api_key: e.target.value }))}
-              placeholder="sk-..." className="field-input font-mono" />
+            {id => <input id={id} type="password" value={form.api_key} onChange={e => setForm(f => ({ ...f, api_key: e.target.value }))}
+              placeholder="sk-..." className="field-input font-mono" />}
           </Field>
           <div className="grid grid-cols-2 gap-3">
             <Field label={t('llm.contextWindow')}>
-              <input type="number" min={1024} step={1024} value={form.context_window ?? ''}
+              {id => <input id={id} type="number" min={1024} step={1024} value={form.context_window ?? ''}
                 onChange={e => setForm(f => ({ ...f, context_window: e.target.value ? Number(e.target.value) : undefined }))}
-                placeholder="128000" className="field-input font-mono" />
+                placeholder="128000" className="field-input font-mono" />}
             </Field>
             <Field label={t('llm.maxOutputTokens')}>
-              <input type="number" min={256} step={256} value={form.max_output_tokens ?? ''}
-                onChange={e => setForm(f => ({ ...f, max_output_tokens: e.target.value ? Number(e.target.value) : undefined }))}
-                placeholder="8192" className="field-input font-mono" />
-              <p className="mt-1 text-[11px] leading-4 text-gray-500 dark:text-gray-400">{t('llm.maxOutputTokensHint')}</p>
+              {id => <>
+                <input id={id} type="number" min={256} step={256} value={form.max_output_tokens ?? ''}
+                  onChange={e => setForm(f => ({ ...f, max_output_tokens: e.target.value ? Number(e.target.value) : undefined }))}
+                  placeholder="8192" className="field-input font-mono" />
+                <p className="mt-1 text-[11px] leading-4 text-gray-500 dark:text-gray-400">{t('llm.maxOutputTokensHint')}</p>
+              </>}
             </Field>
           </div>
           <div className="flex gap-2">
@@ -273,32 +353,41 @@ export function LlmSettings({ embedded = false }: { embedded?: boolean }) {
               className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-400">
               {t('llm.testConnection')}
             </button>
-            <button onClick={() => { setShowCustomForm(false); setError('') }}
+            <button onClick={() => { setShowCustomForm(false); setEditingCustom(null); setForm({ ...EMPTY_CUSTOM }); setError('custom', '') }}
               className="rounded-lg px-3 py-1.5 text-xs text-gray-500 hover:bg-gray-100">{t('llm.cancel')}</button>
           </div>
         </div>
       )}
-    </div>
+    </fieldset>
   )
 }
 
-function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSave, onTest }: {
+function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSave, onTest, saveFailed, onDiscard, onReadinessChange }: {
   provider: LlmProvider
   showKey: boolean
   onToggleKey: () => void
   testResult?: { ok: boolean; msg: string }
   testing: boolean
-  onSave: (p: LlmProvider) => void
+  onSave: (p: LlmProvider) => Promise<boolean>
   onTest: (p: LlmProvider) => void
+  saveFailed: boolean
+  onDiscard: (id: string) => void
+  onReadinessChange: (id: string, ready: boolean) => void
 }) {
   const { t } = useTranslation()
-  const [key, setKey] = useState(provider.api_key)
-  const [model, setModel] = useState(provider.model)
+  // Only this card's successful save or explicit cancel drops its draft.
+  // Reloading another provider must not replace these inputs.
+  const [draft, setDraft] = useState<Pick<LlmProvider, 'api_key' | 'model'> | null>(null)
+  const key = draft?.api_key ?? provider.api_key
+  const model = draft?.model ?? provider.model
+  const dirty = key !== provider.api_key || model !== provider.model
 
-  useEffect(() => { setKey(provider.api_key); setModel(provider.model) }, [provider])
+  useEffect(() => {
+    onReadinessChange(provider.id, !dirty)
+  }, [provider.id, dirty, onReadinessChange])
 
-  function save() {
-    onSave({ ...provider, api_key: key, model, enabled: !!key })
+  async function save() {
+    if (await onSave({ ...provider, api_key: key, model, enabled: !!key })) setDraft(null)
   }
 
   return (
@@ -310,27 +399,29 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
             <span className="rounded-full bg-green-100 px-2 py-0.5 text-xs text-green-700 dark:bg-green-900/30 dark:text-green-400">{t('llm.active')}</span>
           )}
         </div>
-        <EnableToggle enabled={provider.enabled} onChange={v => onSave({ ...provider, enabled: v })} />
+        <EnableToggle name={provider.name} enabled={provider.enabled} onChange={v => onSave({ ...provider, enabled: v })} />
       </div>
 
       <div className="grid grid-cols-2 gap-3">
         <Field label={t('llm.model')}>
-          <input value={model} onChange={e => setModel(e.target.value)}
-            className="field-input font-mono text-xs" placeholder={provider.model} />
+          {id => <input id={id} value={model} onChange={e => setDraft({ api_key: key, model: e.target.value })}
+            className="field-input font-mono text-xs" placeholder={provider.model} />}
         </Field>
         <Field label={t('llm.apiKey')}>
-          <div className="relative">
+          {id => <div className="relative">
             <input
+              id={id}
               type={showKey ? 'text' : 'password'}
               value={key}
-              onChange={e => setKey(e.target.value)}
+              onChange={e => setDraft({ api_key: e.target.value, model })}
               placeholder="sk-..."
               className="field-input font-mono text-xs pr-8"
             />
-            <button onClick={onToggleKey} className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
+            <button onClick={onToggleKey} aria-label={`${t(showKey ? 'agentForm.hide' : 'agentForm.show')} ${t('llm.apiKey')} · ${provider.name}`}
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
               {showKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
             </button>
-          </div>
+          </div>}
         </Field>
       </div>
 
@@ -345,36 +436,86 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
           className="flex items-center gap-1 rounded-lg border border-gray-200 px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-50 disabled:opacity-40 dark:border-gray-700 dark:text-gray-400">
           {testing ? <Loader2 className="h-3 w-3 animate-spin" /> : null} {t('llm.test')}
         </button>
+        {(dirty || saveFailed) && <button onClick={() => { setDraft(null); onDiscard(provider.id) }}
+          className="rounded-lg px-3 py-1.5 text-xs text-gray-500 hover:bg-gray-100">{t('llm.cancel')}</button>}
       </div>
     </div>
   )
 }
 
-function OllamaPanel({ providers, onChanged }: { providers: LlmProvider[]; onChanged: () => Promise<void> }) {
+function OllamaPanel({ providers, onChanged, onBusyChange, onReadinessChange }: {
+  providers: LlmProvider[]
+  onChanged: () => Promise<void>
+  onBusyChange: (busy: boolean) => void
+  onReadinessChange: (ready: boolean) => void
+}) {
   const { t } = useTranslation()
-  const [baseUrl, setBaseUrl] = useState('http://localhost:11434')
-  const [loaded, setLoaded] = useState(false)
+  const [savedBaseUrl, setSavedBaseUrl] = useState<string | null>(null)
+  const [draftBaseUrl, setDraftBaseUrl] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
+  const [saveError, setSaveError] = useState('')
+  const [addErrors, setAddErrors] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
   const [adding, setAdding] = useState<string | null>(null)
   const [result, setResult] = useState<{ ok: boolean; msg: string } | null>(null)
   const [report, setReport] = useState<OllamaTestResult | null>(null)
+  const baseUrl = draftBaseUrl ?? savedBaseUrl ?? 'http://localhost:11434'
+  const dirty = draftBaseUrl !== null && draftBaseUrl !== savedBaseUrl
+  const hasAddErrors = Object.values(addErrors).some(Boolean)
+  const ready = savedBaseUrl !== null && !dirty && !loadError && !saveError && !hasAddErrors
+  const busy = loading || saving || testing || adding !== null
 
   useEffect(() => {
-    invoke<OllamaConfig>('ollama_config_get')
-      .then(cfg => setBaseUrl(cfg.base_url))
-      .catch(() => { /* keep the default URL when config is unavailable */ })
-      .finally(() => setLoaded(true))
+    onBusyChange(busy)
+    return () => onBusyChange(false)
+  }, [busy, onBusyChange])
+
+  useEffect(() => { onReadinessChange(ready) }, [ready, onReadinessChange])
+
+  const loadConfig = useCallback(async () => {
+    setLoading(true)
+    setReport(null)
+    setResult(null)
+    try {
+      const config = await invoke<OllamaConfig>('ollama_config_get')
+      setSavedBaseUrl(config.base_url)
+      setLoadError('')
+      return true
+    } catch (e) {
+      setLoadError(String(e))
+      return false
+    } finally {
+      setLoading(false)
+    }
   }, [])
 
+  useEffect(() => { void loadConfig() }, [loadConfig])
+
   const normalizedBase = baseUrl.trim().replace(/\/+$/, '')
+
+  async function refresh() {
+    const configLoaded = await loadConfig()
+    try {
+      await onChanged()
+      setAddErrors({})
+      if (configLoaded) setSaveError('')
+    } catch (e) {
+      setAddErrors(previous => ({ ...previous, refresh: String(e) }))
+    }
+  }
 
   async function saveConfig() {
     setSaving(true)
     try {
       await invoke('ollama_config_set', { config: { base_url: baseUrl.trim() } })
+      if (await loadConfig()) {
+        setDraftBaseUrl(null)
+        setSaveError('')
+      }
     } catch (e) {
-      setResult({ ok: false, msg: String(e) })
+      setSaveError(String(e))
     } finally {
       setSaving(false)
     }
@@ -396,31 +537,41 @@ function OllamaPanel({ providers, onChanged }: { providers: LlmProvider[]; onCha
     }
   }
 
+  function matchesModel(provider: LlmProvider, model: OllamaModelInfo) {
+    return provider.is_custom && provider.base_url.trim().replace(/\/+$/, '') === `${normalizedBase}/v1` && provider.model === model.name
+  }
+
   function isAdded(model: OllamaModelInfo) {
-    return providers.some(p => p.is_custom && p.base_url.replace(/\/+$/, '') === `${normalizedBase}/v1` && p.model === model.name)
+    return providers.some(p => matchesModel(p, model))
   }
 
   async function addAsProvider(model: OllamaModelInfo) {
+    const scope = JSON.stringify([normalizedBase, model.name])
     setAdding(model.name)
     try {
-      // Ollama's OpenAI-compatible endpoint ignores Authorization; the
-      // placeholder key only satisfies the provider validation rules.
-      const provider: LlmProvider = {
-        id: `ollama_${model.name.toLowerCase().replace(/[^a-z0-9]+/g, '_')}`,
-        name: `Ollama · ${model.name}`,
-        base_url: `${normalizedBase}/v1`,
-        model: model.name,
-        api_key: 'ollama',
-        is_custom: true,
-        enabled: true,
-        context_window: 32768,
-        max_output_tokens: 8192,
+      // Check storage again on retries: a previous write may have succeeded
+      // even if the subsequent reload failed. Keep existing (including old) ids.
+      const current = await invoke<LlmProvider[]>('list_llm_providers')
+      if (!current.some(p => matchesModel(p, model))) {
+        // Ollama ignores Authorization; the key satisfies provider validation.
+        const provider: LlmProvider = {
+          id: `ollama_${crypto.randomUUID()}`,
+          name: `Ollama · ${model.name}`,
+          base_url: `${normalizedBase}/v1`,
+          model: model.name,
+          api_key: 'ollama',
+          is_custom: true,
+          enabled: true,
+          context_window: 32768,
+          max_output_tokens: 8192,
+        }
+        await invoke('save_llm_provider', { provider })
       }
-      await invoke('save_llm_provider', { provider })
       await onChanged()
+      setAddErrors(previous => ({ ...previous, [scope]: '' }))
       setResult({ ok: true, msg: `${model.name} — ${t('llm.ollamaAddedHint')}` })
     } catch (e) {
-      setResult({ ok: false, msg: String(e) })
+      setAddErrors(previous => ({ ...previous, [scope]: String(e) }))
     } finally {
       setAdding(null)
     }
@@ -430,23 +581,31 @@ function OllamaPanel({ providers, onChanged }: { providers: LlmProvider[]; onCha
     <div className="space-y-3">
       <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500">{t('llm.ollamaTitle')}</h3>
       <div className="rounded-lg border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-900 space-y-3">
-        <div className="flex items-end gap-2">
-          <div className="flex-1">
-            <label className="mb-1 block text-xs font-medium text-gray-500 dark:text-gray-400">{t('llm.ollamaBaseUrl')}</label>
-            <input value={baseUrl} onChange={e => setBaseUrl(e.target.value)}
-              placeholder="http://localhost:11434" disabled={!loaded}
-              className="field-input font-mono text-xs" />
-          </div>
-          <button onClick={saveConfig} disabled={saving || !loaded}
+        <div className="flex flex-wrap items-end gap-2">
+          <Field label={t('llm.ollamaBaseUrl')} className="flex-1">
+            {id => <input id={id} value={baseUrl} onChange={e => { setDraftBaseUrl(e.target.value); setReport(null); setResult(null) }}
+              placeholder="http://localhost:11434" disabled={loading}
+              className="field-input font-mono text-xs" />}
+          </Field>
+          <button onClick={saveConfig} disabled={saving || loading}
             className="flex items-center gap-1 rounded-lg border border-gray-200 px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-700 dark:text-gray-400">
             {saving && <Loader2 className="h-3 w-3 animate-spin" />} {t('llm.save')}
           </button>
-          <button onClick={testConnection} disabled={testing || !loaded}
+          <button onClick={testConnection} disabled={testing || loading}
             className="flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-500 disabled:opacity-60">
             {testing && <Loader2 className="h-3 w-3 animate-spin" />} {t('llm.testConnection')}
           </button>
+          {(dirty || saveError) && savedBaseUrl !== null && <button
+            onClick={() => { setDraftBaseUrl(null); setSaveError(''); setReport(null); setResult(null) }}
+            className="rounded-lg px-3 py-1.5 text-xs text-gray-500 hover:bg-gray-100">{t('llm.cancel')}</button>}
         </div>
 
+        {(loadError || saveError || hasAddErrors) && <div role="alert" className="space-y-2">
+          {loadError && <TestBadge result={{ ok: false, msg: loadError }} />}
+          {saveError && <TestBadge result={{ ok: false, msg: saveError }} />}
+          {Object.entries(addErrors).filter(([, message]) => message).map(([scope, message]) => <TestBadge key={scope} result={{ ok: false, msg: message }} />)}
+          <button onClick={() => { void refresh() }} className="text-xs text-blue-600 underline">{t('common.refresh')}</button>
+        </div>}
         {result && <TestBadge result={result} />}
 
         {report && report.models.length > 0 && (
@@ -497,9 +656,13 @@ function TestBadge({ result }: { result: { ok: boolean; msg: string } }) {
   )
 }
 
-function EnableToggle({ enabled, onChange }: { enabled: boolean; onChange: (v: boolean) => void }) {
+function EnableToggle({ name, enabled, onChange }: { name: string; enabled: boolean; onChange: (v: boolean) => void }) {
+  const { t } = useTranslation()
   return (
     <button
+      role="switch"
+      aria-checked={enabled}
+      aria-label={`${name} · ${t('llm.active')}`}
       onClick={() => onChange(!enabled)}
       // overflow-hidden keeps the thumb clipped inside the rounded track
       // throughout the slide animation; left-0.5 pins the resting position
@@ -511,11 +674,12 @@ function EnableToggle({ enabled, onChange }: { enabled: boolean; onChange: (v: b
   )
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({ label, children, className }: { label: string; children: (id: string) => React.ReactNode; className?: string }) {
+  const id = useId()
   return (
-    <div>
-      <label className="mb-1 block text-xs font-medium text-gray-500 dark:text-gray-400">{label}</label>
-      {children}
+    <div className={className}>
+      <label htmlFor={id} className="mb-1 block text-xs font-medium text-gray-500 dark:text-gray-400">{label}</label>
+      {children(id)}
     </div>
   )
 }

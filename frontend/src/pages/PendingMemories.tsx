@@ -7,10 +7,11 @@ import { useMemoryStore } from '../store/memoryStore'
 import type { MemoryConversationDetail, PendingMemorySession } from '../types/memory'
 import { ConversationDialog, STATE_META, displayTime, sourceLabel } from '../components/ConversationDialog'
 import { MemoryBreadcrumb } from '../components/MemoryBreadcrumb'
+import { ErrorRecovery } from '../components/ErrorRecovery'
 
 type StateFilter = 'all' | 'pending' | 'retrying' | 'failed'
 
-export const PendingMemories = memo(function PendingMemories({ onBack }: { onBack: () => void }) {
+export const PendingMemories = memo(function PendingMemories({ onBack, active = true }: { onBack: () => void; active?: boolean }) {
   const { t } = useTranslation()
   const { loadPendingSessions, loadConversationDetail, organizeSession, organizeConversations, ingestStatus, checkIngest, checkTelemetry } = useMemoryStore()
   const [sessions, setSessions] = useState<PendingMemorySession[] | null>(null)
@@ -32,10 +33,11 @@ export const PendingMemories = memo(function PendingMemories({ onBack }: { onBac
   }, [loadPendingSessions])
 
   useEffect(() => {
+    if (!active) return
     void reload()
     void checkIngest()
     void checkTelemetry({ limit: 20 })
-  }, [reload, checkIngest, checkTelemetry])
+  }, [reload, checkIngest, checkTelemetry, active])
 
   const counts = useMemo(() => {
     const list = sessions ?? []
@@ -57,7 +59,7 @@ export const PendingMemories = memo(function PendingMemories({ onBack }: { onBac
     if (refreshing) return
     setRefreshing(true)
     try {
-      await checkTelemetry({ limit: 20 })
+      await Promise.all([checkIngest(), checkTelemetry({ limit: 20 })])
       await reload()
     } finally {
       setRefreshing(false)
@@ -136,6 +138,7 @@ export const PendingMemories = memo(function PendingMemories({ onBack }: { onBac
           <button type="button" onClick={() => { void handleOrganizeAll() }} disabled={organizingAll || !modelReady || (sessions ?? []).length === 0} title={modelReady ? t('memory.pending.organizeAllTitle') : t('memory.pending.modelMissingTitle')} className="inline-flex h-10 items-center gap-2 rounded-lg bg-violet-600 px-4 text-sm font-medium text-white transition hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500">{organizingAll ? <Loader2 size={16} className="animate-spin motion-reduce:animate-none" /> : <Brain size={16} />}{organizingAll ? t('memory.pending.organizing') : t('memory.pending.organizeAll')}</button>
         </div>
       </header>
+      {notice?.kind === 'err' && <ErrorRecovery error={notice.text} fallback="settings" />}
 
       <section className="mt-7 grid gap-3 sm:grid-cols-3" aria-label={t('memory.pending.overviewLabel')}>
         {(['pending', 'retrying', 'failed'] as const).map((state) => {
@@ -152,7 +155,10 @@ export const PendingMemories = memo(function PendingMemories({ onBack }: { onBac
       </section>
 
       {!modelReady && ingestStatus && (
-        <p className="mt-4 rounded-lg bg-amber-500/10 px-3 py-2.5 text-xs text-amber-800 dark:text-amber-200">{t('memory.pending.modelWarn')}</p>
+        <div className="mt-4 rounded-lg bg-amber-500/10 px-3 py-2.5 text-xs text-amber-800 dark:text-amber-200">
+          <p>{t('memory.pending.modelWarn')}</p>
+          <ErrorRecovery fallback="settings" />
+        </div>
       )}
 
       <section className="mt-6 rounded-2xl border border-slate-200 bg-white p-5 shadow-[0_1px_2px_rgba(15,23,42,0.03)] dark:border-slate-800 dark:bg-slate-900 sm:p-6" aria-label={t('memory.pending.listLabel')}>

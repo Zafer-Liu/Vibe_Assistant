@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { AgentState, LogEntry } from '../types/agent'
 import { LogViewer } from './LogViewer'
+import { ErrorRecovery } from './ErrorRecovery'
 import { Play, Square, Globe, LayoutList, Info, TerminalSquare } from 'lucide-react'
 
 interface Props {
@@ -11,6 +12,7 @@ interface Props {
   onStop: (id: string) => void
   onOpenUI: (agent: AgentState) => void
   onOpenTerminal: (agent: AgentState) => void
+  onConfigure?: () => void
   uiIsOpen?: boolean
   termIsOpen?: boolean
 }
@@ -18,7 +20,7 @@ interface Props {
 type Tab = 'overview' | 'logs'
 
 export function AgentDetail({
-  agent, logs, onStart, onStop, onOpenUI, onOpenTerminal,
+  agent, logs, onStart, onStop, onOpenUI, onOpenTerminal, onConfigure,
   uiIsOpen = false, termIsOpen = false,
 }: Props) {
   const { t } = useTranslation()
@@ -126,6 +128,14 @@ export function AgentDetail({
         </div>
       </div>
 
+      {status === 'error' && (
+        <div role="alert" className="border-b border-amber-200 bg-amber-50 px-5 py-3 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+          <p>{t('recovery.agentExited')}</p>
+          <ErrorRecovery error={[...logs].reverse().find(entry => entry.level === 'error')?.message} onConfigure={onConfigure} />
+          <button type="button" onClick={() => setTab('logs')} className="mt-2 rounded text-xs underline underline-offset-2 focus-visible:ring-2 focus-visible:ring-blue-500">{t('agentDetail.logs')}</button>
+        </div>
+      )}
+
       {/* ── Tab content ── */}
       <div className="flex-1 overflow-hidden">
         {tab === 'overview' && (
@@ -150,6 +160,13 @@ export function AgentDetail({
               {config.working_dir && (
                 <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">
                   <span className="font-medium text-gray-500 dark:text-gray-400">cwd:</span> {config.working_dir}
+                </p>
+              )}
+              {config.worktree_repo && (
+                <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
+                  <span className="font-medium text-violet-500 dark:text-violet-400">{t('agentDetail.worktreeLabel')}:</span>{' '}
+                  {config.worktree_repo}
+                  {config.worktree_branch ? ` @ ${config.worktree_branch}` : ''}
                 </p>
               )}
             </div>

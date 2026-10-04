@@ -8,39 +8,43 @@ import { AgentDetail } from './components/AgentDetail'
 import { AgentForm } from './components/AgentForm'
 import { TerminalPanel } from './components/TerminalPanel'
 import { PortManager } from './pages/PortManager'
+import { NetworkManager } from './pages/NetworkManager'
+import { EnvManager } from './pages/EnvManager'
 import { ProxyManager } from './pages/ProxyManager'
 import { Settings } from './pages/Settings'
 import { MemoryCenter } from './pages/MemoryCenter'
 import { SkillLibrary } from './pages/SkillLibrary'
 import { PublishedSkills } from './pages/PublishedSkills'
+import { SkillMarketplace } from './pages/SkillMarketplace'
 import { McpLibrary } from './pages/McpLibrary'
-import { WorkflowCenter } from './pages/WorkflowCenter'
 import { UsageAnalytics } from './pages/UsageAnalytics'
 import { PendingMemories } from './pages/PendingMemories'
 import { OrganizedConversations } from './pages/OrganizedConversations'
 import { MemoryInjection } from './pages/MemoryInjection'
 import { ErrorBoundary } from './components/ErrorBoundary'
+import { ErrorRecovery, RecoveryNavigationContext, type RecoveryTarget } from './components/ErrorRecovery'
+import { useDocumentVisible, useVisiblePolling } from './hooks/useVisiblePolling'
 import { UpdateChecker } from './components/UpdateChecker'
-import { Onboarding } from './components/Onboarding'
+import { Onboarding, needsOnboarding } from './components/Onboarding'
 import { useTheme } from './theme'
 import type { AgentState } from './types/agent'
 import { useResizable } from './hooks/useResizable'
 import { NativeWebviewPanel, type OpenTab } from './components/NativeWebviewPanel'
 import {
-  Plus, RefreshCw, Bot, X, Globe, Network, Sparkles,
+  Plus, RefreshCw, Bot, X, Globe, Network,
   Maximize2, Minimize2, TerminalSquare, Sun, Moon,
   Shield, Eraser, Settings2, Brain, BookOpenText, Plug,
-  ChevronDown, ChevronRight,
+  ChevronDown, ChevronRight, BarChart3, Gauge, Variable,
 } from 'lucide-react'
 import logoUrl from '/logo.png'
 
-type NavPage = 'agents' | 'workflow' | 'ports' | 'proxy' | 'settings' | 'memory' | 'skills' | 'published-skills' | 'mcp-library' | 'usage' | 'pending-memories' | 'organized-conversations' | 'memory-injection'
+type NavPage = 'agents' | 'ports' | 'network' | 'env-vars' | 'proxy' | 'settings' | 'memory' | 'skills' | 'published-skills' | 'skill-marketplace' | 'mcp-library' | 'usage' | 'pending-memories' | 'organized-conversations' | 'memory-injection'
 
-const MEMORY_PAGES = ['memory', 'usage', 'pending-memories', 'organized-conversations', 'memory-injection'] as const
+const MEMORY_PAGES = ['memory', 'pending-memories', 'organized-conversations', 'memory-injection'] as const
 // Skill 库两页同样「访问过即保持挂载」：重进保留筛选/勾选状态，也免去整树重挂载。
-const SKILL_PAGES = ['skills', 'published-skills'] as const
+const SKILL_PAGES = ['skills', 'published-skills', 'skill-marketplace'] as const
 const MCP_PAGES = ['mcp-library'] as const
-const KEPT_PAGES: readonly string[] = [...MEMORY_PAGES, ...SKILL_PAGES, ...MCP_PAGES]
+const KEPT_PAGES: readonly string[] = [...MEMORY_PAGES, ...SKILL_PAGES, ...MCP_PAGES, 'usage']
 
 export default function App() {
   const {
@@ -53,6 +57,9 @@ export default function App() {
   const { t } = useTranslation()
 
   const [page, setPage] = useState<NavPage>('agents')
+  const documentVisible = useDocumentVisible()
+  const openRecoveryTarget = useCallback((target: RecoveryTarget) => setPage(target), [])
+  const [agentError, setAgentError] = useState<{ agent: AgentState; message: string; retry: () => void } | null>(null)
   // 记忆族页面访问过即保持挂载：返回时不再
   // 重新挂载触发全量数据重查，消除往返卡顿。未激活时仅 CSS 隐藏。
   const [keptPages, setKeptPages] = useState<Set<string>>(new Set())
@@ -62,6 +69,7 @@ export default function App() {
     }
   }, [page])
   const [showForm, setShowForm] = useState(false)
+  const [showOnboarding, setShowOnboarding] = useState(needsOnboarding)
   const [editingAgent, setEditingAgent] = useState<AgentState | null>(null)
   const [openTabs, setOpenTabs] = useState<OpenTab[]>([])
   const [activeTabKey, setActiveTabKey] = useState<string | null>(null)
@@ -69,7 +77,7 @@ export default function App() {
   const [panelFullscreen, setPanelFullscreen] = useState(false)
   // 从「已发布」页跳入 Skill 库时自动打开同步对话框
   const [skillsAutoSync, setSkillsAutoSync] = useState(false)
-  // 侧边栏分组展开状态：默认展开记忆中心和 Skill 库，让子页面可发现
+  // 侧边栏分组展开状态：默认展开记忆中心与 Skill 库，让子页面可发现
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set(['memory', 'skills']))
   // 导航到子页面时自动展开所属分组
   useEffect(() => {
@@ -90,6 +98,7 @@ export default function App() {
   const openMemoryInjection = useCallback(() => setPage('memory-injection'), [])
   const openSkills = useCallback(() => setPage('skills'), [])
   const openPublishedSkills = useCallback(() => setPage('published-skills'), [])
+  const openSkillMarketplace = useCallback(() => setPage('skill-marketplace'), [])
   const clearSkillsAutoSync = useCallback(() => setSkillsAutoSync(false), [])
   const goSkillSync = useCallback(() => { setSkillsAutoSync(true); setPage('skills') }, [])
 
@@ -113,17 +122,26 @@ export default function App() {
   const showPanel = activeTab !== null
   const showSplit = showPanel && !panelFullscreen
 
-  useEffect(() => {
-    fetchAgents()
-    const id = setInterval(fetchAgents, 5000)
-    return () => clearInterval(id)
-  }, [fetchAgents])
-
-  useEffect(() => {
-    if (!selectedId) return
-    const id = setInterval(() => useAgentStore.getState().fetchLogs(selectedId), 3000)
-    return () => clearInterval(id)
+  // Port/proxy pages also consume this list; hidden workspaces do not need logs.
+  useVisiblePolling(fetchAgents, 5000, page === 'agents' || page === 'ports' || page === 'proxy')
+  const refreshLogs = useCallback(async () => {
+    if (selectedId) await useAgentStore.getState().fetchLogs(selectedId)
   }, [selectedId])
+  useVisiblePolling(refreshLogs, 3000, page === 'agents' && !panelFullscreen && selectedId !== null)
+
+  async function runAgentAction(id: string, action: 'start' | 'stop') {
+    setAgentError(null)
+    try {
+      await (action === 'start' ? startAgent(id) : stopAgent(id))
+    } catch (error) {
+      const agent = agents.find(item => item.config.id === id)
+      if (agent) setAgentError({ agent, message: String(error), retry: () => { void runAgentAction(id, action) } })
+      await fetchAgents()
+      await useAgentStore.getState().fetchLogs(id).catch(() => {})
+    }
+  }
+  const handleStart = (id: string) => { void runAgentAction(id, 'start') }
+  const handleStop = (id: string) => { void runAgentAction(id, 'stop') }
 
   function openAgentUI(agent: AgentState) {
     if (!agent.config.port) return
@@ -146,10 +164,20 @@ export default function App() {
     setPage('agents')
   }
 
-  function openAgentTerminal(agent: AgentState) {
+  async function openAgentTerminal(agent: AgentState) {
+    setAgentError(null)
     const id = agent.config.id
     const existing = openTabs.find(t => t.agentId === id && t.kind === 'terminal')
     if (!existing) {
+      // 与 Agent 进程共用同一 cwd 解析：worktree 隔离时返回（惰性创建的）独立工作树。
+      let cwd = agent.config.working_dir
+      try {
+        cwd = await invoke<string>('resolve_agent_cwd', { id })
+      } catch (e) {
+        // Never silently lose isolation by falling back to the shared repository.
+        setAgentError({ agent, message: String(e), retry: () => { void openAgentTerminal(agent) } })
+        return
+      }
       setOpenTabs(tabs => [
         ...tabs.filter(t => !(t.agentId === id && t.kind === 'terminal')),
         {
@@ -158,7 +186,7 @@ export default function App() {
           kind: 'terminal',
           command: agent.config.command,
           args: agent.config.args,
-          cwd: agent.config.working_dir,
+          cwd,
           env: agent.config.env,
         },
       ])
@@ -209,6 +237,7 @@ export default function App() {
     : false
 
   return (
+    <RecoveryNavigationContext.Provider value={openRecoveryTarget}>
     <div className="flex h-screen overflow-hidden bg-gray-100 text-gray-800 dark:bg-gray-950 dark:text-gray-100">
 
       {/* ── Sidebar ─────────────────────────────────────── */}
@@ -237,7 +266,7 @@ export default function App() {
         </div>
 
         {/* Nav */}
-        <div className="flex flex-col gap-0.5 p-2 border-b border-gray-200 dark:border-gray-800">
+        <div className="flex min-h-0 shrink flex-col gap-0.5 overflow-y-auto p-2 border-b border-gray-200 dark:border-gray-800">
           {/* 智能体 */}
           <button
             onClick={() => setPage('agents')}
@@ -283,7 +312,6 @@ export default function App() {
                       { id: 'pending-memories' as NavPage, label: t('nav.memoryPending'), onClick: openPendingMemories },
                       { id: 'organized-conversations' as NavPage, label: t('nav.memoryOrganized'), onClick: openOrganizedConversations },
                       { id: 'memory-injection' as NavPage, label: t('nav.memoryInjection'), onClick: openMemoryInjection },
-                      { id: 'usage' as NavPage, label: t('nav.memoryUsage'), onClick: openUsage },
                     ]).map(sub => (
                       <button
                         key={sub.id}
@@ -334,6 +362,7 @@ export default function App() {
                     {([
                       { id: 'skills' as NavPage, label: t('nav.skillsLocal'), onClick: openSkills },
                       { id: 'published-skills' as NavPage, label: t('nav.skillsPublished'), onClick: openPublishedSkills },
+                      { id: 'skill-marketplace' as NavPage, label: t('nav.skillsMarketplace'), onClick: openSkillMarketplace },
                     ]).map(sub => (
                       <button
                         key={sub.id}
@@ -365,16 +394,17 @@ export default function App() {
             <Plug className="h-4 w-4" />{t('nav.mcpLibrary')}
           </button>
 
-          {/* 工作流 */}
           <button
-            onClick={() => setPage('workflow')}
-            className={`flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium transition-colors text-left ${
-              page === 'workflow'
+            type="button"
+            onClick={openUsage}
+            aria-current={page === 'usage' ? 'page' : undefined}
+            className={`flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
+              page === 'usage'
                 ? 'bg-blue-50 text-blue-600 dark:bg-blue-600/20 dark:text-blue-400'
                 : 'text-gray-500 hover:bg-gray-100 hover:text-gray-800 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200'
             }`}
           >
-            <Sparkles className="h-4 w-4" />{t('nav.workflow')}
+            <BarChart3 className="h-4 w-4" />{t('nav.usage')}
           </button>
 
           {/* 分隔线 */}
@@ -383,6 +413,8 @@ export default function App() {
           {/* 工具区 */}
           {([
             { id: 'ports' as NavPage,    icon: <Network className="h-4 w-4" />,   label: t('nav.ports') },
+            { id: 'network' as NavPage,  icon: <Gauge className="h-4 w-4" />,     label: t('nav.network') },
+            { id: 'env-vars' as NavPage, icon: <Variable className="h-4 w-4" />,  label: t('nav.envVars') },
             { id: 'proxy' as NavPage,    icon: <Shield className="h-4 w-4" />,    label: t('nav.proxy') },
             { id: 'settings' as NavPage, icon: <Settings2 className="h-4 w-4" />, label: t('nav.settings') },
           ]).map(nav => (
@@ -418,8 +450,8 @@ export default function App() {
               agents={agents}
               selectedId={selectedId}
               onSelect={selectAgent}
-              onStart={startAgent}
-              onStop={stopAgent}
+              onStart={handleStart}
+              onStop={handleStop}
               onDelete={deleteAgent}
               onConfigure={openEdit}
               onReorder={reorderAgents}
@@ -462,39 +494,38 @@ export default function App() {
       {/* ── Main panel ─────────────────────────────────── */}
       <main className="flex flex-1 flex-col overflow-hidden bg-gray-50 dark:bg-gray-950">
 
-        {page === 'workflow' && <WorkflowCenter />}
         {keptPages.has('memory') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'memory' ? '' : 'hidden'}`}>
             <ErrorBoundary>
-              <MemoryCenter onOpenUsage={openUsage} onOpenPending={openPendingMemories} onOpenOrganized={openOrganizedConversations} onOpenInjection={openMemoryInjection} active={page === 'memory'} />
+              <MemoryCenter onOpenUsage={openUsage} onOpenPending={openPendingMemories} onOpenOrganized={openOrganizedConversations} onOpenInjection={openMemoryInjection} active={page === 'memory' && documentVisible} />
             </ErrorBoundary>
           </div>
         )}
         {keptPages.has('usage') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'usage' ? '' : 'hidden'}`}>
             <ErrorBoundary>
-              <UsageAnalytics onBack={openMemory} active={page === 'usage'} />
+              <UsageAnalytics active={page === 'usage' && documentVisible} />
             </ErrorBoundary>
           </div>
         )}
         {keptPages.has('pending-memories') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'pending-memories' ? '' : 'hidden'}`}>
             <ErrorBoundary>
-              <PendingMemories onBack={openMemory} />
+              <PendingMemories onBack={openMemory} active={page === 'pending-memories' && documentVisible} />
             </ErrorBoundary>
           </div>
         )}
         {keptPages.has('organized-conversations') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'organized-conversations' ? '' : 'hidden'}`}>
             <ErrorBoundary>
-              <OrganizedConversations onBack={openMemory} />
+              <OrganizedConversations onBack={openMemory} active={page === 'organized-conversations' && documentVisible} />
             </ErrorBoundary>
           </div>
         )}
         {keptPages.has('memory-injection') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'memory-injection' ? '' : 'hidden'}`}>
             <ErrorBoundary>
-              <MemoryInjection onBack={openMemory} active={page === 'memory-injection'} />
+              <MemoryInjection onBack={openMemory} active={page === 'memory-injection' && documentVisible} />
             </ErrorBoundary>
           </div>
         )}
@@ -516,23 +547,51 @@ export default function App() {
             </ErrorBoundary>
           </div>
         )}
+        {keptPages.has('skill-marketplace') && (
+          <div className={`flex flex-1 flex-col overflow-hidden ${page === 'skill-marketplace' ? '' : 'hidden'}`}>
+            <ErrorBoundary>
+              <SkillMarketplace />
+            </ErrorBoundary>
+          </div>
+        )}
         {keptPages.has('mcp-library') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'mcp-library' ? '' : 'hidden'}`}>
             <ErrorBoundary>
-              <McpLibrary active={page === 'mcp-library'} />
+              <McpLibrary active={page === 'mcp-library' && documentVisible} />
             </ErrorBoundary>
           </div>
         )}
         {page === 'ports' && <PortManager agents={agents} />}
-        {page === 'proxy' && <ProxyManager agents={agents} />}
-        {page === 'settings' && (
+        {page === 'network' && (
           <ErrorBoundary>
-            <Settings />
+            <NetworkManager />
+          </ErrorBoundary>
+        )}
+        {page === 'env-vars' && (
+          <ErrorBoundary>
+            <EnvManager />
+          </ErrorBoundary>
+        )}
+        {page === 'proxy' && <ProxyManager agents={agents} />}
+        {page === 'settings' && !showOnboarding && (
+          <ErrorBoundary>
+            <Settings onOpenOnboarding={() => setShowOnboarding(true)} />
           </ErrorBoundary>
         )}
 
         {/* Keep the workspace mounted so terminals and iframe state survive navigation. */}
         <div className={`flex flex-1 flex-col overflow-hidden ${page === 'agents' ? '' : 'hidden'}`}>
+
+            {agentError && (
+              <div role="alert" className="shrink-0 border-b border-red-200 bg-red-50 px-5 py-3 text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
+                <div className="flex items-start justify-between gap-3">
+                  <p className="text-sm font-medium">{t('recovery.agentFailed', { name: agentError.agent.config.name })}</p>
+                  <button type="button" onClick={() => setAgentError(null)} aria-label={t('common.close')} className="rounded p-1 focus-visible:ring-2 focus-visible:ring-blue-500"><X size={14} /></button>
+                </div>
+                <p className="mt-1 max-h-24 overflow-auto break-words text-xs">{agentError.message}</p>
+                <ErrorRecovery error={agentError.message} onRetry={agentError.retry} onConfigure={() => openEdit(agentError.agent)} />
+              </div>
+            )}
 
             {/* ── Tab bar ── */}
             {openTabs.length > 0 && (
@@ -640,7 +699,7 @@ export default function App() {
                         ) : (
                           <NativeWebviewPanel
                             tab={tab}
-                            active={isActive && page === 'agents' && !showForm}
+                            active={isActive && page === 'agents' && !showForm && !showOnboarding}
                           />
                         )}
                       </div>
@@ -665,8 +724,9 @@ export default function App() {
                   <AgentDetail
                     agent={selectedAgent}
                     logs={agentLogs}
-                    onStart={startAgent}
-                    onStop={stopAgent}
+                    onConfigure={() => openEdit(selectedAgent)}
+                    onStart={handleStart}
+                    onStop={handleStop}
                     onOpenUI={openAgentUI}
                     onOpenTerminal={openAgentTerminal}
                     uiIsOpen={uiIsOpen}
@@ -697,7 +757,8 @@ export default function App() {
         />
       )}
 
-      <Onboarding />
+      {showOnboarding && <Onboarding onFinish={() => setShowOnboarding(false)} />}
     </div>
+    </RecoveryNavigationContext.Provider>
   )
 }

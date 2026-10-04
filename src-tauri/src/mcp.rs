@@ -46,9 +46,9 @@ pub struct McpServer {
     pub command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
-    // SSE transport fields
+    // Remote transport fields
     #[serde(default)]
-    pub transport: String, // "stdio" | "sse"
+    pub transport: String, // "stdio" | "sse" | "http"
     #[serde(default)]
     pub url: String,
     #[serde(default)]
@@ -71,130 +71,49 @@ pub struct McpScanResult {
     pub confidence: u8,
 }
 
-// ── Config file helpers ──────────────────────────────────────────────────────
+// ── Read-only legacy path ────────────────────────────────────────────────────
 
-fn config_path() -> std::path::PathBuf {
-    dirs_next::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("Claude")
-        .join("claude_desktop_config.json")
+/// 仅供一次性迁移及兼容路径查询；与外部 MCP 读写共用路径选择。
+pub(crate) fn legacy_config_path() -> Result<std::path::PathBuf, String> {
+    crate::memory_mcp::desktop_config_path("claude_desktop")?
+        .ok_or_else(|| "无法定位 Claude Desktop 配置文件".into())
 }
 
-fn read_config() -> Value {
-    std::fs::read_to_string(config_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}))
-}
+// ── Central catalog compatibility commands ────────────────────────────────────
 
-fn write_config(config: &Value) -> Result<(), String> {
-    let path = config_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let json = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())
-}
-
-// ── CRUD commands ────────────────────────────────────────────────────────────
-
+/// 只读遗留路径查询，不再代表当前可编辑的 MCP 库配置。
 #[tauri::command]
-pub fn get_mcp_config_path() -> String {
-    config_path().to_string_lossy().to_string()
+pub fn get_mcp_config_path() -> Result<String, String> {
+    Ok(legacy_config_path()?.to_string_lossy().to_string())
 }
 
 #[tauri::command]
-pub fn list_mcp_servers() -> Vec<McpServer> {
-    let config = read_config();
-    let servers = match config.get("mcpServers").and_then(|v| v.as_object()) {
-        Some(s) => s,
-        None => return vec![],
-    };
-    servers
-        .iter()
-        .map(|(name, val)| {
-            let transport = val["transport"].as_str().unwrap_or("stdio").to_string();
-            McpServer {
-                name: name.clone(),
-                transport: transport.clone(),
-                command: val["command"].as_str().unwrap_or("").to_string(),
-                args: val["args"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                env: val["env"]
-                    .as_object()
-                    .map(|o| {
-                        o.iter()
-                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                url: val["url"].as_str().unwrap_or("").to_string(),
-                headers: val["headers"]
-                    .as_object()
-                    .map(|o| {
-                        o.iter()
-                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                description: val["description"].as_str().unwrap_or("").to_string(),
-            }
-        })
-        .collect()
+pub fn list_mcp_servers() -> Result<Vec<McpServer>, String> {
+    crate::mcp_registry::read_runtime_servers()
 }
 
 #[tauri::command]
 pub fn save_mcp_server(server: McpServer) -> Result<(), String> {
-    let mut config = read_config();
-    let servers = config
-        .as_object_mut()
-        .ok_or("Invalid config")?
-        .entry("mcpServers")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or("Invalid mcpServers")?;
+    crate::mcp_registry::upsert_catalog_entry(compatibility_entry(server)).map(|_| ())
+}
 
-    let transport = if server.transport.is_empty() {
-        "stdio"
-    } else {
-        &server.transport
-    };
-    let mut entry = json!({ "transport": transport, "description": server.description });
-
-    if transport == "sse" {
-        entry["url"] = json!(server.url);
-        if !server.headers.is_empty() {
-            entry["headers"] = json!(server.headers);
-        }
-    } else {
-        entry["command"] = json!(server.command);
-        entry["args"] = json!(server.args);
-        if !server.env.is_empty() {
-            entry["env"] = json!(server.env);
-        }
+fn compatibility_entry(server: McpServer) -> crate::mcp_registry::McpCatalogEntry {
+    crate::mcp_registry::McpCatalogEntry {
+        name: server.name,
+        description: server.description,
+        transport: server.transport,
+        command: server.command,
+        args: server.args,
+        env: server.env.into_iter().collect(),
+        url: server.url,
+        headers: server.headers.into_iter().collect(),
+        ..Default::default()
     }
-
-    servers.insert(server.name, entry);
-    write_config(&config)
 }
 
 #[tauri::command]
 pub fn delete_mcp_server(name: String) -> Result<(), String> {
-    let mut config = read_config();
-    if let Some(servers) = config
-        .as_object_mut()
-        .and_then(|o| o.get_mut("mcpServers"))
-        .and_then(|v| v.as_object_mut())
-    {
-        servers.remove(&name);
-    }
-    write_config(&config)
+    crate::mcp_registry::delete_catalog_entry(&name)
 }
 
 // ── Local directory scan ─────────────────────────────────────────────────────
@@ -730,7 +649,30 @@ fn title_case(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_llm_json, truncate_chars};
+    use super::{compatibility_entry, parse_llm_json, truncate_chars, McpServer};
+    use std::collections::HashMap;
+
+    #[test]
+    fn compatibility_save_preserves_http_fields_and_original_name() {
+        let entry = compatibility_entry(McpServer {
+            name: "Old MCP".into(),
+            transport: "http".into(),
+            command: "node".into(),
+            args: vec!["server.js".into()],
+            env: HashMap::from([("TOKEN".into(), "env-value".into())]),
+            url: "https://example.com/mcp".into(),
+            headers: HashMap::from([("Authorization".into(), "header-value".into())]),
+            description: "remote".into(),
+        });
+        assert_eq!(entry.name, "Old MCP");
+        assert_eq!(entry.transport, "http");
+        assert_eq!(entry.command, "node");
+        assert_eq!(entry.args, vec!["server.js"]);
+        assert_eq!(entry.env["TOKEN"], "env-value");
+        assert_eq!(entry.url, "https://example.com/mcp");
+        assert_eq!(entry.headers["Authorization"], "header-value");
+        assert_eq!(entry.description, "remote");
+    }
 
     #[test]
     fn truncates_unicode_on_character_boundaries() {

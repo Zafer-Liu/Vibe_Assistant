@@ -2,10 +2,12 @@ import { memo, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { open } from '@tauri-apps/plugin-dialog'
 import {
-  ArrowLeft, ArrowDownToLine, ArrowUpFromLine, CheckCircle2, ChevronDown, ChevronUp, FolderOpen, Loader2,
+  ArrowLeft, ArrowDownToLine, ArrowUpFromLine, CheckCircle2, ChevronDown, ChevronUp, FolderOpen, Gauge, Loader2,
   PlugZap, RefreshCw, Webhook, X, XCircle, Zap,
 } from 'lucide-react'
 import { useMemoryStore } from '../store/memoryStore'
+import { useVisiblePolling } from '../hooks/useVisiblePolling'
+import { ErrorRecovery, type RecoveryTarget } from '../components/ErrorRecovery'
 import type { HookStatus, MemoryMcpTarget } from '../types/memory'
 import { displayFullTime } from '../components/ConversationDialog'
 import { MemoryBreadcrumb } from '../components/MemoryBreadcrumb'
@@ -45,9 +47,9 @@ export const MemoryInjection = memo(function MemoryInjection({ onBack, active = 
   const { t } = useTranslation()
   const {
     hookStatus, qoderHookStatus, codexHookStatus, workbuddyHookStatus,
-    ingestStatus, agentSources, memoryMcp, mcpAccessLogs,
+    ingestStatus, agentSources, memoryMcp, mcpAccessLogs, memoryInjectionStats,
     checkIngest, installHook, uninstallHook, setIngestEnabled,
-    checkMemoryMcp, installMemoryMcp, uninstallMemoryMcp, checkMcpAccessLogs,
+    checkMemoryMcp, installMemoryMcp, uninstallMemoryMcp, checkMcpAccessLogs, loadInjectionStats,
     loadAgentSources, setAgentSourceOverride,
   } = useMemoryStore()
   const [mcpAction, setMcpAction] = useState<MemoryMcpTarget | null>(null)
@@ -56,33 +58,30 @@ export const MemoryInjection = memo(function MemoryInjection({ onBack, active = 
   const [expandedLogId, setExpandedLogId] = useState<number | null>(null)
   const [logsExpanded, setLogsExpanded] = useState(false)
   const SUMMARY_PREVIEW_COUNT = 5
-  const [notice, setNotice] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
+  const [notice, setNotice] = useState<{ kind: 'ok' | 'err'; text: string; recovery?: RecoveryTarget } | null>(null)
 
   useEffect(() => {
-    void checkIngest()
-    void checkMemoryMcp()
-    void checkMcpAccessLogs()
-    void loadAgentSources()
-  }, [checkIngest, checkMemoryMcp, checkMcpAccessLogs, loadAgentSources])
-
-  useEffect(() => {
-    // 页面被 CSS 隐藏（保持挂载策略）时暂停轮询，回到页面立即刷一次。
     if (!active) return
-    void checkMcpAccessLogs()
-    const timer = window.setInterval(() => { void checkMcpAccessLogs() }, 10_000)
-    return () => window.clearInterval(timer)
-  }, [checkMcpAccessLogs, active])
+    void Promise.allSettled([checkIngest(), checkMemoryMcp(), loadAgentSources()])
+  }, [checkIngest, checkMemoryMcp, loadAgentSources, active])
 
-  function flash(kind: 'ok' | 'err', text: string) {
-    setNotice({ kind, text })
-    setTimeout(() => setNotice(null), 3500)
+  useVisiblePolling(checkMcpAccessLogs, 10_000, active)
+  // 30 天汇总口径变化慢，低于审计日志的轮询频率即可。
+  useVisiblePolling(loadInjectionStats, 30_000, active)
+
+  function flash(kind: 'ok' | 'err', text: string, recovery?: RecoveryTarget) {
+    const next = { kind, text, recovery }
+    setNotice(next)
+    if (kind === 'ok') setTimeout(() => setNotice(current => current === next ? null : current), 3500)
   }
 
   async function handleRefresh() {
     if (refreshing) return
     setRefreshing(true)
     try {
-      await Promise.all([checkIngest(), checkMemoryMcp(), checkMcpAccessLogs(), loadAgentSources()])
+      await Promise.all([checkIngest(), checkMemoryMcp(), checkMcpAccessLogs(), loadInjectionStats(), loadAgentSources()])
+    } catch (error) {
+      flash('err', String(error))
     } finally {
       setRefreshing(false)
     }
@@ -156,7 +155,7 @@ export const MemoryInjection = memo(function MemoryInjection({ onBack, active = 
       await installMemoryMcp(agentType)
       flash('ok', t('memory.injection.mcpConnectedToast', { label: adapterLabel(agentType) }))
     } catch (error) {
-      flash('err', t('memory.injection.mcpConnectFailed', { error: String(error) }))
+      flash('err', t('memory.injection.mcpConnectFailed', { error: String(error) }), 'mcp-library')
     } finally {
       setMcpAction(null)
     }
@@ -169,7 +168,7 @@ export const MemoryInjection = memo(function MemoryInjection({ onBack, active = 
       await uninstallMemoryMcp(agentType)
       flash('ok', t('memory.injection.mcpDisconnectedToast', { label: adapterLabel(agentType) }))
     } catch (error) {
-      flash('err', t('memory.injection.mcpDisconnectFailed', { error: String(error) }))
+      flash('err', t('memory.injection.mcpDisconnectFailed', { error: String(error) }), 'mcp-library')
     } finally {
       setMcpAction(null)
     }
@@ -205,6 +204,8 @@ export const MemoryInjection = memo(function MemoryInjection({ onBack, active = 
           <button type="button" onClick={() => { void handleRefresh() }} disabled={refreshing} className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:bg-slate-50 disabled:cursor-wait disabled:opacity-60 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"><RefreshCw size={16} className={refreshing ? 'animate-spin motion-reduce:animate-none' : ''} />{t('memory.injection.refreshStatus')}</button>
         </div>
       </header>
+      {notice?.kind === 'err' && <ErrorRecovery error={notice.text} fallback={notice.recovery} onRetry={() => { void handleRefresh() }} disabled={refreshing} />}
+      {ingestStatus && !ingestStatus.model_ready && <ErrorRecovery fallback="settings" />}
 
       <section className="mt-7 grid gap-3 sm:grid-cols-2" aria-label={t('memory.injection.overviewLabel')}>
         <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 dark:border-slate-800 dark:bg-slate-900">
@@ -369,6 +370,30 @@ export const MemoryInjection = memo(function MemoryInjection({ onBack, active = 
       <section className="mt-6 rounded-2xl border border-slate-200 bg-white p-5 shadow-[0_1px_2px_rgba(15,23,42,0.03)] dark:border-slate-800 dark:bg-slate-900 sm:p-6" aria-label={t('memory.injection.summaryLabel')}>
         <h2 className="text-sm font-semibold text-slate-700 dark:text-slate-200">{t('memory.injection.summaryTitle')}</h2>
         <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t('memory.injection.summaryDesc')}</p>
+        {memoryInjectionStats.length > 0 && (
+          <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50/70 p-3 dark:border-slate-700 dark:bg-slate-900/35" aria-label={t('memory.injection.statsLabel')}>
+            <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-600 dark:text-slate-300">
+              <Gauge size={13} className="text-indigo-500" />
+              {t('memory.injection.statsTitle')}
+            </div>
+            <div className="mt-2 space-y-1.5">
+              {memoryInjectionStats.map((row) => {
+                const promptTurns = row.prompt_injections + row.prompt_skips
+                const gateRate = promptTurns > 0 ? `${Math.round((row.prompt_skips / promptTurns) * 100)}%` : null
+                const estTokens = Math.round(row.injected_chars / 3)
+                return <div key={row.client_name} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-xs text-slate-600 dark:text-slate-300">
+                  <span className="min-w-28 font-medium text-slate-700 dark:text-slate-200">{row.client_name}</span>
+                  <span title={t('memory.injection.statsSessionTitle')}>{t('memory.injection.statsSessionStart', { count: row.session_injections })}</span>
+                  <span title={t('memory.injection.statsPromptTitle')}>{t('memory.injection.statsPrompt', { count: row.prompt_injections })}</span>
+                  <span title={t('memory.injection.statsSkippedTitle')}>{t('memory.injection.statsSkipped', { count: row.prompt_skips })}</span>
+                  {gateRate && <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-emerald-700 dark:text-emerald-300" title={t('memory.injection.statsGateTitle')}>{t('memory.injection.statsGateRate', { rate: gateRate })}</span>}
+                  <span className="ml-auto font-mono tabular-nums text-slate-500 dark:text-slate-400" title={t('memory.injection.statsCharsTitle', { chars: row.injected_chars.toLocaleString() })}>≈{estTokens.toLocaleString()} tokens</span>
+                </div>
+              })}
+            </div>
+            <p className="mt-2 text-[11px] leading-4 text-slate-400">{t('memory.injection.statsNote')}</p>
+          </div>
+        )}
         <div className="mt-3 space-y-1.5">
           {mcpAccessLogs.length === 0
             ? <p className="rounded-md bg-slate-50 px-2.5 py-2 text-xs text-slate-500 dark:bg-slate-900/40 dark:text-slate-400">{t('memory.injection.summaryEmpty')}</p>

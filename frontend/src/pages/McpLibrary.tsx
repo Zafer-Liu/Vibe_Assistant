@@ -1,8 +1,8 @@
-import { memo, useCallback, useEffect, useMemo, useState } from 'react'
+import { memo, useCallback, useEffect, useId, useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import { useTranslation } from 'react-i18next'
-import { McpServersManager, type McpServer } from '../components/McpServersManager'
+import { ErrorRecovery } from '../components/ErrorRecovery'
 import {
   Plug, Plus, Download, RefreshCw, Search, Trash2, Pencil, Loader2,
   Terminal, Globe, X, Check, FolderOpen,
@@ -27,7 +27,7 @@ function targetOf(id: string) {
   return TARGETS.find((t) => t.id === id)
 }
 
-/** 表单态：数组/键值字段用多行文本编辑。 */
+/** 表单态：JSON 文本保留空参数、换行及键值中的空白。 */
 interface EntryForm {
   name: string
   description: string
@@ -41,7 +41,73 @@ interface EntryForm {
 
 const EMPTY_FORM: EntryForm = {
   name: '', description: '', transport: 'stdio', command: '',
-  argsText: '', envText: '', url: '', headersText: '',
+  argsText: '[]', envText: '{}', url: '', headersText: '{}',
+}
+
+class InvalidMcpConfig extends Error {}
+
+type CanonicalTransport = 'stdio' | 'sse' | 'http'
+
+const REMOTE_HTTP_TYPES = new Set([
+  'http', 'https', 'remote', 'remote-http', 'streamable-http', 'streamablehttp',
+])
+
+function isConfigObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function parseConfigJson(text: string, field: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new InvalidMcpConfig(`${field}: invalid JSON`)
+  }
+}
+
+function parseArgs(text: string): string[] {
+  const value = parseConfigJson(text, 'args')
+  if (!Array.isArray(value) || !value.every((arg) => typeof arg === 'string')) {
+    throw new InvalidMcpConfig('args: expected a JSON array of strings')
+  }
+  return value
+}
+
+function parseStringMap(text: string, field: 'env' | 'headers'): Record<string, string> {
+  const value = parseConfigJson(text, field)
+  if (!isConfigObject(value) || !Object.values(value).every((item) => typeof item === 'string')) {
+    throw new InvalidMcpConfig(`${field}: expected a JSON object with string values`)
+  }
+  return value as Record<string, string>
+}
+
+function normalizeTransport(value: string, field: string): CanonicalTransport | '' {
+  const normalized = value.trim().toLowerCase().replace(/[\s_]+/g, '-')
+  if (!normalized) return ''
+  if (normalized === 'stdio' || normalized === 'sse') return normalized
+  if (REMOTE_HTTP_TYPES.has(normalized)) return 'http'
+  throw new InvalidMcpConfig(`${field}: expected stdio, sse, http or streamable-http`)
+}
+
+function remoteUrlFromArgs(command: string, args: string[], requireProxy = true): string {
+  const tokens = [command, ...args].map((token) => token.toLowerCase())
+  const usesRemoteProxy = tokens.some((token) =>
+    /(?:^|[/\\])(?:mcp-remote|mcp-proxy|supergateway)(?:@[^/\\]+)?$/.test(token),
+  )
+  if (requireProxy && !usesRemoteProxy) return ''
+  return args.find((arg) => /^https?:\/\//i.test(arg)) ?? ''
+}
+
+function remoteUrlFromText(text: string): string {
+  return text.match(/https?:\/\/[^\s"'`,}\]]+/i)?.[0] ?? ''
+}
+
+function remoteUrlFromForm(form: EntryForm): string {
+  try {
+    const args = parseArgs(form.argsText)
+    return remoteUrlFromArgs(form.command, args, false)
+  } catch {
+    return ''
+  }
 }
 
 function formFromEntry(entry: McpCatalogEntry): EntryForm {
@@ -50,81 +116,160 @@ function formFromEntry(entry: McpCatalogEntry): EntryForm {
     description: entry.description,
     transport: entry.transport || 'stdio',
     command: entry.command,
-    argsText: entry.args.join('\n'),
-    envText: Object.entries(entry.env).map(([k, v]) => `${k}=${v}`).join('\n'),
+    argsText: JSON.stringify(entry.args, null, 2),
+    envText: JSON.stringify(entry.env, null, 2),
     url: entry.url,
-    headersText: Object.entries(entry.headers).map(([k, v]) => `${k}: ${v}`).join('\n'),
+    headersText: JSON.stringify(entry.headers, null, 2),
   }
 }
 
 function entryFromForm(form: EntryForm, existing?: McpCatalogEntry): McpCatalogEntry {
-  const lines = (text: string) => text.split('\n').map((l) => l.trim()).filter(Boolean)
-  const pairs = (text: string, sep: ':' | '=') => {
-    const map: Record<string, string> = {}
-    for (const line of lines(text)) {
-      const idx = line.indexOf(sep)
-      if (idx <= 0) continue
-      map[line.slice(0, idx).trim()] = line.slice(idx + 1).trim()
-    }
-    return map
+  if (!['stdio', 'sse', 'http'].includes(form.transport)) {
+    throw new InvalidMcpConfig('transport: expected stdio, sse or http')
   }
+  if (form.transport === 'stdio' ? !form.command.trim() : !form.url.trim()) {
+    throw new InvalidMcpConfig(form.transport === 'stdio' ? 'command: required' : 'url: required')
+  }
+  const args = parseArgs(form.argsText)
+  const env = parseStringMap(form.envText, 'env')
+  const headers = parseStringMap(form.headersText, 'headers')
+  const original = existing ? formFromEntry(existing) : undefined
   return {
-    name: form.name.trim(),
-    description: form.description.trim(),
+    // Existing legacy names and untouched runtime fields must round-trip exactly.
+    name: existing?.name ?? form.name.trim(),
+    description: form.description,
     transport: form.transport,
-    command: form.command.trim(),
-    args: lines(form.argsText),
-    env: pairs(form.envText, '='),
-    url: form.url.trim(),
-    headers: pairs(form.headersText, ':'),
+    command: form.command,
+    args: existing && form.argsText === original?.argsText ? existing.args : args,
+    env: existing && form.envText === original?.envText ? existing.env : env,
+    url: form.url,
+    headers: existing && form.headersText === original?.headersText ? existing.headers : headers,
     assigned_agents: existing?.assigned_agents ?? [],
     created_at: existing?.created_at ?? '',
     updated_at: existing?.updated_at ?? '',
   }
 }
 
-/** 本地智能解析（不依赖 LLM）：JSON 片段 / 命令行 / 裸 URL。 */
+/** 本地智能解析（不依赖 LLM）：JSON / 简单命令 / 裸 URL；不将无效 JSON 降级。 */
 function smartParse(text: string): Partial<EntryForm> {
   const trimmed = text.trim()
   if (!trimmed) return {}
-  // 1. JSON：单服务器对象或 { mcpServers: { name: {...} } }
-  if (trimmed.startsWith('{')) {
-    try {
-      const parsed: unknown = JSON.parse(trimmed)
-      if (parsed && typeof parsed === 'object') {
-        const root = parsed as Record<string, unknown>
-        const servers = (root.mcpServers ?? root) as Record<string, unknown>
-        const [name, cfg] = Object.entries(servers)[0] ?? []
-        if (cfg && typeof cfg === 'object' && ('command' in cfg || 'url' in cfg)) {
-          const c = cfg as Record<string, unknown>
-          const transport = c.type === 'sse' || c.type === 'http' ? String(c.type)
-            : typeof c.url === 'string' && c.url ? 'http' : 'stdio'
-          return {
-            name: typeof name === 'string' ? name.toLowerCase() : '',
-            description: typeof c.description === 'string' ? c.description : '',
-            transport,
-            command: typeof c.command === 'string' ? c.command : '',
-            argsText: Array.isArray(c.args) ? c.args.map(String).join('\n') : '',
-            envText: c.env && typeof c.env === 'object'
-              ? Object.entries(c.env as Record<string, unknown>).map(([k, v]) => `${k}=${String(v)}`).join('\n') : '',
-            url: typeof c.url === 'string' ? c.url : '',
-            headersText: c.headers && typeof c.headers === 'object'
-              ? Object.entries(c.headers as Record<string, unknown>).map(([k, v]) => `${k}: ${String(v)}`).join('\n') : '',
-          }
-        }
-      }
-    } catch { /* 非 JSON，继续尝试其他形态 */ }
-  }
-  // 2. 裸 URL → 远程
   if (/^https?:\/\//.test(trimmed) && !/\s/.test(trimmed)) {
-    return { transport: 'sse', url: trimmed }
+    return {
+      ...EMPTY_FORM,
+      transport: /\/sse(?:[/?#]|$)/i.test(trimmed) ? 'sse' : 'http',
+      url: trimmed,
+    }
   }
-  // 3. 命令行（npx/uvx/node/python…）→ stdio
   if (/^(npx|uvx|node|python3?|uv|deno|bunx?)(\s|$)/.test(trimmed)) {
+    if (/["'`|;&<>]|\\\s/.test(trimmed)) {
+      throw new InvalidMcpConfig('command: use JSON for shell quoting or operators')
+    }
     const tokens = trimmed.split(/\s+/)
-    return { transport: 'stdio', command: tokens[0], argsText: tokens.slice(1).join('\n') }
+    const command = tokens[0]
+    const args = tokens.slice(1)
+    const remoteUrl = remoteUrlFromArgs(command, args)
+    return {
+      ...EMPTY_FORM,
+      transport: remoteUrl ? 'http' : 'stdio',
+      command,
+      argsText: JSON.stringify(args, null, 2),
+      url: remoteUrl,
+    }
   }
-  return {}
+
+  // Accept copied object members, but never repair missing inner braces or commas.
+  const jsonText = /^"(?:[^"\\]|\\.)*"\s*:/.test(trimmed) ? `{${trimmed}}` : trimmed
+  const root = parseConfigJson(jsonText, 'config')
+  if (!isConfigObject(root)) throw new InvalidMcpConfig('config: expected a JSON object')
+  let config = root
+  let serverName: string | undefined
+  const serverCollectionKey = 'mcpServers' in root ? 'mcpServers' : 'servers' in root ? 'servers' : ''
+  if (serverCollectionKey) {
+    const collection = root[serverCollectionKey]
+    if (!isConfigObject(collection)) {
+      throw new InvalidMcpConfig(`${serverCollectionKey}: expected an object containing one server`)
+    }
+    const servers = Object.entries(collection)
+    if (servers.length !== 1 || !isConfigObject(servers[0][1])) {
+      throw new InvalidMcpConfig(`${serverCollectionKey}: expected exactly one server configuration`)
+    }
+    serverName = servers[0][0]
+    config = servers[0][1]
+  } else if (!['command', 'url', 'serverUrl', 'endpoint', 'transport', 'type'].some((key) => key in root)) {
+    // Also accept { "server-name": { ... } }, with or without the outer braces.
+    const servers = Object.entries(root)
+    if (servers.length !== 1 || !isConfigObject(servers[0][1])) {
+      throw new InvalidMcpConfig('config: expected exactly one server configuration')
+    }
+    serverName = servers[0][0]
+    config = servers[0][1]
+  }
+  const stringField = (key: string) => {
+    const value = config[key]
+    if (value === undefined) return ''
+    if (typeof value !== 'string') throw new InvalidMcpConfig(`${key}: expected a string`)
+    return value
+  }
+  const transportConfig = isConfigObject(config.transport) ? config.transport : undefined
+  if (config.transport !== undefined && typeof config.transport !== 'string' && !transportConfig) {
+    throw new InvalidMcpConfig('transport: expected a string or object')
+  }
+  const nestedStringField = (key: string) => {
+    const value = transportConfig?.[key]
+    if (value === undefined) return ''
+    if (typeof value !== 'string') throw new InvalidMcpConfig(`transport.${key}: expected a string`)
+    return value
+  }
+  const declaredTransports = [
+    typeof config.transport === 'string' ? normalizeTransport(config.transport, 'transport') : '',
+    stringField('type') ? normalizeTransport(stringField('type'), 'type') : '',
+    nestedStringField('type') ? normalizeTransport(nestedStringField('type'), 'transport.type') : '',
+  ].filter(Boolean) as CanonicalTransport[]
+  if (new Set(declaredTransports).size > 1) {
+    throw new InvalidMcpConfig('transport/type: conflicting values')
+  }
+  const directUrls = ['url', 'serverUrl', 'endpoint']
+    .map((key) => stringField(key))
+    .filter(Boolean)
+  const nestedUrl = nestedStringField('url')
+  if (nestedUrl) directUrls.push(nestedUrl)
+  if (new Set(directUrls).size > 1) {
+    throw new InvalidMcpConfig('url: conflicting remote addresses')
+  }
+  const args = config.args === undefined
+    ? []
+    : Array.isArray(config.args) && config.args.every((arg) => typeof arg === 'string')
+      ? config.args as string[]
+      : []
+  const command = stringField('command')
+  const proxyUrl = remoteUrlFromArgs(command, args)
+  const url = directUrls[0] ?? proxyUrl
+  const transport = declaredTransports[0] ?? (url ? 'http' : 'stdio')
+  if (transport !== 'stdio' && !url) {
+    throw new InvalidMcpConfig('url: required for a remote transport')
+  }
+  if (transport === 'stdio' && !command) {
+    throw new InvalidMcpConfig('command: required for stdio')
+  }
+  const headers = config.headers ?? transportConfig?.headers ?? {}
+  if (config.headers !== undefined && transportConfig?.headers !== undefined
+      && JSON.stringify(config.headers) !== JSON.stringify(transportConfig.headers)) {
+    throw new InvalidMcpConfig('headers: conflicting values')
+  }
+  const form: EntryForm = {
+    name: (serverName ?? stringField('name')).toLowerCase(),
+    description: stringField('description'),
+    transport,
+    command,
+    argsText: JSON.stringify(config.args === undefined ? [] : config.args, null, 2),
+    envText: JSON.stringify(config.env === undefined ? {} : config.env, null, 2),
+    url,
+    headersText: JSON.stringify(headers, null, 2),
+  }
+  // Validate before applying anything so failed parsing leaves the previous form intact.
+  entryFromForm(form)
+  return form
 }
 
 /** 目录扫描结果（复用后端 scan_mcp_local，不传 provider 即不调 LLM）。 */
@@ -146,12 +291,12 @@ function applyScan(form: EntryForm, result: ScanResult): EntryForm {
     ...form,
     name: result.name,
     description: result.description,
-    transport: result.transport || 'stdio',
+    transport: result.transport,
     command: result.command,
-    argsText: result.args.join('\n'),
-    envText: Object.entries(result.env ?? {}).map(([k, v]) => `${k}=${v}`).join('\n'),
+    argsText: JSON.stringify(result.args, null, 2),
+    envText: JSON.stringify(result.env, null, 2),
     url: result.url,
-    headersText: Object.entries(result.headers ?? {}).map(([k, v]) => `${k}: ${v}`).join('\n'),
+    headersText: JSON.stringify(result.headers, null, 2),
   }
 }
 
@@ -175,36 +320,53 @@ function AddEditDialog({ initial, editing, onClose, onSaved }: {
 
   const isRemote = form.transport === 'sse' || form.transport === 'http'
 
+  function changeTransport(transport: string) {
+    setForm((prev) => ({
+      ...prev,
+      transport,
+      // A URL already present in stdio proxy args should not need to be entered again.
+      url: transport === 'stdio' || prev.url.trim()
+        ? prev.url
+        : remoteUrlFromForm(prev) || remoteUrlFromText(pasteText),
+    }))
+  }
+
   function applyPaste() {
-    const patch = smartParse(pasteText)
-    if (Object.keys(patch).length === 0) {
-      setError(t('mcpLibrary.parseUnsupported'))
-      return
+    try {
+      const patch = smartParse(pasteText)
+      if (Object.keys(patch).length === 0) {
+        setError(t('mcpLibrary.parseUnsupported'))
+        return
+      }
+      setError('')
+      set(patch)
+      setTab('manual')
+    } catch (e) {
+      setError(t('mcpLibrary.invalidConfig', { error: e instanceof Error ? e.message : String(e) }))
     }
-    setError('')
-    set(patch)
-    setTab('manual')
   }
 
   async function pickDir() {
-    const picked = await open({ directory: true, multiple: false })
-    if (typeof picked === 'string') {
+    setBusy(true)
+    setError('')
+    try {
+      const picked = await open({ directory: true, multiple: false })
+      if (typeof picked !== 'string') return
       setScanDir(picked)
-      setBusy(true)
-      setError('')
-      try {
-        const result = await invoke<ScanResult>('scan_mcp_local', { dir: picked, provider: null })
-        setForm((prev) => applyScan(prev, result))
-        setTab('manual')
-      } catch (e) {
-        setError(t('mcpLibrary.scanFailed', { error: String(e) }))
-      } finally {
-        setBusy(false)
-      }
+      const result = await invoke<ScanResult>('scan_mcp_local', { dir: picked, provider: null })
+      const next = applyScan(form, result)
+      entryFromForm(next)
+      setForm(next)
+      setTab('manual')
+    } catch (e) {
+      setError(t('mcpLibrary.scanFailed', { error: String(e) }))
+    } finally {
+      setBusy(false)
     }
   }
 
   async function save() {
+    if (busy || tab !== 'manual') return
     setBusy(true)
     setError('')
     try {
@@ -213,7 +375,9 @@ function AddEditDialog({ initial, editing, onClose, onSaved }: {
       onSaved(entry.name)
       onClose()
     } catch (e) {
-      setError(t('mcpLibrary.saveFailed', { error: String(e) }))
+      setError(e instanceof InvalidMcpConfig
+        ? t('mcpLibrary.invalidConfig', { error: e.message })
+        : t('mcpLibrary.saveFailed', { error: String(e) }))
     } finally {
       setBusy(false)
     }
@@ -290,7 +454,7 @@ function AddEditDialog({ initial, editing, onClose, onSaved }: {
               </div>
               <div>
                 <label className={label}>{t('mcpLibrary.fieldTransport')}</label>
-                <select value={form.transport} onChange={(e) => set({ transport: e.target.value })} className={input}>
+                <select value={form.transport} onChange={(e) => changeTransport(e.target.value)} className={input}>
                   <option value="stdio">{t('mcpLibrary.transportStdio')}</option>
                   <option value="sse">{t('mcpLibrary.transportSse')}</option>
                   <option value="http">{t('mcpLibrary.transportHttp')}</option>
@@ -303,8 +467,8 @@ function AddEditDialog({ initial, editing, onClose, onSaved }: {
                     <input value={form.url} onChange={(e) => set({ url: e.target.value })} placeholder="https://example.com/mcp" className={`${input} font-mono text-xs`} />
                   </div>
                   <div>
-                    <label className={label}>{t('mcpLibrary.fieldHeaders')}</label>
-                    <textarea value={form.headersText} onChange={(e) => set({ headersText: e.target.value })} rows={2} placeholder="Authorization: Bearer …" className={`${input} font-mono text-xs`} />
+                    <label className={label}>{t('mcpLibrary.fieldHeadersJson')}</label>
+                    <textarea value={form.headersText} onChange={(e) => set({ headersText: e.target.value })} rows={3} placeholder={'{"Authorization": "Bearer token"}'} className={`${input} font-mono text-xs`} />
                   </div>
                 </>
               ) : (
@@ -314,23 +478,23 @@ function AddEditDialog({ initial, editing, onClose, onSaved }: {
                     <input value={form.command} onChange={(e) => set({ command: e.target.value })} placeholder="npx" className={`${input} font-mono text-xs`} />
                   </div>
                   <div>
-                    <label className={label}>{t('mcpLibrary.fieldArgs')}</label>
-                    <textarea value={form.argsText} onChange={(e) => set({ argsText: e.target.value })} rows={2} placeholder={'-y\n@playwright/mcp'} className={`${input} font-mono text-xs`} />
+                    <label className={label}>{t('mcpLibrary.fieldArgsJson')}</label>
+                    <textarea value={form.argsText} onChange={(e) => set({ argsText: e.target.value })} rows={3} placeholder={'["-y", "@playwright/mcp"]'} className={`${input} font-mono text-xs`} />
                   </div>
                   <div>
-                    <label className={label}>{t('mcpLibrary.fieldEnv')}</label>
-                    <textarea value={form.envText} onChange={(e) => set({ envText: e.target.value })} rows={2} placeholder="API_KEY=your_key" className={`${input} font-mono text-xs`} />
+                    <label className={label}>{t('mcpLibrary.fieldEnvJson')}</label>
+                    <textarea value={form.envText} onChange={(e) => set({ envText: e.target.value })} rows={3} placeholder={'{"API_KEY": "your_key"}'} className={`${input} font-mono text-xs`} />
                   </div>
                 </>
               )}
             </>
           )}
-          {error && <p className="rounded-lg bg-red-50 px-3 py-2 text-xs text-red-600 dark:bg-red-900/30 dark:text-red-300">{error}</p>}
+          {error && <p role="alert" className="rounded-lg bg-red-50 px-3 py-2 text-xs text-red-600 dark:bg-red-900/30 dark:text-red-300">{error}</p>}
         </div>
 
         <div className="flex justify-end gap-2 border-t border-gray-100 px-5 py-3 dark:border-gray-800">
           <button onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-gray-500 transition hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200">{t('mcpLibrary.cancel')}</button>
-          <button onClick={() => { void save() }} disabled={busy} className="inline-flex items-center gap-1 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-violet-500 disabled:opacity-50">
+          <button onClick={() => { void save() }} disabled={busy || tab !== 'manual'} className="inline-flex items-center gap-1 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-violet-500 disabled:opacity-50">
             {busy ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
             {t('mcpLibrary.save')}
           </button>
@@ -483,24 +647,30 @@ function EquipDialog({ entry, onClose, onNotice }: {
 
 function ImportDialog({ onClose, onNotice }: { onClose: () => void; onNotice: (message: string) => void }) {
   const { t } = useTranslation()
-  const { importMcpFromAgents, upsertMcpEntry } = useMemoryStore()
+  const { importMcpFromAgents, importMcpEntry } = useMemoryStore()
   const [scanning, setScanning] = useState(true)
   const [candidates, setCandidates] = useState<McpImportCandidate[]>([])
   const [picked, setPicked] = useState<Set<string>>(new Set())
   const [importing, setImporting] = useState(false)
+  const [scanError, setScanError] = useState('')
+  const [scanAttempt, setScanAttempt] = useState(0)
 
   useEffect(() => {
     let mounted = true
+    setScanning(true)
+    setScanError('')
     importMcpFromAgents()
       .then((found) => {
         if (!mounted) return
         setCandidates(found)
         setPicked(new Set(found.filter((c) => !c.already_in_catalog).map((c) => c.entry.name)))
-        setScanning(false)
       })
-      .catch(() => { if (mounted) setScanning(false) })
+      .catch((error) => {
+        if (mounted) setScanError(t('mcpLibrary.importFailed', { error: String(error) }))
+      })
+      .finally(() => { if (mounted) setScanning(false) })
     return () => { mounted = false }
-  }, [importMcpFromAgents])
+  }, [importMcpFromAgents, scanAttempt, t])
 
   function toggle(name: string) {
     setPicked((prev) => {
@@ -517,7 +687,7 @@ function ImportDialog({ onClose, onNotice }: { onClose: () => void; onNotice: (m
     try {
       for (const candidate of candidates) {
         if (picked.has(candidate.entry.name)) {
-          await upsertMcpEntry(candidate.entry)
+          await importMcpEntry(candidate.entry.name, candidate.agent)
           count += 1
         }
       }
@@ -550,10 +720,16 @@ function ImportDialog({ onClose, onNotice }: { onClose: () => void; onNotice: (m
               <Loader2 size={16} className="animate-spin" />{t('mcpLibrary.importScanning')}
             </div>
           )}
-          {!scanning && candidates.length === 0 && (
+          {scanError && (
+            <div role="alert" className="space-y-2 rounded-lg bg-red-50 p-3 text-xs text-red-600 dark:bg-red-900/20 dark:text-red-300">
+              <p className="break-words">{scanError}</p>
+              <button type="button" onClick={() => setScanAttempt(value => value + 1)} disabled={scanning} className="rounded border border-current px-2 py-1 disabled:opacity-50">{t('common.refresh')}</button>
+            </div>
+          )}
+          {!scanning && !scanError && candidates.length === 0 && (
             <p className="py-8 text-center text-sm text-gray-500 dark:text-gray-400">{t('mcpLibrary.importEmpty')}</p>
           )}
-          {!scanning && candidates.map((candidate) => {
+          {!scanning && !scanError && candidates.map((candidate) => {
             const target = targetOf(candidate.agent)
             return (
               <label key={candidate.entry.name} className="mb-1 flex cursor-pointer items-center gap-2 rounded-lg px-2 py-2 transition hover:bg-gray-50 dark:hover:bg-gray-800">
@@ -581,7 +757,7 @@ function ImportDialog({ onClose, onNotice }: { onClose: () => void; onNotice: (m
         </div>
         <div className="flex justify-end gap-2 border-t border-gray-100 px-5 py-3 dark:border-gray-800">
           <button onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-gray-500 transition hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200">{t('mcpLibrary.cancel')}</button>
-          <button onClick={() => { void importSelected() }} disabled={importing || picked.size === 0} className="inline-flex items-center gap-1 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-violet-500 disabled:opacity-50">
+          <button onClick={() => { void importSelected() }} disabled={scanning || !!scanError || importing || picked.size === 0} className="inline-flex items-center gap-1 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-violet-500 disabled:opacity-50">
             {importing ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
             {t('mcpLibrary.importApply', { count: picked.size })}
           </button>
@@ -591,12 +767,169 @@ function ImportDialog({ onClose, onNotice }: { onClose: () => void; onNotice: (m
   )
 }
 
+// ── Claude Desktop 配置路径（仅保存 Vibe Assistant 内部偏好） ──────────────────
+
+interface ClaudeDesktopMcpConfig {
+  candidates: { path: string; exists: boolean }[]
+  selected_path: string | null
+  override_path: string | null
+  needs_selection: boolean
+}
+
+function ClaudeDesktopConfigSelector({ disabled, onBusyChange, onChanged }: {
+  disabled: boolean
+  onBusyChange: (busy: boolean) => void
+  onChanged: () => Promise<void>
+}) {
+  const { t } = useTranslation()
+  const id = useId()
+  const [config, setConfig] = useState<ClaudeDesktopMcpConfig | null>(null)
+  // undefined follows the saved preference; null is an explicit return to auto mode.
+  const [draftPath, setDraftPath] = useState<string | null | undefined>(undefined)
+  const [busy, setBusy] = useState<'load' | 'pick' | 'save' | null>('load')
+  const [reloadAttempt, setReloadAttempt] = useState(0)
+  const [error, setError] = useState<{ kind: 'load' | 'pick' | 'save'; detail: string } | null>(null)
+  const [saved, setSaved] = useState(false)
+
+  useEffect(() => {
+    let mounted = true
+    setBusy('load')
+    setError(null)
+    onBusyChange(true)
+    async function load() {
+      try {
+        let next: ClaudeDesktopMcpConfig
+        try {
+          next = await invoke<ClaudeDesktopMcpConfig>('claude_desktop_mcp_config_get')
+        } catch (e) {
+          if (mounted) setError({ kind: 'load', detail: String(e) })
+          return
+        }
+        if (!mounted) return
+        // Keep any unsaved selection, including after a failed save or refresh.
+        setConfig(next)
+        // Rediscovery can change the effective path even without saving a preference.
+        if (reloadAttempt > 0) await onChanged()
+      } finally {
+        if (mounted) {
+          setBusy(null)
+          onBusyChange(false)
+        }
+      }
+    }
+    void load()
+    return () => { mounted = false; onBusyChange(false) }
+  }, [reloadAttempt, onBusyChange, onChanged])
+
+  const locked = disabled || busy !== null
+  const dirty = draftPath !== undefined && draftPath !== config?.override_path
+  const value = draftPath === undefined ? config?.override_path ?? '' : draftPath ?? ''
+  const paths = [...new Set([
+    ...(config?.candidates.map((candidate) => candidate.path) ?? []),
+    ...(config?.override_path ? [config.override_path] : []),
+    ...(draftPath ? [draftPath] : []),
+  ])]
+
+  async function pickFile() {
+    if (locked) return
+    setBusy('pick')
+    onBusyChange(true)
+    setError(null)
+    try {
+      const picked = await open({ directory: false, multiple: false, filters: [{ name: 'JSON', extensions: ['json'] }] })
+      if (typeof picked === 'string') {
+        setDraftPath(picked)
+        setSaved(false)
+      }
+    } catch (e) {
+      setError({ kind: 'pick', detail: String(e) })
+    } finally {
+      setBusy(null)
+      onBusyChange(false)
+    }
+  }
+
+  async function savePath() {
+    // A corrupt/missing preference must remain recoverable through a file choice.
+    if (locked || !dirty || draftPath === undefined) return
+    setBusy('save')
+    onBusyChange(true)
+    setError(null)
+    setSaved(false)
+    try {
+      let next: ClaudeDesktopMcpConfig
+      try {
+        next = await invoke<ClaudeDesktopMcpConfig>('claude_desktop_mcp_config_set', { path: draftPath })
+      } catch (e) {
+        setError({ kind: 'save', detail: String(e) })
+        return
+      }
+      setConfig(next)
+      setDraftPath(undefined)
+      setSaved(true)
+      // The preference is saved. Catalog/status refresh errors are shown by the page,
+      // not reported as save failures. Explicit re-import is a separate user action.
+      await onChanged()
+    } finally {
+      setBusy(null)
+      onBusyChange(false)
+    }
+  }
+
+  const button = 'inline-flex items-center gap-1 rounded-lg border border-gray-300 bg-white px-2.5 py-1.5 text-xs font-medium text-gray-700 transition hover:bg-gray-50 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700'
+  const errorKey = error?.kind === 'save' ? 'mcpLibrary.desktopConfigSaveFailed'
+    : error?.kind === 'pick' ? 'mcpLibrary.desktopConfigPickFailed' : 'mcpLibrary.desktopConfigLoadFailed'
+
+  return (
+    <section aria-label={t('mcpLibrary.desktopConfigLabel')} aria-busy={busy !== null} className="space-y-1.5 border-b border-gray-200 px-5 py-3 text-left dark:border-gray-800">
+      <div className="flex flex-wrap items-center gap-2">
+        <label htmlFor={id} className="text-xs font-medium text-gray-700 dark:text-gray-300">{t('mcpLibrary.desktopConfigLabel')}</label>
+        <select
+          id={id}
+          value={value}
+          onChange={(event) => { setDraftPath(event.target.value || null); setSaved(false) }}
+          disabled={locked}
+          aria-describedby={`${id}-details`}
+          className="min-w-0 flex-1 basis-64 rounded-lg border border-gray-300 bg-white px-2.5 py-1.5 text-xs text-gray-800 outline-none transition focus:border-violet-400 focus-visible:ring-2 focus-visible:ring-violet-500 disabled:opacity-50 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+        >
+          <option value="">{t(config ? 'mcpLibrary.desktopConfigAuto' : 'mcpLibrary.desktopConfigUnknown')}</option>
+          {paths.map((path) => {
+            const candidate = config?.candidates.find((item) => item.path === path)
+            return <option key={path} value={path}>{path}{candidate ? (candidate.exists ? '' : ` · ${t('mcpLibrary.desktopConfigMissing')}`) : ` · ${t('mcpLibrary.desktopConfigCustom')}`}</option>
+          })}
+        </select>
+        <button type="button" onClick={() => { void pickFile() }} disabled={locked} className={button}>
+          <FolderOpen size={13} />{t('mcpLibrary.desktopConfigBrowse')}
+        </button>
+        <button type="button" onClick={() => { void savePath() }} disabled={locked || !dirty} className={button}>
+          {busy === 'save' ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
+          {t(busy === 'save' ? 'common.saving' : 'common.save')}
+        </button>
+        <button type="button" onClick={() => setReloadAttempt((attempt) => attempt + 1)} disabled={locked} className={button}>
+          <RefreshCw size={13} className={busy === 'load' ? 'animate-spin' : ''} />{t('common.refresh')}
+        </button>
+      </div>
+      <div id={`${id}-details`} className="space-y-1 text-[11px] leading-5 text-gray-500 dark:text-gray-400">
+        <p className="break-all" aria-live="polite">
+          {t('mcpLibrary.desktopConfigEffective')}{' '}
+          <span className="font-mono">{config ? config.selected_path ?? t('mcpLibrary.desktopConfigNone') : t('mcpLibrary.desktopConfigUnknown')}</span>
+        </p>
+        {config?.needs_selection && <p role="alert" className="text-amber-700 dark:text-amber-300">{t('mcpLibrary.desktopConfigAmbiguous')}</p>}
+        <p>{t('mcpLibrary.desktopConfigHint')}</p>
+      </div>
+      {dirty && <p role="status" className="text-xs text-amber-700 dark:text-amber-300">{t('mcpLibrary.desktopConfigPending')}</p>}
+      {saved && <p role="status" className="text-xs text-emerald-700 dark:text-emerald-300">{t('mcpLibrary.desktopConfigSaved')}</p>}
+      {error && <p role="alert" className="break-words rounded-lg bg-red-50 px-3 py-2 text-xs text-red-600 dark:bg-red-900/30 dark:text-red-300">{t(errorKey, { error: error.detail })}</p>}
+    </section>
+  )
+}
+
 // ── 主页面 ────────────────────────────────────────────────────────────────────
 
 export const McpLibrary = memo(function McpLibrary({ active = true }: { active?: boolean }) {
   const { t } = useTranslation()
   const {
-    mcpCatalog, mcpStatuses, loadMcpCatalog, checkMcpStatuses, deleteMcpEntry,
+    mcpCatalog, mcpStatuses, mcpStatusError: statusError, loadMcpCatalog, checkMcpStatuses, deleteMcpEntry,
   } = useMemoryStore()
 
   const [booting, setBooting] = useState(true)
@@ -607,57 +940,42 @@ export const McpLibrary = memo(function McpLibrary({ active = true }: { active?:
   const [editing, setEditing] = useState<McpCatalogEntry | null>(null)
   const [equipping, setEquipping] = useState<McpCatalogEntry | null>(null)
   const [importOpen, setImportOpen] = useState(false)
-  // MCP 服务器中心双视图：runtime 服务器配置（工作流使用）与目录分发
-  const [view, setView] = useState<'servers' | 'catalog'>('servers')
-  const [runtimeServers, setRuntimeServers] = useState<McpServer[]>([])
-  const [providers, setProviders] = useState<{ id: string; name: string; model: string; base_url: string; api_key: string; is_custom: boolean; enabled: boolean; context_window?: number; max_output_tokens?: number }[]>([])
+  const [loadError, setLoadError] = useState('')
+  const [migrationNotices, setMigrationNotices] = useState<string[]>([])
+  const [configBusy, setConfigBusy] = useState(false)
+  const operationOpen = addOpen || editing !== null || equipping !== null || importOpen
 
-  const reloadServers = useCallback(async () => {
+  const refreshAll = useCallback(async () => {
+    setLoading(true)
+    setLoadError('')
     try {
-      const [ms, ps] = await Promise.all([
-        invoke<McpServer[]>('list_mcp_servers'),
-        invoke<{ id: string; name: string; model: string; base_url: string; api_key: string; is_custom: boolean; enabled: boolean; context_window?: number; max_output_tokens?: number }[]>('list_llm_providers'),
-      ])
-      setRuntimeServers(ms)
-      setProviders(ps)
-    } catch { /* 配置读取失败时保持空列表 */ }
-  }, [])
+      await loadMcpCatalog()
+      setMigrationNotices(await invoke<string[]>('mcp_catalog_migration_report'))
+      // Status failures are retained in the shared store, without blocking catalog edits.
+      await checkMcpStatuses().catch(() => {})
+    } catch (error) {
+      setLoadError(String(error))
+    } finally {
+      setLoading(false)
+      setBooting(false)
+    }
+  }, [loadMcpCatalog, checkMcpStatuses])
 
+  const refreshAfterConfigChange = useCallback(async () => {
+    useMemoryStore.setState({ mcpStatuses: [], mcpStatusError: '' })
+    await refreshAll()
+  }, [refreshAll])
+
+  // Re-entering the one management view reloads the shared catalog.
   useEffect(() => {
-    if (active) void reloadServers()
-  }, [active, reloadServers])
-
-  const activeProvider = providers.find(p => p.enabled && !!p.api_key.trim()) ?? null
-
-  useEffect(() => {
-    let mounted = true
-    Promise.all([loadMcpCatalog(), checkMcpStatuses().catch(() => {})])
-      .catch(() => setNotice(t('mcpLibrary.importFailed', { error: '' })))
-      .finally(() => { if (mounted) setBooting(false) })
-    return () => { mounted = false }
-  }, [loadMcpCatalog, checkMcpStatuses, t])
-
-  // 每次进入页面刷新一次状态（只读配置文件，毫秒级）；不做定时轮询。
-  useEffect(() => {
-    if (active) void checkMcpStatuses().catch(() => {})
-  }, [active, checkMcpStatuses])
+    if (active) void refreshAll()
+  }, [active, refreshAll])
 
   useEffect(() => {
     if (!notice) return
     const timer = window.setTimeout(() => setNotice(''), 6000)
     return () => window.clearTimeout(timer)
   }, [notice])
-
-  const refreshAll = useCallback(async () => {
-    setLoading(true)
-    try {
-      await Promise.all([loadMcpCatalog(), checkMcpStatuses()])
-    } catch (error) {
-      setNotice(String(error))
-    } finally {
-      setLoading(false)
-    }
-  }, [loadMcpCatalog, checkMcpStatuses])
 
   const visible = useMemo(() => {
     const keyword = query.trim().toLowerCase()
@@ -683,12 +1001,39 @@ export const McpLibrary = memo(function McpLibrary({ active = true }: { active?:
     }
   }
 
-  if (booting && view === 'catalog') {
+  if (booting) {
     return (
       <div className="flex h-full items-center justify-center gap-2 text-sm text-gray-500 dark:text-gray-400">
         <Loader2 size={16} className="animate-spin" />{t('mcpLibrary.booting')}
       </div>
     )
+  }
+
+  // Keep the same keyed child under the same root in both views so a catalog
+  // failure/recovery cannot discard the selector's draft, errors or saved state.
+  const configSelector = (
+    <ClaudeDesktopConfigSelector
+      key="claude-desktop-config"
+      disabled={loading || operationOpen}
+      onBusyChange={setConfigBusy}
+      onChanged={refreshAfterConfigChange}
+    />
+  )
+
+  if (loadError) {
+    return <div className="flex h-full min-h-0 flex-col overflow-y-auto">
+      <div className="border-b border-gray-200 px-5 py-3 dark:border-gray-800">
+        <h1 className="flex items-center gap-2 text-base font-semibold text-gray-900 dark:text-gray-100">
+          <Plug size={18} className="text-violet-500" />{t('mcpLibrary.title')}
+        </h1>
+      </div>
+      {configSelector}
+      <div role="alert" className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
+        <p className="text-sm font-medium text-red-600 dark:text-red-400">{t('mcpLibrary.loadFailed')}</p>
+        <p className="max-w-xl break-words text-xs text-gray-500 dark:text-gray-400">{loadError}</p>
+        <ErrorRecovery onRetry={() => { void refreshAll() }} disabled={loading || configBusy} />
+      </div>
+    </div>
   }
 
   return (
@@ -702,25 +1047,8 @@ export const McpLibrary = memo(function McpLibrary({ active = true }: { active?:
             </h1>
             <p className="truncate text-xs text-gray-500 dark:text-gray-400">{t('mcpLibrary.subtitle')}</p>
           </div>
-          {/* 视图切换：本地服务器 / 目录与分发 */}
-          <div className="flex shrink-0 rounded-lg border border-gray-200 p-0.5 dark:border-gray-700">
-            {([
-              { id: 'servers' as const, label: t('mcpLibrary.tabServers') },
-              { id: 'catalog' as const, label: t('mcpLibrary.tabCatalog') },
-            ]).map(v => (
-              <button key={v.id} onClick={() => setView(v.id)}
-                className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
-                  view === v.id
-                    ? 'bg-violet-600 text-white'
-                    : 'text-gray-500 hover:text-gray-800 dark:text-gray-400 dark:hover:text-gray-200'
-                }`}>
-                {v.label}
-              </button>
-            ))}
-          </div>
         </div>
-        {view === 'catalog' && (
-          <>
+        <>
             <div className="relative">
               <Search size={14} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" />
               <input
@@ -732,35 +1060,42 @@ export const McpLibrary = memo(function McpLibrary({ active = true }: { active?:
             </div>
             <button
               onClick={() => { void refreshAll() }}
-              disabled={loading}
+              disabled={loading || configBusy}
               className="inline-flex items-center gap-1 rounded-lg border border-gray-300 bg-white px-2.5 py-1.5 text-xs font-medium text-gray-700 transition hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
             >
               <RefreshCw size={13} className={loading ? 'animate-spin' : ''} />{t('mcpLibrary.refreshStatus')}
             </button>
             <button
               onClick={() => setImportOpen(true)}
-              disabled={loading}
+              disabled={loading || configBusy}
               className="inline-flex items-center gap-1 rounded-lg border border-gray-300 bg-white px-2.5 py-1.5 text-xs font-medium text-gray-700 transition hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
             >
               <Download size={13} />{t('mcpLibrary.importFromAgents')}
             </button>
             <button
               onClick={() => { setEditing(null); setAddOpen(true) }}
-              className="inline-flex items-center gap-1 rounded-lg bg-violet-600 px-2.5 py-1.5 text-xs font-medium text-white transition hover:bg-violet-500"
+              disabled={loading || configBusy}
+              className="inline-flex items-center gap-1 rounded-lg bg-violet-600 px-2.5 py-1.5 text-xs font-medium text-white transition hover:bg-violet-500 disabled:opacity-50"
             >
               <Plus size={13} />{t('mcpLibrary.add')}
             </button>
-          </>
-        )}
+        </>
       </div>
 
-      {view === 'servers' ? (
-        <div className="min-h-0 flex-1 overflow-hidden">
-          <McpServersManager servers={runtimeServers} onReload={reloadServers} activeProvider={activeProvider} />
+      {configSelector}
+      {statusError && (
+        <div role="alert" className="border-b border-red-200 bg-red-50 px-5 py-3 text-xs text-red-600 dark:border-red-800 dark:bg-red-500/10 dark:text-red-300">
+          {t('mcpLibrary.statusFailed', { error: statusError })}
+          <ErrorRecovery onRetry={() => { void refreshAll() }} disabled={loading || configBusy} />
         </div>
-      ) : (
-        <>
-        {notice && (
+      )}
+      {migrationNotices.length > 0 && (
+        <div role="status" className="border-b border-amber-200 bg-amber-50 px-5 py-3 text-xs leading-5 text-amber-800 dark:border-amber-800 dark:bg-amber-500/10 dark:text-amber-300">
+          <p className="font-medium">{t('mcpLibrary.migrationNotice')}</p>
+          {migrationNotices.map((message, index) => <p key={index} className="break-words">{message}</p>)}
+        </div>
+      )}
+      {notice && (
         <div className="flex items-center gap-2 border-b border-emerald-200 bg-emerald-50 px-5 py-2 text-xs text-emerald-700 dark:border-emerald-500/20 dark:bg-emerald-500/10 dark:text-emerald-300">
           <Check size={12} className="shrink-0" />
           <span className="min-w-0 flex-1 break-all">{notice}</span>
@@ -826,13 +1161,13 @@ export const McpLibrary = memo(function McpLibrary({ active = true }: { active?:
                   </div>
                   {/* actions */}
                   <div className="mt-3 flex items-center gap-1.5">
-                    <button onClick={() => setEquipping(entry)} className="inline-flex items-center gap-1 rounded-md bg-violet-600 px-2 py-1 text-[11px] font-medium text-white transition hover:bg-violet-500">
+                    <button onClick={() => setEquipping(entry)} disabled={loading || configBusy} className="inline-flex items-center gap-1 rounded-md bg-violet-600 px-2 py-1 text-[11px] font-medium text-white transition hover:bg-violet-500 disabled:opacity-50">
                       <Plug size={11} />{t('mcpLibrary.equip')}
                     </button>
-                    <button onClick={() => { setEditing(entry); setAddOpen(true) }} className="inline-flex items-center gap-1 rounded-md border border-gray-300 px-2 py-1 text-[11px] font-medium text-gray-600 transition hover:bg-gray-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800">
+                    <button onClick={() => { setEditing(entry); setAddOpen(true) }} disabled={loading || configBusy} className="inline-flex items-center gap-1 rounded-md border border-gray-300 px-2 py-1 text-[11px] font-medium text-gray-600 transition hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800">
                       <Pencil size={11} />{t('mcpLibrary.edit')}
                     </button>
-                    <button onClick={() => { void handleDelete(entry) }} disabled={loading} className="ml-auto inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium text-gray-400 transition hover:text-red-600 dark:hover:text-red-400 disabled:opacity-50">
+                    <button onClick={() => { void handleDelete(entry) }} disabled={loading || configBusy} className="ml-auto inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium text-gray-400 transition hover:text-red-600 dark:hover:text-red-400 disabled:opacity-50">
                       <Trash2 size={11} />{t('mcpLibrary.delete')}
                     </button>
                   </div>
@@ -843,8 +1178,6 @@ export const McpLibrary = memo(function McpLibrary({ active = true }: { active?:
         )}
         <p className="mt-4 text-center text-[11px] text-gray-400 dark:text-gray-500">{t('mcpLibrary.statusHint')}</p>
       </div>
-        </>
-      )}
 
       {addOpen && (
         <AddEditDialog

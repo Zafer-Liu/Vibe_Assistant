@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -453,7 +454,7 @@ impl IngestStore {
 fn l1_extraction_messages(transcript: &str) -> Vec<Value> {
     let language = output_language_directive(transcript);
     vec![
-        json!({"role": "system", "content": format!("你是本地 Agent Manager 的高质量会话记忆整理器。每个完整会话最多输出 3 条、通常 1–2 条。第一条必须是 `summary`，且 durability 必须为 `session`；其余只保留可跨后续任务复用的事实、已确认决定、偏好候选或约束。不要逐步复述操作、工具调用、短暂报错、无结论讨论、重复表述或大段代码。每条须可独立理解，明确主体和结论；不得臆测用户偏好。\n\n必须为每条写准确 durability：`session` 仅当前会话摘要、进度或临时排查；`short_term` 是当前项目/近期任务可能持续数天到数周的决定；`long_term` 仅限用户明确表达、跨项目且 90 天后仍适用的偏好或硬约束。助手自行做出的代码修改、模型/端点/Token 配置、UI 实现、构建/测试记录一律不得标为 `long_term`。若某条拿不准，请保守标为 `short_term`（summary 一律标 `session`），不要猜测升级。{language}\n\n严格输出 JSON：{{\"memories\":[{{\"content\":\"...\",\"type\":\"summary|fact|decision|constraint|preference_candidate|open_item\",\"durability\":\"session|short_term|long_term\"}}]}}。只输出这个 JSON，不要包裹在代码块或说明文字里。没有可长期复用的信息时只输出一个 summary。")}),
+        json!({"role": "system", "content": format!("你是本地 Vibe Assistant 的高质量会话记忆整理器。每个完整会话最多输出 3 条、通常 1–2 条。第一条必须是 `summary`，且 durability 必须为 `session`；其余只保留可跨后续任务复用的事实、已确认决定、偏好候选或约束。不要逐步复述操作、工具调用、短暂报错、无结论讨论、重复表述或大段代码。每条须可独立理解，明确主体和结论；不得臆测用户偏好。\n\n必须为每条写准确 durability：`session` 仅当前会话摘要、进度或临时排查；`short_term` 是当前项目/近期任务可能持续数天到数周的决定；`long_term` 仅限用户明确表达、跨项目且 90 天后仍适用的偏好或硬约束。助手自行做出的代码修改、模型/端点/Token 配置、UI 实现、构建/测试记录一律不得标为 `long_term`。若某条拿不准，请保守标为 `short_term`（summary 一律标 `session`），不要猜测升级。{language}\n\n严格输出 JSON：{{\"memories\":[{{\"content\":\"...\",\"type\":\"summary|fact|decision|constraint|preference_candidate|open_item\",\"durability\":\"session|short_term|long_term\"}}]}}。只输出这个 JSON，不要包裹在代码块或说明文字里。没有可长期复用的信息时只输出一个 summary。")}),
         json!({"role": "user", "content": format!("以下是一段已经结束的会话，请整体理解后整理为 L1：\n\n{transcript}")}),
     ]
 }
@@ -1453,12 +1454,21 @@ fn normalize_l1_durability(raw: Option<&str>, memory_type: &str) -> String {
     }
 }
 
-/// 从模型输出中提取 memories 数组：容忍代码块、前后说明文字、裸数组等
-/// 常见包装形态。返回 None 表示确实找不到任何数组。
+/// 从模型输出中提取 memories 数组：容忍代码块、前后说明文字、裸数组、
+/// `memory` 单数键等常见包装形态。返回 None 表示确实找不到任何数组。
 fn extract_l1_memories_value(normalized: &str) -> Option<Value> {
+    // 模型偶尔把键名写成单数 `memory`；契约里两个键都指同一数组。
+    fn memories_array(value: &Value) -> Option<Value> {
+        for key in ["memories", "memory"] {
+            if let Some(values) = value.get(key).and_then(Value::as_array) {
+                return Some(Value::Array(values.clone()));
+            }
+        }
+        None
+    }
     if let Ok(value) = serde_json::from_str::<Value>(normalized) {
-        if let Some(values) = value.get("memories").and_then(Value::as_array) {
-            return Some(Value::Array(values.clone()));
+        if let Some(values) = memories_array(&value) {
+            return Some(values);
         }
         if value.is_array() {
             return Some(value);
@@ -1470,8 +1480,8 @@ fn extract_l1_memories_value(normalized: &str) -> Option<Value> {
         if let (Some(start), Some(end)) = (normalized.find(open), normalized.rfind(close)) {
             if start < end {
                 if let Ok(value) = serde_json::from_str::<Value>(&normalized[start..=end]) {
-                    if let Some(values) = value.get("memories").and_then(Value::as_array) {
-                        return Some(Value::Array(values.clone()));
+                    if let Some(values) = memories_array(&value) {
+                        return Some(values);
                     }
                     if value.is_array() {
                         return Some(value);
@@ -1480,7 +1490,77 @@ fn extract_l1_memories_value(normalized: &str) -> Option<Value> {
             }
         }
     }
-    None
+    // 括号不闭合（输出被截断）：逐元素回收 memories 数组里完整的对象。
+    salvage_truncated_memories(normalized)
+}
+
+/// 契约失败时附在错误消息里的一小段模型原文。l1_error_detail 只保留 600
+/// 字符，摘录压成单行并截到 200 字符，给错误前缀留出余量——此前只存错误
+/// 消息不存原文，定位模型到底输出了什么只能靠重放请求。
+fn output_excerpt(text: &str) -> String {
+    let flattened = text.replace(['\n', '\r', '\t'], " ");
+    let mut chars = flattened.chars();
+    let excerpt: String = chars.by_ref().take(200).collect();
+    if chars.next().is_some() {
+        format!("{excerpt}…")
+    } else {
+        excerpt
+    }
+}
+
+/// 截断补救：模型输出被 max_tokens 或服务端截断时 JSON 断在半途，整体
+/// 解析与首尾大括号截取都会失败（括号不闭合）。定位 memories/memory 数组
+/// 后逐元素扫描，只回收完整闭合的对象，丢弃断尾的残缺元素。
+fn salvage_truncated_memories(normalized: &str) -> Option<Value> {
+    let key_pos = ["memories", "memory"]
+        .iter()
+        .filter_map(|key| normalized.find(&format!("\"{key}\"")))
+        .min()?;
+    let array_start = normalized[key_pos..].find('[')? + key_pos;
+    let bytes = normalized.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut elements: Vec<&str> = Vec::new();
+    let mut element_start: Option<usize> = None;
+    for (offset, &byte) in bytes.iter().enumerate().skip(array_start + 1) {
+        let ch = byte as char;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    element_start = Some(offset);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    if let Some(start) = element_start.take() {
+                        elements.push(&normalized[start..=offset]);
+                    }
+                }
+            }
+            // 数组顶层遇到 ']' 即数组结束；未闭合的残缺元素自然丢弃。
+            ']' if depth == 0 => break,
+            _ => {}
+        }
+    }
+    let values = elements
+        .iter()
+        .filter_map(|element| serde_json::from_str::<Value>(element).ok())
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then_some(Value::Array(values))
 }
 
 /// 解析 L1 输出并做**修复式**校验：模型输出轻微偏离契约（顺序、条数、
@@ -1499,7 +1579,12 @@ fn parse_typed_l1_candidates(
     let Some(values) =
         extract_l1_memories_value(normalized).and_then(|value| value.as_array().cloned())
     else {
-        return Err("模型输出未符合 L1 JSON 契约，缺少 memories 数组".into());
+        let excerpt = output_excerpt(normalized);
+        return Err(if excerpt.is_empty() {
+            "模型输出未符合 L1 JSON 契约，缺少 memories 数组（模型返回了空内容）".into()
+        } else {
+            format!("模型输出未符合 L1 JSON 契约，缺少 memories 数组。输出开头：{excerpt}")
+        });
     };
     let mut candidates = Vec::new();
     for value in &values {
@@ -1535,7 +1620,10 @@ fn parse_typed_l1_candidates(
         });
     }
     if candidates.is_empty() {
-        return Err("模型未输出任何可用的 L1 记忆".into());
+        return Err(format!(
+            "模型未输出任何可用的 L1 记忆。输出开头：{}",
+            output_excerpt(normalized)
+        ));
     }
     // 修复 1：summary 不在首位时移到首位（契约只要求第一条是 summary）。
     if let Some(index) = candidates
@@ -1920,12 +2008,11 @@ fn l2_final_retry_messages(parts: &[String]) -> Vec<Value> {
 /// Manual L2 generation only reads a bounded recent L1 window.  It uses a
 /// map-reduce compression pass and stores all selected evidence ids, rather
 /// than feeding the entire memory library into one unreviewable prompt.
-#[tauri::command]
-pub async fn memory_short_term_consolidate(
-    telemetry: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
-    days: Option<i64>,
+pub(crate) async fn consolidate_l2(
+    telemetry: &crate::telemetry_store::TelemetryStore,
+    days: i64,
 ) -> Result<MemoryLayerRunResult, String> {
-    let days = days.unwrap_or(30).clamp(1, 90);
+    let days = days.clamp(1, 90);
     let mut evidence = select_l2_evidence(telemetry.recent_l1_memories(days, 500)?);
     // 归入 L2 的用户自定义记忆强制进入整理证据：不受时间窗与类型筛选
     // 影响；L3 层自定义记忆只进 Profile，两者相互独立。
@@ -1993,12 +2080,22 @@ pub async fn memory_short_term_consolidate(
     })
 }
 
+#[tauri::command]
+pub async fn memory_short_term_consolidate(
+    telemetry: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
+    days: Option<i64>,
+) -> Result<MemoryLayerRunResult, String> {
+    begin_layer_refresh()?;
+    let result = consolidate_l2(&telemetry, days.unwrap_or(30)).await;
+    end_layer_refresh();
+    result
+}
+
 /// Build, but never automatically publish, a compact L3 Profile. Existing
 /// Profile text is input as a baseline so updates preserve stable preferences
 /// unless newer L2 evidence explicitly supports a change.
-#[tauri::command]
-pub async fn memory_long_term_profile_draft(
-    telemetry: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
+pub(crate) async fn draft_l3(
+    telemetry: &crate::telemetry_store::TelemetryStore,
 ) -> Result<MemoryLayerRunResult, String> {
     let l2 = telemetry
         .memory_layer_documents("l2", 12)?
@@ -2109,6 +2206,16 @@ pub async fn memory_long_term_profile_draft(
 }
 
 #[tauri::command]
+pub async fn memory_long_term_profile_draft(
+    telemetry: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
+) -> Result<MemoryLayerRunResult, String> {
+    begin_layer_refresh()?;
+    let result = draft_l3(&telemetry).await;
+    end_layer_refresh();
+    result
+}
+
+#[tauri::command]
 pub fn memory_long_term_profile_publish(
     telemetry: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
     document_id: String,
@@ -2155,7 +2262,7 @@ pub async fn memory_layer_documents(
 // Hook 自动配置：向支持 hook 的 Agent 写入回调（Claude Code settings.json）
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Stable marker used to recognise entries injected by Agent Manager.  Do not
+/// Stable marker used to recognise entries injected by Vibe Assistant.  Do not
 /// use the HTTP address here: the hook server port is user configurable.
 const HOOK_MARKER: &str = "X-Agent-Manager-Hook";
 const CLAUDE_SETTINGS: &str = ".claude/settings.json";
@@ -2195,11 +2302,11 @@ fn hook_command(agent_type: &str) -> Result<String, String> {
     }
 }
 
-/// SessionStart 注入 hook：仅拉取 L2 近 30 天工作记忆并写到 stdout。端点已按来源
-/// 返回 Claude 形态的结构化 JSON（hookSpecificOutput.additionalContext），
-/// curl 只需透传，harness 解析后注入模型上下文。应用未运行时 curl 静默
-/// 失败，不阻塞会话启动。URL 携带 source 标识，端点据此把注入计入记忆
-/// 注入摘要。
+/// SessionStart 注入 hook：拉取 L3 长期记忆 + L2 近 30 天工作记忆合并写到
+/// stdout。端点已按来源返回 Claude 形态的结构化 JSON
+/// （hookSpecificOutput.additionalContext），curl 只需透传，harness 解析后注入
+/// 模型上下文。应用未运行时 curl 静默失败，不阻塞会话启动。URL 携带 source
+/// 标识，端点据此把注入计入记忆注入摘要。
 fn hook_inject_command(agent_type: &str) -> String {
     let url = format!(
         "http://127.0.0.1:{}/memory/context?source={agent_type}&event=SessionStart",
@@ -2214,10 +2321,11 @@ fn hook_inject_command(agent_type: &str) -> String {
 }
 
 /// UserPromptSubmit 组合 hook：先透传 stdin 事件到沉淀端点（出站），再拉取
-/// L3 长期记忆写到 stdout（入站），实现每轮提问都注入一次。两条 curl 用
-/// 分隔符串联：沉淀失败（应用未运行）不阻断注入；注入失败时 stdout 为空，
-/// harness 按无附加上下文继续，不阻塞提问。端点带 event=UserPromptSubmit，
-/// 按事件名返回协议格式并单独计入记忆注入摘要。
+/// L3 长期记忆写到 stdout（入站）。端点按内容指纹门控：L3 未变化时返回空
+/// 正文，本轮零注入成本。两条 curl 用分隔符串联：沉淀失败（应用未运行）
+/// 不阻断注入；注入失败时 stdout 为空，harness 按无附加上下文继续，不阻塞
+/// 提问。端点带 event=UserPromptSubmit，按事件名返回协议格式并单独计入
+/// 记忆注入摘要（跳过也会留痕，正文不重复存储）。
 fn hook_prompt_command(agent_type: &str) -> Result<String, String> {
     let sink = hook_command(agent_type)?;
     let inject_url = format!(
@@ -2264,8 +2372,9 @@ fn install_command_hooks(agent_type: &str) -> Result<Vec<String>, String> {
     let inject_command = hook_inject_command(agent_type);
     let prompt_command = hook_prompt_command(agent_type)?;
     let mut installed = Vec::new();
-    // 出站沉淀（Agent → 本应用）与入站注入：SessionStart 只注入
-    // L2，UserPromptSubmit 用组合命令沉淀当前轮并注入 L3。
+    // 出站沉淀（Agent → 本应用）与入站注入：SessionStart 注入 L3+L2 完整
+    // 稳定层；UserPromptSubmit 用组合命令沉淀当前轮，并按内容指纹门控注入
+    // L3（内容未变化时端点返回空正文，本轮跳过）。
     for (event, command) in [
         ("UserPromptSubmit", &prompt_command),
         ("PostToolUse", &command),
@@ -2767,6 +2876,264 @@ pub fn start_idle_flusher(backend: Arc<MemoryBackend>, store: IngestStore) {
     });
 }
 
+// ── L2/L3 后台自动重算 ─────────────────────────────────────────────────────
+
+/// app_settings 键。取值是 AutoRefreshConfig 对象；早期版本存过布尔开关，
+/// 解析时按「enabled」迁移。
+const AUTO_REFRESH_SETTING_KEY: &str = "memory_auto_refresh_l2_l3";
+/// 失败后的重试退避：不必等满最小间隔，1 小时后再试一次。
+const REFRESH_RETRY_BACKOFF: Duration = Duration::from_secs(3600);
+/// 检查周期：半小时醒一次看条件是否满足。
+const REFRESH_TICK: Duration = Duration::from_secs(1800);
+/// 启动延迟：先让 L1 整理队列和遥测回补跑完，避免与启动高峰抢模型。
+const REFRESH_STARTUP_DELAY: Duration = Duration::from_secs(600);
+
+/// 定时重算设置：开关 + 两层各自的重建最小间隔。默认 L2 7 天、L3 1 个月
+/// （长期画像稳定，间隔比 L2 长），设置页可改。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AutoRefreshConfig {
+    pub enabled: bool,
+    pub l2_days: u32,
+    pub l3_days: u32,
+}
+
+impl Default for AutoRefreshConfig {
+    fn default() -> Self {
+        AutoRefreshConfig { enabled: true, l2_days: 7, l3_days: 30 }
+    }
+}
+
+/// 纯函数：兼容布尔旧值 / 部分字段 / 越界值，越界一律收敛到允许区间。
+fn parse_auto_refresh_config(raw: Option<Value>) -> AutoRefreshConfig {
+    let mut config = AutoRefreshConfig::default();
+    match raw {
+        // 旧版只存布尔开关：保留开关语义，间隔取默认。
+        Some(Value::Bool(enabled)) => config.enabled = enabled,
+        Some(value) => {
+            if let Ok(parsed) = serde_json::from_value::<AutoRefreshConfig>(value) {
+                config = parsed;
+            }
+        }
+        None => {}
+    }
+    config.l2_days = config.l2_days.clamp(1, 90);
+    config.l3_days = config.l3_days.clamp(1, 365);
+    config
+}
+
+/// 手动整理与后台调度共用一把互斥闸：L2 的 map/reduce 是多轮模型调用，
+/// 一次可能持续数分钟，重入只会重复烧钱并互相覆盖文档。
+static LAYER_REFRESH_RUNNING: AtomicBool = AtomicBool::new(false);
+
+fn begin_layer_refresh() -> Result<(), String> {
+    LAYER_REFRESH_RUNNING
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .map(|_| ())
+        .map_err(|_| "已有 L2/L3 整理任务在进行中，请稍后再试".to_string())
+}
+
+fn try_begin_layer_refresh() -> bool {
+    LAYER_REFRESH_RUNNING
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+}
+
+fn end_layer_refresh() {
+    LAYER_REFRESH_RUNNING.store(false, Ordering::Release);
+}
+
+fn parse_doc_time(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|time| time.with_timezone(&chrono::Utc))
+}
+
+/// L2 是否到期：文档缺失→到期；否则需同时满足「距上次达到设置间隔」与
+/// 「期间有更新的 L1 证据」——没有新内容的定时重跑只会原样复述旧文档。
+fn l2_refresh_due(
+    doc_time: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+    has_newer_evidence: bool,
+    min_interval: chrono::Duration,
+) -> bool {
+    match doc_time {
+        None => true,
+        Some(time) => has_newer_evidence && now - time >= min_interval,
+    }
+}
+
+/// L3 是否到期：没有已发布 L3→到期（前提是有 L2）；否则需 L2 比 L3 新
+/// （画像未覆盖当前 L2 内容）且距上次发布达到设置间隔。
+fn l3_refresh_due(
+    l2_time: Option<chrono::DateTime<chrono::Utc>>,
+    l3_time: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+    min_interval: chrono::Duration,
+) -> bool {
+    let Some(l2_time) = l2_time else { return false };
+    match l3_time {
+        None => true,
+        Some(time) => l2_time > time && now - time >= min_interval,
+    }
+}
+
+#[tauri::command]
+pub fn memory_auto_refresh_get(
+    telemetry: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
+) -> Result<AutoRefreshConfig, String> {
+    Ok(parse_auto_refresh_config(
+        telemetry.app_setting_get::<Value>(AUTO_REFRESH_SETTING_KEY),
+    ))
+}
+
+#[tauri::command]
+pub fn memory_auto_refresh_set(
+    telemetry: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
+    enabled: bool,
+    l2_days: u32,
+    l3_days: u32,
+) -> Result<AutoRefreshConfig, String> {
+    // 越界值收敛后回传，设置页据此显示生效值。
+    let config = AutoRefreshConfig {
+        enabled,
+        l2_days: l2_days.clamp(1, 90),
+        l3_days: l3_days.clamp(1, 365),
+    };
+    telemetry.app_setting_set(AUTO_REFRESH_SETTING_KEY, &config)?;
+    Ok(config)
+}
+
+fn scheduler_log(state: &str, detail: String) {
+    if let Some(ingest) = ingest_store() {
+        ingest.log(IngestLog {
+            at: now_str(),
+            agent_id: GLOBAL_MEMORY_OWNER.into(),
+            kind: "memory".into(),
+            state: state.into(),
+            detail,
+        });
+    }
+}
+
+/// 后台自动重算：L2 有新 L1 证据且距上次文档达到设置间隔（默认 7 天）时
+/// 重建；L2 更新过且距上次发布达到设置间隔（默认 30 天）时重建草案并
+/// **自动发布**（注入用文档是发布版，不发布等于没更新）。间隔可在设置页
+/// 调整，每轮 tick 现读现用，改完无需重启。所有动作都写进注入页的记录
+/// 流，前端经 `memory-layers-updated` 事件刷新。
+pub fn start_l2_l3_refresh_scheduler(app: tauri::AppHandle) {
+    use tauri::Emitter;
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(REFRESH_STARTUP_DELAY).await;
+        let mut next_l2_attempt = Instant::now();
+        let mut next_l3_attempt = Instant::now();
+        loop {
+            if let Some(store) = crate::telemetry_store::shared_store() {
+                let config = parse_auto_refresh_config(
+                    store.app_setting_get::<Value>(AUTO_REFRESH_SETTING_KEY),
+                );
+                let model_ready = llm::memory_extraction_provider().is_ok();
+                if !config.enabled || !model_ready || !try_begin_layer_refresh() {
+                    tokio::time::sleep(REFRESH_TICK).await;
+                    continue;
+                }
+                let l2_interval = chrono::Duration::days(config.l2_days as i64);
+                let l3_interval = chrono::Duration::days(config.l3_days as i64);
+                let now = Instant::now();
+                if now >= next_l2_attempt {
+                    match refresh_l2_if_due(&store, l2_interval).await {
+                        Ok(Some(document)) => {
+                            scheduler_log(
+                                "stored",
+                                format!("后台自动重算 L2：{}（{} 条来源）", document.created_at, document.source_count),
+                            );
+                            let _ = app.emit("memory-layers-updated", ());
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            next_l2_attempt = Instant::now() + REFRESH_RETRY_BACKOFF;
+                            scheduler_log("failed", format!("后台自动重算 L2 失败：{error}"));
+                        }
+                    }
+                }
+                let now = Instant::now();
+                if now >= next_l3_attempt {
+                    match refresh_l3_if_due(&store, l3_interval).await {
+                        Ok(true) => {
+                            scheduler_log("stored", "后台自动重算 L3：已重建草案并自动发布".into());
+                            let _ = app.emit("memory-layers-updated", ());
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            next_l3_attempt = Instant::now() + REFRESH_RETRY_BACKOFF;
+                            scheduler_log("failed", format!("后台自动重算 L3 失败：{error}"));
+                        }
+                    }
+                }
+                end_layer_refresh();
+            }
+            tokio::time::sleep(REFRESH_TICK).await;
+        }
+    });
+}
+
+/// L2 到期则重算。`Ok(None)` = 未到期或没有新证据（正常跳过，不算失败）。
+async fn refresh_l2_if_due(
+    store: &crate::telemetry_store::TelemetryStore,
+    min_interval: chrono::Duration,
+) -> Result<Option<crate::telemetry_store::MemoryLayerDocument>, String> {
+    let evidence = store.recent_l1_memories(30, 500)?;
+    if evidence.is_empty()
+        && store.user_defined_l1_memories_for_scope("l2")?.is_empty()
+    {
+        return Ok(None);
+    }
+    let current = store.active_memory_layer_document("l2")?;
+    let doc_time = current.as_ref().and_then(|doc| parse_doc_time(&doc.created_at));
+    // 仅有新 L1 证据落在当前文档之后才值得重算；否则模型会原样复述旧文档。
+    let has_newer = evidence
+        .iter()
+        .filter_map(|item| parse_doc_time(&item.created_at))
+        .any(|created| doc_time.is_none_or(|doc_time| created > doc_time));
+    if l2_refresh_due(doc_time, chrono::Utc::now(), has_newer, min_interval) {
+        consolidate_l2(store, 30)
+            .await
+            .map(|result| Some(result.document))
+    } else {
+        Ok(None)
+    }
+}
+
+/// L3 到期则重建草案并自动发布。`Ok(false)` = 未到期。
+async fn refresh_l3_if_due(
+    store: &crate::telemetry_store::TelemetryStore,
+    min_interval: chrono::Duration,
+) -> Result<bool, String> {
+    let Some(l2) = store.active_memory_layer_document("l2")? else {
+        return Ok(false);
+    };
+    let Some(l2_time) = parse_doc_time(&l2.created_at) else {
+        return Ok(false);
+    };
+    let l3 = store.active_memory_layer_document("l3")?;
+    let l3_time = l3
+        .as_ref()
+        .and_then(|doc| {
+            doc.published_at
+                .as_deref()
+                .and_then(parse_doc_time)
+                .or_else(|| parse_doc_time(&doc.created_at))
+        });
+    if !l3_refresh_due(Some(l2_time), l3_time, chrono::Utc::now(), min_interval) {
+        return Ok(false);
+    }
+    let draft = draft_l3(store).await?;
+    // 自动发布：注入读的是发布版。草案生成本身以已发布 Profile 为基线，
+    // 手工编辑过的条目会被生成提示词默认保留。
+    store.publish_memory_layer_document(&draft.document.id, None)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2807,6 +3174,94 @@ mod tests {
         assert_eq!(
             strip_memory_thinking("user", "<think>这是用户原文</think>"),
             "<think>这是用户原文</think>"
+        );
+    }
+
+    #[test]
+    fn layer_refresh_due_predicates_match_scheduler_intent() {
+        use super::{l2_refresh_due, l3_refresh_due, parse_doc_time};
+        use chrono::DateTime;
+        // 库里实际存的两种 rfc3339 形态（7 位与 6 位纳秒）都必须能解析。
+        let seven = parse_doc_time("2026-10-04T02:53:24.592798300+00:00").expect("7-digit nanos");
+        let six = parse_doc_time("2026-09-21T15:12:36.673637+00:00").expect("6-digit nanos");
+        assert_eq!(seven.timestamp() % 60, 24);
+        assert_eq!(six.timestamp() % 60, 36);
+        assert!(parse_doc_time("garbage").is_none());
+
+        let now = DateTime::parse_from_rfc3339("2026-10-04T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let day = chrono::Duration::days(1);
+        let l2_default = chrono::Duration::days(7);
+        let l3_default = chrono::Duration::days(30);
+
+        // L2：没有文档 → 到期（有证据时的前置检查在调用方）。
+        assert!(l2_refresh_due(None, now, false, l2_default));
+        // 文档年轻（即使有新证据）→ 不到期。
+        assert!(!l2_refresh_due(Some(now - chrono::Duration::hours(13)), now, true, l2_default));
+        // 到达间隔但没有新证据 → 不到期（不重复烧模型复述旧文档）。
+        assert!(!l2_refresh_due(Some(now - l2_default), now, false, l2_default));
+        // 到达间隔且有新证据 → 到期。
+        assert!(l2_refresh_due(Some(now - l2_default), now, true, l2_default));
+        assert!(l2_refresh_due(Some(now - l2_default - day), now, true, l2_default));
+        // 无效时间戳按「无文档」处理 → 到期（重算后写回有效时间自愈）。
+        assert!(l2_refresh_due(None, now, true, day));
+
+        // L3：没有 L2 → 永不到期。
+        assert!(!l3_refresh_due(None, None, now, l3_default));
+        // 有 L2 没 L3 → 到期。
+        assert!(l3_refresh_due(Some(now - day), None, now, l3_default));
+        // L3 比 L2 新（画像已覆盖 L2 内容）→ 不到期，即使过了间隔。
+        assert!(!l3_refresh_due(
+            Some(now - day),
+            Some(now - chrono::Duration::hours(1)),
+            now,
+            l3_default
+        ));
+        // L2 比 L3 新但距上次发布未到间隔 → 不到期。
+        let old_l3 = now - chrono::Duration::days(10);
+        assert!(!l3_refresh_due(Some(now - day), Some(old_l3), now, l3_default));
+        // L2 比 L3 新且到达间隔 → 到期。
+        assert!(l3_refresh_due(
+            Some(now - day),
+            Some(now - l3_default - day),
+            now,
+            l3_default
+        ));
+        // 间隔改成 7 天后，同一状态即到期：配置即时生效。
+        assert!(l3_refresh_due(Some(now - day), Some(old_l3), now, chrono::Duration::days(7)));
+    }
+
+    #[test]
+    fn auto_refresh_config_parsing_covers_defaults_migration_and_clamps() {
+        use super::{parse_auto_refresh_config, AutoRefreshConfig};
+        // 无存储值 → 默认：开、L2 7 天、L3 30 天。
+        assert_eq!(
+            parse_auto_refresh_config(None),
+            AutoRefreshConfig { enabled: true, l2_days: 7, l3_days: 30 }
+        );
+        // 旧版布尔开关：只迁移 enabled，间隔用默认。
+        assert_eq!(
+            parse_auto_refresh_config(Some(serde_json::json!(false))),
+            AutoRefreshConfig { enabled: false, l2_days: 7, l3_days: 30 }
+        );
+        // 完整对象原样读取。
+        assert_eq!(
+            parse_auto_refresh_config(Some(serde_json::json!({
+                "enabled": false, "l2_days": 3, "l3_days": 90
+            }))),
+            AutoRefreshConfig { enabled: false, l2_days: 3, l3_days: 90 }
+        );
+        // 越界与损坏值收敛：间隔夹到允许区间，垃圾 JSON 回退默认。
+        assert_eq!(parse_auto_refresh_config(Some(serde_json::json!({
+            "enabled": true, "l2_days": 0, "l3_days": 9999
+        }))).l2_days, 1);
+        assert_eq!(parse_auto_refresh_config(Some(serde_json::json!({
+            "enabled": true, "l2_days": 0, "l3_days": 9999
+        }))).l3_days, 365);
+        assert_eq!(
+            parse_auto_refresh_config(Some(serde_json::json!("garbage"))),
+            AutoRefreshConfig { enabled: true, l2_days: 7, l3_days: 30 }
         );
     }
 
@@ -2866,6 +3321,71 @@ mod tests {
         assert_eq!(memories.len(), 1);
         // 完全无法解析 → 报错。
         assert!(parse_typed_l1_candidates("我认为这次会话没有值得记录的内容。").is_err());
+    }
+
+    #[test]
+    fn typed_l1_parser_accepts_memory_singular_key() {
+        // 模型偶发把键名写成单数 `memory`；与 `memories` 同义，不应整批拒绝。
+        let memories = parse_typed_l1_candidates(
+            r#"{"memory":[{"content":"摘要","type":"summary","durability":"session"},{"content":"事实","type":"fact","durability":"short_term"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(memories.len(), 2);
+        assert_eq!(memories[0].memory_type, "summary");
+        // 包在说明文字里的单数键同样要能救回来。
+        let memories = parse_typed_l1_candidates(
+            "好的，以下是整理结果：{\"memory\":[{\"content\":\"摘要\",\"type\":\"summary\",\"durability\":\"session\"}]} 希望有帮助",
+        )
+        .unwrap();
+        assert_eq!(memories.len(), 1);
+    }
+
+    #[test]
+    fn typed_l1_parser_recovers_truncated_json() {
+        // MiniMax-M3 实测失败形态：输出在 max_tokens 或服务端处被截断，
+        // JSON 断在字符串中间，括号不闭合。完整的元素必须被救回。
+        let full = r#"{"memories":[{"content":"本地与云端长期记忆同步漏拉的根因已定位并修复：旧拉取算法把最大 revision 当作全局游标","type":"summary","durability":"session"},{"content":"拉取游标改为按设备分别记录","type":"decision","durability":"short_term"}]}"#;
+        // 断在第 2 个元素的 content 字符串中间。
+        let truncated = &full[..full.find("按设备").unwrap() + 6];
+        let memories = parse_typed_l1_candidates(truncated).unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].memory_type, "summary");
+        assert!(memories[0].content.contains("旧拉取算法"));
+        // 断在第 1 个元素里 → 无完整元素，仍报错（错误里带原文片段）。
+        let head = &full[..full.find("旧拉取算法").unwrap()];
+        let error = match parse_typed_l1_candidates(head) {
+            Err(error) => error,
+            Ok(_) => panic!("fully truncated output must fail"),
+        };
+        assert!(error.contains("输出开头"), "got: {error}");
+    }
+
+    #[test]
+    fn contract_failure_error_carries_output_excerpt() {
+        // 失败原因里必须带模型原文片段：l1_error_detail 只存错误消息时，
+        // 无法事后定位模型实际输出了什么。
+        let error = match parse_typed_l1_candidates("这段对话只是一次性的 Docker 排查，没有需要沉淀的内容。") {
+            Err(error) => error,
+            Ok(_) => panic!("prose output must fail the contract"),
+        };
+        assert!(
+            error.contains("Docker 排查"),
+            "error should quote the model output, got: {error}"
+        );
+        // 换行压平 + 超长截断，保证单条错误不超过存储上限太多。
+        let long = format!("{}\n{}", "很长的说明。".repeat(40), "结尾");
+        let error = match parse_typed_l1_candidates(&long) {
+            Err(error) => error,
+            Ok(_) => panic!("long prose must fail"),
+        };
+        assert!(!error.contains('\n'), "excerpt must be flattened to one line");
+        assert!(error.chars().count() < 300, "error stays bounded, got {} chars", error.chars().count());
+        // 数组解析成功但没有任何可用条目时同样附原文。
+        let error = match parse_typed_l1_candidates(r#"{"memories":[{"content":"","type":"summary"}]}"#) {
+            Err(error) => error,
+            Ok(_) => panic!("no usable items must fail"),
+        };
+        assert!(error.contains("输出开头"), "empty-candidates error should quote output, got: {error}");
     }
 
     #[test]

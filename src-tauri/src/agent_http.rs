@@ -86,18 +86,6 @@ pub struct AgentHttpStore {
     pub tasks: Mutex<HashMap<String, AgentTask>>,
     /// task_id → AgentResult
     pub results: Mutex<HashMap<String, AgentResult>>,
-    /// 工作流等待中的任务：task_id → (run_id, step_id, oneshot_sender)
-    /// agent_task 节点 dispatch 后挂起等待 submit 回调，submit 时通过 sender 唤醒
-    pub pending: Mutex<HashMap<String, PendingTask>>,
-}
-
-/// 工作流中等待子 Agent 结果的挂起任务
-pub struct PendingTask {
-    #[allow(dead_code)]
-    pub run_id: String,
-    #[allow(dead_code)]
-    pub step_id: String,
-    pub tx: tokio::sync::oneshot::Sender<AgentResult>,
 }
 
 /// 获取全局 store（HTTP server 和 Tauri 命令共用）
@@ -117,38 +105,6 @@ impl AgentHttpStore {
         AgentHttpStore {
             tasks: Mutex::new(HashMap::new()),
             results: Mutex::new(HashMap::new()),
-            pending: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// 注册一个工作流等待中的任务（agent_task 节点 dispatch 后调用）
-    pub fn register_pending(
-        &self,
-        task_id: &str,
-        run_id: &str,
-        step_id: &str,
-    ) -> tokio::sync::oneshot::Receiver<AgentResult> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let mut pending = self.pending.lock().unwrap();
-        pending.insert(
-            task_id.to_string(),
-            PendingTask {
-                run_id: run_id.to_string(),
-                step_id: step_id.to_string(),
-                tx,
-            },
-        );
-        rx
-    }
-
-    /// 子 Agent submit 时调用，唤醒等待的工作流
-    pub fn resolve_pending(&self, task_id: &str, result: AgentResult) -> bool {
-        let mut pending = self.pending.lock().unwrap();
-        if let Some(p) = pending.remove(task_id) {
-            let _ = p.tx.send(result);
-            true
-        } else {
-            false
         }
     }
 }
@@ -400,12 +356,9 @@ async fn route(
                 }
             }
 
-            // 唤醒等待中的工作流（如果此任务由 agent_task 节点触发）
-            let resolved = store.resolve_pending(&result.task_id, result.clone());
-
             eprintln!(
-                "[agent-http] submit task={} verdict={} resolved_pending={}",
-                result.task_id, result.verdict, resolved
+                "[agent-http] submit task={} verdict={}",
+                result.task_id, result.verdict
             );
 
             (
@@ -414,7 +367,6 @@ async fn route(
                     "task_id": result.task_id,
                     "status": "received",
                     "verdict": result.verdict,
-                    "workflow_resolved": resolved,
                 })
                 .to_string(),
             )
@@ -425,8 +377,9 @@ async fn route(
         // hookSpecificOutput.additionalContext 的结构化 JSON stdout，纯文本
         // 会被当作 "no parsed output" 丢弃；端点直接返回协议格式，hook 命令
         // 保持 curl 透传。不依赖 MCP instructions，也不需要 Agent 主动调用工具。
-        // SessionStart 只注入 L2 近 30 天工作记忆；UserPromptSubmit
-        // 只注入 L3 长期记忆，每轮提问都执行。
+        // SessionStart 注入完整稳定层（L3 长期记忆 + 手动长期条目 + L2 近
+        // 30 天工作记忆）；UserPromptSubmit 按内容指纹门控注入 L3——内容
+        // 未变化时返回空正文，本轮零注入成本，harness 按无附加上下文继续。
         ("GET", p) if p == "/memory/context" || p.starts_with("/memory/context") => {
             let query = p.split_once('?').map(|(_, query)| query).unwrap_or("");
             let source = query
@@ -439,39 +392,61 @@ async fn route(
                 .find_map(|part| part.strip_prefix("event="))
                 .filter(|event| matches!(*event, "SessionStart" | "UserPromptSubmit"))
                 .unwrap_or("SessionStart");
-            let context = if event == "UserPromptSubmit" {
-                crate::memory_mcp::hook_prompt_context()
-            } else {
-                crate::memory_mcp::hook_session_start_context()
-            };
             // 与 MCP 调用同表审计：记忆注入摘要同时覆盖 Hook 启动注入、每轮
-            // 提问注入与 MCP 检索，detail 保存完整注入正文，面板可逐字回放。
-            if let Some(store) = crate::telemetry_store::shared_store() {
-                if event == "UserPromptSubmit" {
-                    let _ = store.try_record_mcp_access(
-                        crate::agent_sources::agent_label(source),
-                        "prompt_inject",
-                        &format!(
-                            "每轮提问注入 L3 长期记忆（{} 字符）",
-                            context.chars().count()
-                        ),
-                        Some(&context),
-                        true,
-                    );
-                } else {
+            // 提问注入（含内容未变化时的跳过记录）与 MCP 检索，detail 保存
+            // 完整注入正文，面板可逐字回放；summary 里的指纹是渲染正文的短
+            // 哈希，可据此对比两次注入是否逐字节相同。
+            if event == "UserPromptSubmit" {
+                let injection = crate::memory_mcp::hook_prompt_context_gated(source);
+                match injection.context {
+                    Some(context) => {
+                        if let Some(store) = crate::telemetry_store::shared_store() {
+                            let _ = store.try_record_mcp_access(
+                                crate::agent_sources::agent_label(source),
+                                "prompt_inject",
+                                &format!(
+                                    "每轮提问注入 L3 长期记忆（{} 字符，指纹 {}）",
+                                    context.chars().count(),
+                                    injection.fingerprint
+                                ),
+                                Some(&context),
+                                true,
+                            );
+                        }
+                        ("200 OK", hook_inject_body(source, event, context))
+                    }
+                    None => {
+                        if let Some(store) = crate::telemetry_store::shared_store() {
+                            let _ = store.try_record_mcp_access(
+                                crate::agent_sources::agent_label(source),
+                                "prompt_inject",
+                                &format!("跳过未变化的 L3 注入（指纹 {}）", injection.fingerprint),
+                                None,
+                                true,
+                            );
+                        }
+                        // 空 stdout：harness 按无附加上下文继续，不阻塞提问。
+                        ("200 OK", String::new())
+                    }
+                }
+            } else {
+                let context = crate::memory_mcp::hook_session_start_context(source);
+                let fingerprint = crate::memory_mcp::context_fingerprint(&context);
+                if let Some(store) = crate::telemetry_store::shared_store() {
                     let _ = store.try_record_mcp_access(
                         crate::agent_sources::agent_label(source),
                         "session_start_inject",
                         &format!(
-                            "会话首次启动注入 L2 近 30 天工作记忆（{} 字符）",
-                            context.chars().count()
+                            "会话启动注入 L3 长期记忆 + L2 工作记忆（{} 字符，指纹 {}）",
+                            context.chars().count(),
+                            fingerprint
                         ),
                         Some(&context),
                         true,
                     );
                 }
+                ("200 OK", hook_inject_body(source, event, context))
             }
-            ("200 OK", hook_inject_body(source, event, context))
         }
 
         // ── 记忆沉淀 Agent Hook 回调 ──────────────────────────────────────
@@ -544,57 +519,6 @@ async fn route(
                     Err(error) => ("500 Internal Server Error", json!({"error": error}).to_string()),
                 },
                 None => ("503 Service Unavailable", json!({"error": "telemetry store not ready"}).to_string()),
-            }
-        }
-
-        // ── Run 管理 API ──────────────────────────────────────────────
-        ("GET", p) if p == "/runs" || p.starts_with("/runs?") => {
-            let run_store = crate::workflow_store::WorkflowRunStore::new();
-            let list = run_store.list_runs();
-            ("200 OK", serde_json::to_string(&list).unwrap_or_default())
-        }
-
-        ("GET", p) if p.starts_with("/runs/") => {
-            let run_id = p.trim_start_matches("/runs/");
-            let run_store = crate::workflow_store::WorkflowRunStore::new();
-            match run_store.get_run(run_id) {
-                Some(run) => ("200 OK", serde_json::to_string(&run).unwrap_or_default()),
-                None => (
-                    "404 Not Found",
-                    json!({"error": "run not found"}).to_string(),
-                ),
-            }
-        }
-
-        ("POST", p) if p.contains("/approve") && p.starts_with("/runs/") => {
-            let run_id = p
-                .trim_start_matches("/runs/")
-                .trim_end_matches("/approve")
-                .to_string();
-            let run_store = crate::workflow_store::WorkflowRunStore::new();
-            match crate::workflow_store::approve_run_inner(&run_store, &run_id) {
-                Ok(run) => ("200 OK", serde_json::to_string(&run).unwrap_or_default()),
-                Err(e) => ("400 Bad Request", json!({"error": e}).to_string()),
-            }
-        }
-
-        ("POST", p) if p.contains("/reject") && p.starts_with("/runs/") => {
-            let run_id = p
-                .trim_start_matches("/runs/")
-                .trim_end_matches("/reject")
-                .to_string();
-            let payload: Value = serde_json::from_str(body).unwrap_or(json!({}));
-            let reject_to = payload["reject_to_node"].as_str().unwrap_or("").to_string();
-            let reason = payload["reason"].as_str().unwrap_or("").to_string();
-
-            let run_store = crate::workflow_store::WorkflowRunStore::new();
-            match crate::workflow_store::reject_run_inner(&run_store, &run_id, &reject_to, &reason)
-            {
-                Ok(new_run_id) => (
-                    "200 OK",
-                    json!({"status": "rejected", "new_run_id": new_run_id}).to_string(),
-                ),
-                Err(e) => ("400 Bad Request", json!({"error": e}).to_string()),
             }
         }
 

@@ -1,6 +1,6 @@
 //! 内置记忆引擎托管：随应用启动/停止 Qdrant、Neo4j、Embedding 代理与记忆 API。
 //!
-//! Agent Manager 将长期记忆能力作为原生功能内置：引擎组件随应用启动时自动拉起
+//! Vibe Assistant 将长期记忆能力作为原生功能内置：引擎组件随应用启动时自动拉起
 //! （已在运行则复用），退出时由应用停止由本模块拉起的进程。API 细节对用户隐藏。
 
 use crate::process_util::no_window;
@@ -17,7 +17,7 @@ const QDRANT_PORT: u16 = 6333;
 const NEO4J_PORT: u16 = 7474;
 // Do not share the conventional development ports 8000/8001.  They are
 // commonly occupied by user projects and an unrelated service must never be
-// mistaken for Agent Manager's private memory sidecar.
+// mistaken for Vibe Assistant's private memory sidecar.
 const EMBED_PORT: u16 = 18001;
 const API_PORT: u16 = 18000;
 
@@ -157,7 +157,7 @@ pub fn shared_backend() -> Option<Arc<MemoryBackend>> {
 
 impl MemoryBackend {
     pub fn new() -> Self {
-        // Release builds use the runtime shipped with Agent Manager.  An
+        // Release builds use the runtime shipped with Vibe Assistant.  An
         // explicit MINDMEMOS_HOME remains a development-only override, which
         // keeps local contributors productive without silently coupling user
         // installs to an arbitrary pre-existing server.
@@ -227,7 +227,7 @@ impl MemoryBackend {
         eprintln!("[memory-engine] {name} started");
     }
 
-    /// 确保 Agent Manager 自己的语义 sidecar 运行。
+    /// 确保 Vibe Assistant 自己的语义 sidecar 运行。
     pub fn ensure_started(&self) {
         let runtime_python = self.root.join(".venv").join("Scripts").join("python.exe");
         if !runtime_python.exists() {
@@ -361,15 +361,15 @@ impl MemoryBackend {
             .join("python.exe")
             .exists();
         let api_detail = if api_ok {
-            format!("Agent Manager 专属语义服务 :{API_PORT}")
+            format!("Vibe Assistant 专属语义服务 :{API_PORT}")
         } else if runtime_missing {
-            "Agent Manager 内置语义运行时未安装".into()
+            "Vibe Assistant 内置语义运行时未安装".into()
         } else if api_port_open {
             format!("端口 :{API_PORT} 被外部进程占用；未复用")
         } else if self.children.lock().unwrap().contains_key("api") {
-            format!("Agent Manager 语义服务启动中 :{API_PORT}")
+            format!("Vibe Assistant 语义服务启动中 :{API_PORT}")
         } else {
-            format!("Agent Manager 专属语义服务未启动 :{API_PORT}")
+            format!("Vibe Assistant 专属语义服务未启动 :{API_PORT}")
         };
 
         EngineStatus {
@@ -613,7 +613,7 @@ async fn all_memories(backend: &MemoryBackend) -> Result<Vec<SnapshotMemory>, St
         .collect())
 }
 
-/// Importance is owned by Agent Manager's local evidence ledger.  The optional
+/// Importance is owned by Vibe Assistant's local evidence ledger.  The optional
 /// semantic backend contributes its legacy/manual memories when reachable, but
 /// it must never prevent L1 conversation memory from being ranked.
 async fn importance_memory_inventory(
@@ -933,7 +933,7 @@ async fn create_candidate_batch_plan(
         .collect::<Vec<_>>()
         .join("\n\n---\n\n");
     let messages = vec![
-        serde_json::json!({"role": "system", "content": "你是 Agent Manager 的记忆去重裁决器。输入已经是本地筛出的疑似重复候选；只在两条或多条记忆表达同一事实、明显重复或彼此冲突且能安全合并时生成动作。不要合并不同时间的经历、不同任务、不同文件修改、不同偏好或仅主题相近的内容。每个动作保留一个 keep_id，把其余重复 ID 放入 remove_ids，并用 content 给出保留后的完整、准确、简洁记忆。content 必须继承被合并记忆的主要语言；禁止编造信息。若无安全合并项，返回空 actions。直接输出严格 JSON，不要解释：{\"actions\":[{\"keep_id\":\"已有 ID\",\"remove_ids\":[\"已有 ID\"],\"content\":\"合并后记忆\",\"reason\":\"简短理由\"}]}。"}),
+        serde_json::json!({"role": "system", "content": "你是 Vibe Assistant 的记忆去重裁决器。输入已经是本地筛出的疑似重复候选；只在两条或多条记忆表达同一事实、明显重复或彼此冲突且能安全合并时生成动作。不要合并不同时间的经历、不同任务、不同文件修改、不同偏好或仅主题相近的内容。每个动作保留一个 keep_id，把其余重复 ID 放入 remove_ids，并用 content 给出保留后的完整、准确、简洁记忆。content 必须继承被合并记忆的主要语言；禁止编造信息。若无安全合并项，返回空 actions。直接输出严格 JSON，不要解释：{\"actions\":[{\"keep_id\":\"已有 ID\",\"remove_ids\":[\"已有 ID\"],\"content\":\"合并后记忆\",\"reason\":\"简短理由\"}]}。"}),
         serde_json::json!({"role": "user", "content": format!("请裁决以下 {} 条由本地 BGE-small 语义检索选出的疑似重复候选（来自全库 {} 条记忆）：\n\n{}", candidates.len(), library_size, library)}),
     ];
     let response = llm::complete_text_with_limit(&provider, &messages, Some(2048)).await?;
@@ -981,7 +981,7 @@ pub async fn memory_consolidate(
     app: tauri::AppHandle,
     candidate_batches: Vec<Vec<ConsolidationCandidate>>,
 ) -> Result<ConsolidationResult, String> {
-    // L1 is Agent Manager's source of truth.  Consolidation must therefore
+    // L1 is Vibe Assistant's source of truth.  Consolidation must therefore
     // remain available when the optional MindMemOS sidecar is stopped.
     let local_before = telemetry.local_l1_memory_snapshot()?;
     let before = local_before

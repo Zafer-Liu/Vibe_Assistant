@@ -1,15 +1,15 @@
-# 智管-Agent Manager
+# 智管-Vibe Assistant
 
 <p align="center">
-  <img src="./Logo/Banner.png" alt="智管-Agent Manager Banner" width="100%" />
+  <img src="./Logo/Banner.png" alt="智管-Vibe Assistant Banner" width="100%" />
 </p>
 
 <p align="right"><a href="./README_EN.md">English</a></p>
 
 ![版本](https://img.shields.io/badge/版本-v1.0.0%20Beta-blue.svg)
 ![License](https://img.shields.io/badge/License-Apache%202.0-yellow.svg)
-[![Stars](https://img.shields.io/github/stars/Zafer-Liu/Agent_Manager?style=flat-square)](https://github.com/Zafer-Liu/Agent_Manager/stargazers)
-[![CI](https://img.shields.io/github/actions/workflow/status/Zafer-Liu/Agent_Manager/ci.yml?style=flat-square&label=CI)](https://github.com/Zafer-Liu/Agent_Manager/actions)
+[![Stars](https://img.shields.io/github/stars/Zafer-Liu/Vibe_Assistant?style=flat-square)](https://github.com/Zafer-Liu/Vibe_Assistant/stargazers)
+[![CI](https://img.shields.io/github/actions/workflow/status/Zafer-Liu/Vibe_Assistant/ci.yml?style=flat-square&label=CI)](https://github.com/Zafer-Liu/Vibe_Assistant/actions)
 [![Platform](https://img.shields.io/badge/平台-Windows%20%7C%20macOS-blue?style=flat-square)](#)
 [![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?style=flat-square&logo=tauri)](https://tauri.app)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react)](https://react.dev)
@@ -64,12 +64,12 @@
 
 # ✨ 项目亮点
 
-**智管-Agent Manager** 是一个基于 Tauri 2 + React 19 + Rust 的桌面应用，专门解决"本机跑了一堆 AI Agent，管理混乱"的问题。
+**智管-Vibe Assistant** 是一个基于 Tauri 2 + React 19 + Rust 的桌面应用，专门解决"本机跑了一堆 AI Agent，管理混乱"的问题。
 
 核心理念：**所有 Agent，一个窗口管到底。**
 
 <p align="center">
-  <img src="./Images/diagram-architecture.png" alt="智管-Agent Manager 系统架构" width="100%" />
+  <img src="./Images/diagram-architecture.png" alt="智管-Vibe Assistant 系统架构" width="100%" />
 </p>
 
 - 不用开多个终端，不用记各种启动命令
@@ -83,7 +83,7 @@
 
 # 🤝 推荐搭配 Agent
 
-智管-Agent Manager 可以统一管理本地运行的各类 AI Agent。
+智管-Vibe Assistant 可以统一管理本地运行的各类 AI Agent。
 如果你正在寻找一个适合被智管托管的业务型 Agent，推荐搭配使用：
 
 <details>
@@ -100,9 +100,9 @@
 * 业务洞察分析
 * Excel / Word / PPT 报告导出
 
-配合智管-Agent Manager 使用后，可以获得更完整的桌面端体验：
+配合智管-Vibe Assistant 使用后，可以获得更完整的桌面端体验：
 
-| 使用场景         | 智管-Agent Manager 提供的能力      |
+| 使用场景         | 智管-Vibe Assistant 提供的能力      |
 | ------------ | --------------------------- |
 | 启动商业分析 Agent | 一键启动 / 停止进程                 |
 | 查看运行状态       | 实时日志、PID、端口状态               |
@@ -295,7 +295,7 @@ brew install cloudflared
 
 ### 下载预构建安装包（推荐）
 
-从 [Releases](https://github.com/Zafer-Liu/Agent_Manager/releases) 下载最新版本（当前提供 Windows x64 安装包，macOS 支持即将到来）。
+从 [Releases](https://github.com/Zafer-Liu/Vibe_Assistant/releases) 下载最新版本（当前提供 Windows x64 安装包，macOS 支持即将到来）。
 
 双击安装包，按提示安装即可。
 
@@ -308,8 +308,8 @@ brew install cloudflared
 - [Tauri 前置依赖](https://tauri.app/start/prerequisites/)（Windows 需要 VS C++ 生成工具）
 
 ```bash
-git clone https://github.com/Zafer-Liu/Agent_Manager.git
-cd Agent_Manager
+git clone https://github.com/Zafer-Liu/Vibe_Assistant.git
+cd Vibe_Assistant
 
 # 安装依赖
 npm install
@@ -485,7 +485,7 @@ LLM 设置页内置 **Ollama 本地模型** 模块：
 - ✅ **配置导入导出备份**：一键迁移与恢复
 - ✅ **从 GitHub 安装 Agent**：填入仓库地址自动拉取并填充配置
 
-📖 [查看完整 Changelog](https://github.com/Zafer-Liu/Agent_Manager/releases)
+📖 [查看完整 Changelog](https://github.com/Zafer-Liu/Vibe_Assistant/releases)
 
 ---
 
@@ -493,7 +493,7 @@ LLM 设置页内置 **Ollama 本地模型** 模块：
 
 **阶段四：外部协作能力**
 
-- ✅ **本地 Hook Server**：默认 `127.0.0.1:9420`，外部系统通过 HTTP 推任务进 Agent Manager，端口和 auth_token 可配置
+- ✅ **本地 Hook Server**：默认 `127.0.0.1:9420`，外部系统通过 HTTP 推任务进 Vibe Assistant，端口和 auth_token 可配置
 - ✅ **agent_task 节点**：工作流可调度本地/远程子 Agent，oneshot channel 挂起等待结果
 - ✅ **Callback 出站通知**：Run 终态时回调外部 URL，指数退避重试 3 次
 - ✅ **Fan-out 并行执行**：static / by_field / llm_split 拆分策略，`join_all` 并行执行子任务
@@ -503,7 +503,7 @@ LLM 设置页内置 **Ollama 本地模型** 模块：
 - ✅ **前端 SVG DAG 画布**：支持拖拽定位和工具栏
 - ✅ **ExternalTriggers 设置页**、运行历史来源列、工作流验收面板、Sweeper 自愈巡检、FailureTrace 诊断链路、Metrics 事件源
 
-📖 [查看完整 Changelog](https://github.com/Zafer-Liu/Agent_Manager/releases)
+📖 [查看完整 Changelog](https://github.com/Zafer-Liu/Vibe_Assistant/releases)
 
 ---
 
@@ -515,7 +515,7 @@ LLM 设置页内置 **Ollama 本地模型** 模块：
 - ✅ 中英文界面：完整 i18n 与语言切换
 - ✅ 持续集成：Push、Pull Request 和正式发布前自动执行前端检查与 Rust 测试
 
-📖 [查看完整 Changelog](https://github.com/Zafer-Liu/Agent_Manager/releases)
+📖 [查看完整 Changelog](https://github.com/Zafer-Liu/Vibe_Assistant/releases)
 
 ---
 
@@ -636,7 +636,7 @@ Agent 可能还在启动中（端口尚未监听）。等待几秒后，点击 U
 <details>
 <summary><b>多个同事同时访问对话内容混在一起？</b></summary>
 
-这是 Agent 本身的限制，对话历史存在 Agent 进程的内存里，Agent Manager 无法从外部隔离。
+这是 Agent 本身的限制，对话历史存在 Agent 进程的内存里，Vibe Assistant 无法从外部隔离。
 
 如需隔离，需在 Agent 代码中加 session 支持（如 Streamlit 使用 `st.session_state` 天然隔离）。
 
@@ -718,7 +718,7 @@ taskkill /PID <PID> /F
 4. 推送到分支 (`git push origin feature/amazing-feature`)
 5. 提交 **Pull Request**
 
-Bug 报告或功能建议请通过 [Issues](https://github.com/Zafer-Liu/Agent_Manager/issues) 提交。开发环境搭建详见[从源码构建](#install)。
+Bug 报告或功能建议请通过 [Issues](https://github.com/Zafer-Liu/Vibe_Assistant/issues) 提交。开发环境搭建详见[从源码构建](#install)。
 
 ---
 

@@ -22,6 +22,15 @@ pub struct SkillItem {
     pub assigned_agents: Vec<String>,
     /// Skill 目录内打包发布的全部文件（相对路径，含 SKILL.md）。
     pub files: Vec<String>,
+    /// 技能性质：builtin（厂商内置）/ plugin（agent 插件市场安装）/
+    /// local（用户本地或 Vibe Assistant 部署）/ marketplace（技能市场导入）。
+    /// 旧缓存与旧 manifest 无此字段时按 local 处理，重新扫描后回填。
+    #[serde(default = "default_skill_origin")]
+    pub origin: String,
+}
+
+fn default_skill_origin() -> String {
+    "local".into()
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -32,6 +41,10 @@ struct SkillManifest {
     assigned_agents: Vec<String>,
     current_hash: String,
     updated_at: String,
+    /// 扫描时判定的技能性质（见 SkillItem::origin），随 manifest 持久化，
+    /// 共享库目录重读时据此恢复。
+    #[serde(default)]
+    origin: String,
 }
 
 const SKILL_CATALOG_SETTING_KEY: &str = "skill_catalog";
@@ -73,6 +86,11 @@ fn shared_root() -> PathBuf {
         .join("shared-skills")
 }
 
+fn is_managed_skill_source(source: &str) -> bool {
+    crate::agent_sources::is_supported_source(source)
+        || matches!(source, "market-openai" | "market-anthropic")
+}
+
 fn manifest_path(skill_path: &Path) -> PathBuf {
     skill_path
         .parent()
@@ -91,6 +109,7 @@ fn default_manifest(hash: &str) -> SkillManifest {
         assigned_agents: Vec::new(),
         current_hash: hash.into(),
         updated_at: chrono::Utc::now().to_rfc3339(),
+        origin: String::new(),
     }
 }
 
@@ -118,7 +137,73 @@ fn with_manifest(mut item: SkillItem, skill_path: &Path) -> SkillItem {
     item.version = manifest.version;
     item.status = manifest.status;
     item.assigned_agents = manifest.assigned_agents;
+    if !manifest.origin.is_empty() {
+        item.origin = manifest.origin;
+    }
     item
+}
+
+fn path_components(path: &Path) -> Vec<&str> {
+    path.components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect()
+}
+
+/// 依据扫描时的原始路径判定技能性质（见 SkillItem::origin）。市场命名
+/// 空间只看 source 前缀且必须最先判定：市场技能落库后再读取时，路径已
+/// 换成共享库路径，路径启发式会失效。
+fn classify_origin(source: &str, path: &Path) -> &'static str {
+    if source.starts_with("market-") {
+        return "marketplace";
+    }
+    let components = path_components(path);
+    // MiniMax 的厂商内置技能根。
+    if components.iter().any(|c| *c == ".builtin-skills") {
+        return "builtin";
+    }
+    if let Some(index) = components.iter().position(|c| *c == "plugins") {
+        // plugins[/cache]/<marketplace>/...：官方内置或捆绑的 marketplace
+        // （workbuddy-builtin、qoder-bundler 等）归 builtin，其余为用户经
+        // agent 插件市场安装的归 plugin。
+        let after = &components[index + 1..];
+        let marketplace = if after.first() == Some(&"cache") {
+            after.get(1)
+        } else {
+            after.first()
+        };
+        if let Some(marketplace) = marketplace {
+            let lower = marketplace.to_lowercase();
+            if lower.contains("builtin") || lower.contains("bundler") {
+                return "builtin";
+            }
+        }
+        return "plugin";
+    }
+    "local"
+}
+
+/// Vibe Assistant 同步到 Kimi 的托管插件目录（plugins/managed/...）是部署
+/// 产物而非用户配置，扫描时跳过，避免以 kimi:<name> 身份回声入库。
+fn is_agent_manager_managed(path: &Path) -> bool {
+    let components = path_components(path);
+    components.windows(2).any(|w| w == ["plugins", "managed"])
+}
+
+/// plugins 层级下直接落在版本目录里的 SKILL.md（如
+/// `plugins/cache/.../tencent-docx/5.6.2-wb.39298511.../SKILL.md`）是插件
+/// 自述文件而非独立技能；返回其安全化目录名，即旧版扫描逻辑误入库的
+/// 条目名，用于跳过与清理。
+fn plugin_version_artifact(path: &Path) -> Option<String> {
+    if !path_components(path).iter().any(|c| *c == "plugins") {
+        return None;
+    }
+    let dir = path.parent()?.file_name()?.to_str()?;
+    let looks_versioned = dir.starts_with(|c: char| c.is_ascii_digit()) && dir.contains('-');
+    if !looks_versioned {
+        return None;
+    }
+    let safe = safe_name(dir);
+    (!safe.is_empty()).then_some(safe)
 }
 
 /// 每个来源需扫描的根目录列表（多根 Agent 如 Qoder/MiniMax 一次覆盖）。
@@ -159,7 +244,7 @@ fn ensure_kimi_skill_plugin() -> Result<(), String> {
             "$schema": "https://kimi.com/schemas/kimi.plugin.schema.json",
             "name": "agent-manager-skills",
             "version": "1.0.0",
-            "description": "Skills published from the Agent Manager shared library",
+            "description": "Skills published from the Vibe Assistant shared library",
             "skills": "./skills/",
         });
         std::fs::write(
@@ -392,6 +477,7 @@ fn parse_skill(path: &Path, source: &str) -> Result<SkillItem, String> {
         version: 1,
         status: "draft".into(),
         assigned_agents: Vec::new(),
+        origin: classify_origin(source, path).to_string(),
         files,
     })
 }
@@ -538,7 +624,7 @@ fn cache_upsert_skill(item: &SkillItem) {
     }
 }
 
-/// Import existing skills into the Agent Manager shared directory.  Each
+/// Import existing skills into the Vibe Assistant shared directory.  Each
 /// source retains its own namespace so equal names never silently overwrite.
 #[tauri::command]
 pub async fn skill_scan() -> Result<Vec<SkillItem>, String> {
@@ -550,6 +636,35 @@ pub async fn skill_scan() -> Result<Vec<SkillItem>, String> {
         for scan_root in &roots {
             collect_skill_files(scan_root, &mut files)?;
         }
+        // Vibe Assistant 托管插件（Kimi 同步产物）不入库，避免回声。
+        files.retain(|path| !is_agent_manager_managed(path));
+        // 插件版本根的 SKILL.md 不是独立技能：跳过，并清理旧版扫描逻辑
+        // 误入库的同名条目（目录名即当时的条目名）。
+        let mut artifact_names: Vec<String> = Vec::new();
+        files.retain(|path| match plugin_version_artifact(path) {
+            Some(name) => {
+                artifact_names.push(name);
+                false
+            }
+            None => true,
+        });
+        for name in &artifact_names {
+            let stale = root.join(source).join(name);
+            if stale.is_dir() {
+                let _ = std::fs::remove_dir_all(&stale);
+                eprintln!("[skill] 清理插件版本残留条目：{}", stale.display());
+            }
+        }
+        // 固定处理顺序：路径字典序倒序（新到旧）。plugins/cache 里同一插件的
+        // 多版本目录按版本号升序排列，倒序后最新版本最先处理；用户自建的
+        // skills/ 根排在 plugins/cache 之后，优先级高于缓存副本。
+        files.sort();
+        files.reverse();
+        // 同一 source 内按 Skill 名去重：多版本插件缓存会让同一
+        // (source, name) 收集到多份，而前端列表以 `${source}:${name}` 作为
+        // React key，重复条目会破坏列表协调，导致切换筛选时渲染错乱。
+        // 首次出现的（最新）版本之后的同名副本全部跳过。
+        let mut seen_names = std::collections::HashSet::new();
         for path in files {
             let skill = match parse_skill(&path, source) {
                 Ok(skill) => skill,
@@ -558,6 +673,9 @@ pub async fn skill_scan() -> Result<Vec<SkillItem>, String> {
                     continue;
                 }
             };
+            if !seen_names.insert(skill.name.clone()) {
+                continue;
+            }
             let skill_dir = path
                 .parent()
                 .ok_or("SKILL.md has no parent directory")?
@@ -586,6 +704,8 @@ pub async fn skill_scan() -> Result<Vec<SkillItem>, String> {
                 }
             }
             replace_contents_within(&skill_dir, &target_dir)?;
+            // 重新扫描时以最新路径判定回填性质，分类规则升级后无需迁移。
+            manifest.origin = skill.origin.clone();
             write_manifest(&target, &manifest)?;
             imported.push(with_manifest(
                 SkillItem {
@@ -621,7 +741,7 @@ pub async fn skill_list() -> Result<Vec<SkillItem>, String> {
 /// Reads only a skill already registered in the managed shared directory; the
 /// frontend never supplies a raw filesystem path.
 pub fn skill_read_impl(source: String, name: String) -> Result<SkillDocument, String> {
-    let allowed_source = crate::agent_sources::is_supported_source(&source);
+    let allowed_source = is_managed_skill_source(&source);
     let safe = safe_name(&name);
     if !allowed_source || safe != name || safe.is_empty() {
         return Err("invalid shared skill identifier".into());
@@ -937,7 +1057,7 @@ pub async fn skill_published_drift() -> Result<Vec<SkillPublishedDrift>, String>
 }
 
 fn managed_skill_path(source: &str, name: &str) -> Result<PathBuf, String> {
-    let allowed_source = crate::agent_sources::is_supported_source(source);
+    let allowed_source = is_managed_skill_source(source);
     let safe = safe_name(name);
     if !allowed_source || safe != name || safe.is_empty() {
         return Err("invalid shared skill identifier".into());
@@ -947,6 +1067,63 @@ fn managed_skill_path(source: &str, name: &str) -> Result<PathBuf, String> {
         return Err("shared skill not found".into());
     }
     Ok(path)
+}
+
+/// Import a reviewed public marketplace package into the same managed registry
+/// used by locally discovered Skills. The caller downloads into an isolated
+/// temporary directory; this function only accepts the two curated namespaces.
+pub(crate) fn import_marketplace_skill(
+    namespace: &str,
+    expected_name: &str,
+    source_dir: &Path,
+) -> Result<SkillItem, String> {
+    if !matches!(namespace, "market-openai" | "market-anthropic") {
+        return Err("unsupported marketplace source".into());
+    }
+    let safe = safe_name(expected_name);
+    if safe.is_empty() || safe != expected_name {
+        return Err("invalid marketplace skill name".into());
+    }
+    let source_skill = source_dir.join("SKILL.md");
+    if !source_skill.is_file() {
+        return Err("marketplace package does not contain SKILL.md".into());
+    }
+    let parsed = parse_skill(&source_skill, namespace)?;
+    if parsed.name != expected_name {
+        return Err(format!(
+            "marketplace package name mismatch: expected {expected_name}, got {}",
+            parsed.name
+        ));
+    }
+
+    let target_dir = shared_root().join(namespace).join(expected_name);
+    let target_skill = target_dir.join("SKILL.md");
+    let next_hash = dir_hash(source_dir)?;
+    let mut manifest = if target_skill.is_file() {
+        let previous_hash = dir_hash(&target_dir)?;
+        let mut previous = read_manifest(&target_skill, &previous_hash);
+        if previous_hash != next_hash {
+            let snapshot = version_root(&target_skill).join(format!(
+                "v{}-{}",
+                previous.version,
+                &previous_hash[..12]
+            ));
+            copy_dir_contents(&target_dir, &snapshot)?;
+            previous.version += 1;
+            previous.status = "draft".into();
+            previous.current_hash = next_hash.clone();
+            previous.updated_at = chrono::Utc::now().to_rfc3339();
+        }
+        previous
+    } else {
+        default_manifest(&next_hash)
+    };
+    manifest.current_hash = next_hash;
+    replace_contents_within(source_dir, &target_dir)?;
+    write_manifest(&target_skill, &manifest)?;
+    let item = managed_skill_item(namespace, expected_name)?;
+    let _ = refresh_skill_cache()?;
+    Ok(item)
 }
 
 fn managed_skill_item(source: &str, name: &str) -> Result<SkillItem, String> {
@@ -1242,4 +1419,58 @@ fn write_safely(path: &Path, content: &[u8]) -> Result<(), String> {
         std::fs::remove_file(path).map_err(|e| e.to_string())?;
     }
     std::fs::rename(&temp, path).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn classifies_builtin_plugin_local_marketplace() {
+        let wb_builtin = Path::new(
+            r"C:\u\.workbuddy\plugins\cache\workbuddy-builtin\tencent-docx\5.6.2-wb.1\skills\html-review\SKILL.md",
+        );
+        assert_eq!(classify_origin("workbuddy", wb_builtin), "builtin");
+
+        let wb_installed = Path::new(
+            r"C:\u\.workbuddy\plugins\cache\codebuddy-plugins-official\foo\1.0.0\skills\bar\SKILL.md",
+        );
+        assert_eq!(classify_origin("workbuddy", wb_installed), "plugin");
+
+        let qoder_builtin = Path::new(r"C:\u\.qoder\plugins\cache\qoder-bundler\p\1.0\skills\s\SKILL.md");
+        assert_eq!(classify_origin("qoder", qoder_builtin), "builtin");
+
+        let minimax_builtin = Path::new(r"C:\u\.minimax\.builtin-skills\code-review\SKILL.md");
+        assert_eq!(classify_origin("minimax", minimax_builtin), "builtin");
+
+        let minimax_plugin = Path::new(r"C:\u\.minimax\plugins\some-plugin\skills\s\SKILL.md");
+        assert_eq!(classify_origin("minimax", minimax_plugin), "plugin");
+
+        let local = Path::new(r"C:\u\.claude\skills\hyperframes\SKILL.md");
+        assert_eq!(classify_origin("claude", local), "local");
+
+        let market = Path::new(r"C:\tmp\download\docx\SKILL.md");
+        assert_eq!(classify_origin("market-anthropic", market), "marketplace");
+    }
+
+    #[test]
+    fn detects_version_artifacts_and_managed_dirs() {
+        let version_root = Path::new(
+            r"C:\u\.workbuddy\plugins\cache\workbuddy-builtin\tencent-docx\5.6.2-wb.39298511.g37a65c0b.he233403f909a\SKILL.md",
+        );
+        let name = plugin_version_artifact(version_root).expect("version root is an artifact");
+        assert_eq!(name, "5-6-2-wb-39298511-g37a65c0b-he233403f909a");
+
+        let real_skill = Path::new(
+            r"C:\u\.workbuddy\plugins\cache\workbuddy-builtin\tencent-docx\5.6.2-wb.1\skills\html-review\SKILL.md",
+        );
+        assert!(plugin_version_artifact(real_skill).is_none());
+
+        let managed = Path::new(
+            r"C:\u\.kimi\plugins\managed\agent-manager-skills\skills\docx\SKILL.md",
+        );
+        assert!(is_agent_manager_managed(managed));
+        assert!(!is_agent_manager_managed(real_skill));
+    }
 }

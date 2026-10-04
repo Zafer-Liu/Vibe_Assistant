@@ -1,6 +1,6 @@
 [package]
 name = "agent-manager"
-version = "1.0.1"
+version = "1.0.2"
 description = "A local agent management tool"
 authors = ["you"]
 edition = "2021"
@@ -37,6 +37,15 @@ rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 tiktoken-rs = "0.12"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tempfile = "3"
+sysinfo = "0.37.2"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+windows-sys = { version = "0.60", features = [
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_Foundation",
+  "Win32_System_Environment",
+] }
 
 [profile.release]
 panic = "abort"

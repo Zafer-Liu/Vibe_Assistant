@@ -24,6 +24,31 @@ export const SOURCES: { id: Exclude<SourceFilter, 'all'>; label: string; color: 
 
 const sourceColor = (source: string) => SOURCES.find(s => s.id === source)?.color ?? 'bg-gray-400'
 
+// ── 技能性质（origin）：区分厂商内置、插件市场安装、本地自建与市场导入 ──
+
+type SkillOrigin = 'builtin' | 'plugin' | 'local' | 'marketplace'
+type OriginFilter = 'all' | SkillOrigin
+
+/** 列表排序权重：本地/市场（用户自己的）在前，插件与内置在后。 */
+const ORIGIN_ORDER: Record<SkillOrigin, number> = { local: 0, marketplace: 1, plugin: 2, builtin: 3 }
+
+const originOf = (skill: SkillItem): SkillOrigin =>
+  skill.origin === 'builtin' || skill.origin === 'plugin' || skill.origin === 'marketplace' ? skill.origin : 'local'
+
+/** 非本地性质的行内徽标样式；本地是默认语境不加徽标，保持行紧凑。 */
+const ORIGIN_BADGE: Record<Exclude<SkillOrigin, 'local'>, string> = {
+  marketplace: 'bg-emerald-500/10 text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-300',
+  plugin: 'bg-sky-500/10 text-sky-600 dark:bg-sky-500/15 dark:text-sky-300',
+  builtin: 'bg-gray-200/70 text-gray-500 dark:bg-gray-700/60 dark:text-gray-400',
+}
+
+const ORIGIN_LABEL_KEY: Record<SkillOrigin, string> = {
+  local: 'skills.originLocal',
+  marketplace: 'skills.originMarketplace',
+  plugin: 'skills.originPlugin',
+  builtin: 'skills.originBuiltin',
+}
+
 export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOpenSync, onSyncOpened }: {
   onOpenPublished?: () => void
   autoOpenSync?: boolean
@@ -32,6 +57,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
   const { t } = useTranslation()
  const { skills, skillCacheReady, loadSkills, scanSkills, readSkill, applySkillSync, setSkillStatus, setSkillStatusBulk, setSkillAssignment, setSkillAssignmentBulk, publishSkill, rollbackSkillLatest, deleteSkill } = useMemoryStore()
   const [filter, setFilter] = useState<SourceFilter>('all')
+  const [originFilter, setOriginFilter] = useState<OriginFilter>('all')
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<SkillDocument | null>(null)
   const [loading, setLoading] = useState(false)
@@ -80,21 +106,36 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
      : filter === 'published'
        ? skill.status === 'published'
        : skill.source === filter
+   const originMatches = originFilter === 'all' || originOf(skill) === originFilter
    const q = query.trim().toLowerCase()
-   return filterMatches && (!q || `${skill.name} ${skill.description} ${skill.source}`.toLowerCase().includes(q))
- }), [skills, filter, query])
+   return filterMatches && originMatches && (!q || `${skill.name} ${skill.description} ${skill.source}`.toLowerCase().includes(q))
+ }).sort((a, b) => {
+   // 分组排序：本地/市场在前，插件与内置在后；同组内按名称排序。
+   const byOrigin = ORIGIN_ORDER[originOf(a)] - ORIGIN_ORDER[originOf(b)]
+   return byOrigin !== 0 ? byOrigin : a.name.localeCompare(b.name)
+ }), [skills, filter, originFilter, query])
+
+ // 筛选胶囊的「分面计数」：只应用其他维度（性质 + 搜索），排除胶囊自身维度，
+ // 这样切换性质下拉时「全部 / 已发布 / 各 Agent」的数字会同步收窄。
+ const facetedSkills = useMemo(() => skills.filter((skill) => {
+   const originMatches = originFilter === 'all' || originOf(skill) === originFilter
+   const q = query.trim().toLowerCase()
+   return originMatches && (!q || `${skill.name} ${skill.description} ${skill.source}`.toLowerCase().includes(q))
+ }), [skills, originFilter, query])
 
   const countsBySource = useMemo(() => {
     const map: Record<string, number> = {}
-    for (const s of skills) map[s.source] = (map[s.source] || 0) + 1
+    for (const s of facetedSkills) map[s.source] = (map[s.source] || 0) + 1
     return map
-  }, [skills])
+  }, [facetedSkills])
 
   // 当前筛选结果是否全部被勾选（用于「全选」复选框的受控状态）。
   const allVisibleChecked = visibleSkills.length > 0 && visibleSkills.every((s) => selectedIds.has(`${s.source}:${s.name}`))
 
   // 已发布数量，用于头部「已发布」入口徽标。
   const publishedCount = useMemo(() => skills.filter((s) => s.status === 'published').length, [skills])
+  // 已发布胶囊的分面计数（随性质/搜索收窄）。
+  const facetedPublishedCount = useMemo(() => facetedSkills.filter((s) => s.status === 'published').length, [facetedSkills])
 
   // ── Actions ──
 
@@ -358,13 +399,25 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
             className="w-full rounded-lg border border-gray-300 bg-white py-1.5 pl-8 pr-3 text-xs text-gray-800 outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-400/20 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 dark:focus:border-violet-500"
           />
         </label>
+        <select
+          value={originFilter}
+          onChange={(e) => setOriginFilter(e.target.value as OriginFilter)}
+          aria-label={t('skills.originFilterAria')}
+          className="rounded-lg border border-gray-300 bg-white px-2 py-1.5 text-xs text-gray-700 outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-400/20 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:focus:border-violet-500"
+        >
+          <option value="all">{t('skills.originAll')}</option>
+          <option value="local">{t('skills.originLocal')}</option>
+          <option value="marketplace">{t('skills.originMarketplace')}</option>
+          <option value="plugin">{t('skills.originPlugin')}</option>
+          <option value="builtin">{t('skills.originBuiltin')}</option>
+        </select>
         <div className="flex flex-wrap gap-1.5">
          <FilterPill active={filter === 'all'} onClick={() => setFilter('all')}>
-           {t('skills.all')} <span className="ml-1 font-mono opacity-70">{skills.length}</span>
+           {t('skills.all')} <span className="ml-1 font-mono opacity-70">{facetedSkills.length}</span>
          </FilterPill>
          <FilterPill active={filter === 'published'} onClick={() => setFilter('published')}>
            <ShieldCheck size={11} className="mr-0.5" />
-           {t('skills.publishedFilter')} <span className="ml-1 font-mono opacity-70">{publishedCount}</span>
+           {t('skills.publishedFilter')} <span className="ml-1 font-mono opacity-70">{facetedPublishedCount}</span>
          </FilterPill>
          {SOURCES.map(s => (
             <FilterPill key={s.id} active={filter === s.id} onClick={() => setFilter(s.id)}>
@@ -420,6 +473,11 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
                      <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${sourceColor(skill.source)}`} />
                      <FileCode2 size={14} className={isSelected ? 'text-violet-600 dark:text-violet-400' : 'text-gray-400'} />
                      <span className="min-w-0 flex-1 truncate text-sm font-medium">{skill.name}</span>
+                     {originOf(skill) !== 'local' && (
+                       <span className={`shrink-0 rounded px-1 py-px text-[10px] font-medium ${ORIGIN_BADGE[originOf(skill) as Exclude<SkillOrigin, 'local'>]}`}>
+                         {t(ORIGIN_LABEL_KEY[originOf(skill)])}
+                       </span>
+                     )}
                      <ChevronRight size={14} className="shrink-0 text-gray-400 opacity-0 transition group-hover:opacity-100" />
                    </div>
                    <p className="mt-1 truncate pl-8 text-xs text-gray-500 dark:text-gray-400">
@@ -501,6 +559,9 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
                       {selected.item.description || t('skills.noDescription')}
                     </p>
                     <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                      <span className="inline-flex items-center gap-1 rounded-full bg-gray-100 px-2 py-0.5 font-medium text-gray-600 dark:bg-gray-800 dark:text-gray-300">
+                        {t(ORIGIN_LABEL_KEY[originOf(selected.item)])}
+                      </span>
                       <span className="inline-flex items-center gap-1 rounded-full bg-gray-100 px-2 py-0.5 font-medium text-gray-600 dark:bg-gray-800 dark:text-gray-300">
                         <Globe size={11} />
                         {selected.item.source}

@@ -15,6 +15,13 @@ pub struct AgentConfig {
     pub port: Option<u16>,
     #[serde(default)]
     pub ui_token: Option<String>,
+    /// 可选 Git worktree 隔离：源仓库绝对路径（须为 git 仓库）。设置后启动/
+    /// 打开终端时惰性创建独立工作树作为 cwd；未设置沿用 working_dir。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_repo: Option<String>,
+    /// worktree 检出分支：已存在则检出，不存在则自 HEAD 创建；缺省分离 HEAD。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_branch: Option<String>,
     pub auto_restart: bool,
     pub created_at: String,
     pub updated_at: String,

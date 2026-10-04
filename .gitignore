@@ -67,3 +67,6 @@ docs/
 PRODUCT.md
 /spike
 /.qoder
+
+# zvec-grep workspace index
+.zvec-grep/

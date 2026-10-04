@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import { invoke } from '@tauri-apps/api/core'
 import {
@@ -8,6 +8,8 @@ import {
   Link, Wifi, WifiOff, Loader2, ExternalLink,
 } from 'lucide-react'
 import type { AgentState } from '../types/agent'
+import { useVisiblePolling } from '../hooks/useVisiblePolling'
+import { ErrorRecovery } from '../components/ErrorRecovery'
 
 // ── Caddy 类型 ───────────────────────────────────────────────
 
@@ -55,33 +57,38 @@ function TunnelSection({ agents }: { agents: AgentState[] }) {
   const [cloudflaredPath, setCloudflaredPath] = useState<string | null>(null)
   const [tunnels, setTunnels] = useState<Record<string, TunnelState>>({})
   const [copied, setCopied] = useState<string | null>(null)
-  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null)
-
   useEffect(() => {
-    invoke<string | null>('tunnel_check_cloudflared').then(setCloudflaredPath)
-    invoke<Record<string, string>>('tunnel_list').then(existing => {
+    let disposed = false
+    void invoke<string | null>('tunnel_check_cloudflared').then(path => {
+      if (!disposed) setCloudflaredPath(path)
+    }).catch(() => {})
+    void invoke<Record<string, string>>('tunnel_list').then(existing => {
+      if (disposed) return
       const states: Record<string, TunnelState> = {}
       for (const [id, url] of Object.entries(existing)) {
         states[id] = { status: 'active', url, error: '' }
       }
-      setTunnels(states)
-    })
+      // A delayed initial snapshot must not overwrite a user start/stop action.
+      setTunnels(prev => ({ ...states, ...prev }))
+    }).catch(() => {})
+    return () => { disposed = true }
   }, [])
 
-  // 轮询隧道存活状态
-  useEffect(() => {
-    pollingRef.current = setInterval(() => {
-      setTunnels(prev => {
-        const active = Object.keys(prev).filter(id => prev[id].status === 'active')
-        active.forEach(async (id) => {
-          const alive = await invoke<boolean>('tunnel_alive', { agentId: id })
-          if (!alive) setTunnels(p => ({ ...p, [id]: { status: 'idle', url: '', error: t('proxy.tunnelDisconnected') } }))
+  // Only observe active tunnels; tunnel_start owns connecting/error/timeout state.
+  const refreshTunnelStatus = useCallback(async () => {
+    const active = Object.entries(tunnels).filter(([, tunnel]) => tunnel.status === 'active')
+    await Promise.allSettled(active.map(async ([id, tunnel]) => {
+      const alive = await invoke<boolean>('tunnel_alive', { agentId: id })
+      if (!alive) {
+        setTunnels(prev => {
+          // Ignore a result for a tunnel that has since been stopped or restarted.
+          if (prev[id] !== tunnel) return prev
+          return { ...prev, [id]: { status: 'idle', url: '', error: t('proxy.tunnelDisconnected') } }
         })
-        return prev
-      })
-    }, 8000)
-    return () => { if (pollingRef.current) clearInterval(pollingRef.current) }
-  }, [t])
+      }
+    }))
+  }, [t, tunnels])
+  useVisiblePolling(refreshTunnelStatus, 8000)
 
   const activeAgents = agents.filter(a => a.config.port)
   const canStart = !!cloudflaredPath
@@ -223,9 +230,10 @@ function TunnelSection({ agents }: { agents: AgentState[] }) {
                       )}
 
                       {isError && (
-                        <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-red-50 px-3 py-2 text-[11px] leading-relaxed text-red-600 dark:bg-red-900/30 dark:text-red-400">
-                          {tunnel.error}
-                        </pre>
+                        <div role="alert" className="mt-2 rounded-lg bg-red-50 px-3 py-2 text-[11px] leading-relaxed text-red-600 dark:bg-red-900/30 dark:text-red-400">
+                          <pre className="max-h-48 overflow-auto whitespace-pre-wrap">{tunnel.error}</pre>
+                          <ErrorRecovery error={tunnel.error} onRetry={() => { void startTunnel(agent.config.id) }} disabled={isConnecting} />
+                        </div>
                       )}
                     </div>
 
@@ -301,11 +309,23 @@ export function ProxyManager({ agents }: Props) {
     setConfig(cfg); setCaddyPath(caddy); setIsRunning(running)
   }, [])
 
+  // Load configuration once; polling must not overwrite in-progress form edits.
+  // proxy_status is fetched by the hook, avoiding a duplicate initial status read.
   useEffect(() => {
-    refresh()
-    const timer = setInterval(() => invoke<boolean>('proxy_status').then(setIsRunning), 5000)
-    return () => clearInterval(timer)
-  }, [refresh])
+    let disposed = false
+    void Promise.all([
+      invoke<ProxyConfig>('proxy_get_config'),
+      invoke<string | null>('proxy_check_caddy'),
+    ]).then(([cfg, caddy]) => {
+      if (!disposed) { setConfig(cfg); setCaddyPath(caddy) }
+    }).catch(() => {})
+    return () => { disposed = true }
+  }, [])
+
+  const refreshProxyStatus = useCallback(async () => {
+    setIsRunning(await invoke<boolean>('proxy_status'))
+  }, [])
+  useVisiblePolling(refreshProxyStatus, 5000)
 
   async function addUser() {
     if (!newUsername.trim() || !newPassword.trim()) return
@@ -400,12 +420,15 @@ export function ProxyManager({ agents }: Props) {
 
       {/* 消息提示 */}
       {msg && (
-        <div className={`mx-6 mt-4 flex items-center gap-2 rounded-lg px-4 py-2.5 text-sm ${
+        <div role={msg.ok ? 'status' : 'alert'} className={`mx-6 mt-4 flex items-start gap-2 rounded-lg px-4 py-2.5 text-sm ${
           msg.ok ? 'bg-green-50 text-green-700 dark:bg-green-900/30 dark:text-green-300'
                  : 'bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300'
         }`}>
-          {msg.ok ? <CheckCircle className="h-4 w-4 shrink-0" /> : <AlertTriangle className="h-4 w-4 shrink-0" />}
-          {msg.text}
+          {msg.ok ? <CheckCircle className="mt-0.5 h-4 w-4 shrink-0" /> : <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />}
+          <div className="min-w-0 flex-1">
+            <p className="break-words">{msg.text}</p>
+            {!msg.ok && <ErrorRecovery error={msg.text} />}
+          </div>
         </div>
       )}
 

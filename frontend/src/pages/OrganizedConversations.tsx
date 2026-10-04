@@ -6,7 +6,7 @@ import type { MemoryConversationDetail, PendingMemorySession } from '../types/me
 import { ConversationDialog, displayTime, sourceLabel } from '../components/ConversationDialog'
 import { MemoryBreadcrumb } from '../components/MemoryBreadcrumb'
 
-export const OrganizedConversations = memo(function OrganizedConversations({ onBack }: { onBack: () => void }) {
+export const OrganizedConversations = memo(function OrganizedConversations({ onBack, active = true }: { onBack: () => void; active?: boolean }) {
   const { t } = useTranslation()
   const { loadOrganizedSessions, loadConversationDetail, checkTelemetry } = useMemoryStore()
   const [sessions, setSessions] = useState<PendingMemorySession[] | null>(null)
@@ -25,9 +25,10 @@ export const OrganizedConversations = memo(function OrganizedConversations({ onB
   }, [loadOrganizedSessions])
 
   useEffect(() => {
+    if (!active) return
     void reload()
     void checkTelemetry({ limit: 20 })
-  }, [reload, checkTelemetry])
+  }, [reload, checkTelemetry, active])
 
   const sourceCounts = useMemo(() => {
     const counts = new Map<string, number>()

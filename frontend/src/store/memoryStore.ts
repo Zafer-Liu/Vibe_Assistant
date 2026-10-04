@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import { invoke } from '@tauri-apps/api/core'
 import { createBgeConsolidationCandidateBatches, searchMemoriesWithBge } from '../lib/bgeSemanticSearch'
-import type { AddEventItem, AddResult, AgentSourceInfo, ConsolidationResult, EngineStatus, HookStatus, IngestStatus, L1ResetResult, LocalMemoryStats, McpAccessLog, McpAgentStatus, McpCatalogEntry, McpImportCandidate, MemoryConversationDetail, MemoryImportance, MemoryImportanceSummary, MemoryImportResult, MemoryItem, MemoryLayerDocument, MemoryLayerRunResult, MemoryMcpStatus, MemoryMcpTarget, OrganizeConversationsResult, PendingMemorySession, SkillAdoptResult, SkillDocument, SkillDriftFile, SkillItem, SkillPublishedDrift, SkillSyncPreview, TelemetryEvent, TelemetryLiveStatus, TelemetrySummary, TelemetryUsageAnalytics, TelemetryUsageRecord, TelemetryUsageRefresh } from '../types/memory'
+import type { AddEventItem, AddResult, AgentSourceInfo, ConsolidationResult, EngineStatus, HookStatus, IngestStatus, L1ResetResult, LocalMemoryStats, McpAccessLog, McpAgentStatus, McpCatalogEntry, McpImportCandidate, MemoryConversationDetail, MemoryImportance, MemoryImportanceSummary, MemoryImportResult, MemoryInjectionStats, MemoryItem, MemoryLayerDocument, MemoryLayerRunResult, MemoryMcpStatus, MemoryMcpTarget, OrganizeConversationsResult, PendingMemorySession, SkillAdoptResult, SkillDocument, SkillDriftFile, SkillItem, SkillPublishedDrift, SkillSyncPreview, TelemetryEvent, TelemetryLiveStatus, TelemetrySummary, TelemetryUsageAnalytics, TelemetryUsageRecord, TelemetryUsageRefresh } from '../types/memory'
 
 /** 全局记忆归属（未选择具体 Agent 时的 user_id） */
 export const GLOBAL_USER_ID = 'agent-manager'
@@ -55,6 +55,7 @@ interface MemoryStore {
   telemetryEvents: TelemetryEvent[]
   telemetryUsageRecords: TelemetryUsageRecord[]
   mcpAccessLogs: McpAccessLog[]
+  memoryInjectionStats: MemoryInjectionStats[]
   agentSources: AgentSourceInfo[]
   l2Documents: MemoryLayerDocument[]
   l3Documents: MemoryLayerDocument[]
@@ -90,6 +91,7 @@ interface MemoryStore {
   checkTelemetry: (options?: { backfill?: boolean; refreshUsage?: boolean; limit?: number }) => Promise<TelemetryUsageRefresh | null>
   loadUsageAnalytics: (filters: { startAt?: string; endAt?: string; source?: string; bucket: 'hour' | 'day' }) => Promise<TelemetryUsageAnalytics>
   checkMcpAccessLogs: () => Promise<void>
+  loadInjectionStats: () => Promise<void>
   loadAgentSources: () => Promise<void>
   setAgentSourceOverride: (id: string, transcriptRoots?: string[] | null, configHome?: string | null) => Promise<AgentSourceInfo>
   loadMemoryLayers: () => Promise<void>
@@ -118,8 +120,10 @@ interface MemoryStore {
   // ── MCP 库 ──
   mcpCatalog: McpCatalogEntry[]
   mcpStatuses: McpAgentStatus[]
+  mcpStatusError: string
   loadMcpCatalog: () => Promise<McpCatalogEntry[]>
   upsertMcpEntry: (entry: McpCatalogEntry) => Promise<McpCatalogEntry>
+  importMcpEntry: (name: string, agent: string) => Promise<McpCatalogEntry>
   deleteMcpEntry: (name: string) => Promise<void>
   equipMcp: (name: string, agent: string) => Promise<McpCatalogEntry>
   unequipMcp: (name: string, agent: string) => Promise<McpCatalogEntry>
@@ -156,12 +160,14 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
   telemetryEvents: [],
   telemetryUsageRecords: [],
   mcpAccessLogs: [],
+  memoryInjectionStats: [],
   agentSources: [],
   l2Documents: [],
   l3Documents: [],
   skills: [],
   mcpCatalog: [],
   mcpStatuses: [],
+  mcpStatusError: '',
   localMemoryStats: null,
   memoryCacheReady: false,
   skillCacheReady: false,
@@ -324,6 +330,15 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
     }
   },
 
+  async loadInjectionStats() {
+    try {
+      const stats = await invoke<MemoryInjectionStats[]>('memory_injection_stats', { days: 30 })
+      set((state) => (jsonEqual(state.memoryInjectionStats, stats) ? state : { memoryInjectionStats: stats }))
+    } catch {
+      /* 浏览器预览或旧版后端不可用时保留当前内容。 */
+    }
+  },
+
   async loadAgentSources() {
     try {
       set({ agentSources: await invoke<AgentSourceInfo[]>('agent_sources_list') })
@@ -382,9 +397,11 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
   },
 
   async scanSkills() {
-    const skills = await invoke<SkillItem[]>('skill_scan')
-    set({ skills, skillCacheReady: true })
-    return skills
+    const imported = await invoke<SkillItem[]>('skill_scan')
+    // 扫描返回值仅用于提示数量；列表数据以共享库缓存为准重新加载，
+    // 与其他变更操作保持一致，避免把中间态直接当成目录状态。
+    await get().loadSkills(true)
+    return imported
   },
 
   async loadSkills(force = false) {
@@ -488,6 +505,18 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
     return saved
   },
 
+  async importMcpEntry(name, agent) {
+    const saved = await invoke<McpCatalogEntry>('mcp_catalog_import', { name, agent })
+    set((state) => ({
+      mcpCatalog: state.mcpCatalog.some(entry => entry.name === saved.name)
+        ? state.mcpCatalog.map(entry => entry.name === saved.name ? saved : entry)
+        : [...state.mcpCatalog, saved],
+    }))
+    // Import succeeded. Status failures are retained separately for the UI.
+    await get().checkMcpStatuses().catch(() => {})
+    return saved
+  },
+
   async deleteMcpEntry(name) {
     await invoke('mcp_catalog_delete', { name })
     set((state) => ({
@@ -499,25 +528,33 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
   async equipMcp(name, agent) {
     const saved = await invoke<McpCatalogEntry>('mcp_equip', { name, agent })
     set((state) => ({ mcpCatalog: state.mcpCatalog.map((e) => (e.name === saved.name ? saved : e)) }))
-    await get().checkMcpStatuses()
+    // The write succeeded; status errors remain visible through mcpStatusError.
+    await get().checkMcpStatuses().catch(() => {})
     return saved
   },
 
   async unequipMcp(name, agent) {
     const saved = await invoke<McpCatalogEntry>('mcp_unequip', { name, agent })
     set((state) => ({ mcpCatalog: state.mcpCatalog.map((e) => (e.name === saved.name ? saved : e)) }))
-    await get().checkMcpStatuses()
+    // The write succeeded; status errors remain visible through mcpStatusError.
+    await get().checkMcpStatuses().catch(() => {})
     return saved
   },
 
   async syncMcpAgent(agent) {
     await invoke('mcp_sync_agent', { agent })
-    await get().checkMcpStatuses()
+    await get().checkMcpStatuses().catch(() => {})
   },
 
   async checkMcpStatuses() {
-    const statuses = await invoke<McpAgentStatus[]>('mcp_status_all')
-    set((state) => (jsonEqual(state.mcpStatuses, statuses) ? state : { mcpStatuses: statuses }))
+    try {
+      const statuses = await invoke<McpAgentStatus[]>('mcp_status_all')
+      set((state) => (jsonEqual(state.mcpStatuses, statuses) && !state.mcpStatusError
+        ? state : { mcpStatuses: statuses, mcpStatusError: '' }))
+    } catch (error) {
+      set({ mcpStatusError: String(error) })
+      throw error
+    }
   },
 
   async importMcpFromAgents() {

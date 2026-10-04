@@ -3,10 +3,10 @@ use crate::process_util::no_window;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,39 +24,595 @@ fn get_data_dir() -> std::path::PathBuf {
         .join("agent-manager")
 }
 
+// Every read/modify/write in this module holds this lock, including manual edits.
+static CONFIGS_LOCK: Mutex<()> = Mutex::new(());
+const AGENT_CONFIGS_SETTING: &str = "agent_configs";
+
 fn load_configs() -> HashMap<String, AgentConfig> {
-    const SETTING_KEY: &str = "agent_configs";
+    let _guard = lock_safe(&CONFIGS_LOCK);
+    // Preserve the legacy list/start behavior; mutations use the checked reader.
+    load_configs_checked().unwrap_or_default()
+}
+
+// Caller holds CONFIGS_LOCK. Reads are side-effect free: legacy JSON is migrated
+// on the next explicit save, not while probing installed CLIs.
+fn load_configs_checked() -> Result<HashMap<String, AgentConfig>, String> {
+    use rusqlite::OptionalExtension;
+
     if let Some(store) = crate::telemetry_store::shared_store() {
-        if let Some(configs) = store.app_setting_get(SETTING_KEY) {
-            return configs;
+        // app_setting_get returns None for both missing data and errors. Do not
+        // fall back to a stale mirror on a database/JSON error and overwrite data.
+        let conn = store
+            .conn
+            .lock()
+            .map_err(|_| "Cannot read agent configs: telemetry store lock poisoned".to_string())?;
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT value_json FROM app_settings WHERE setting_key = ?1",
+                [AGENT_CONFIGS_SETTING],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("Cannot read agent configs from SQLite: {error}"))?;
+        if let Some(json) = json {
+            return serde_json::from_str(&json)
+                .map_err(|error| format!("Invalid agent configs in SQLite: {error}"));
         }
     }
     let path = get_data_dir().join("agents.json");
-    let configs = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    // One-time lazy migration: startup remains compatible with existing
-    // installs, while all later reads use the primary SQLite store.
-    if let Some(store) = crate::telemetry_store::shared_store() {
-        let _ = store.app_setting_set(SETTING_KEY, &configs);
+    match std::fs::read_to_string(&path) {
+        Ok(json) => serde_json::from_str(&json)
+            .map_err(|error| format!("Invalid agent configs in {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(error) => Err(format!("Cannot read {}: {error}", path.display())),
     }
-    configs
 }
 
-fn save_configs(configs: &HashMap<String, AgentConfig>) {
-    const SETTING_KEY: &str = "agent_configs";
-    if let Some(store) = crate::telemetry_store::shared_store() {
-        let _ = store.app_setting_set(SETTING_KEY, configs);
-    }
-    // Keep a compatibility mirror for a downgrade to an older Agent Manager
-    // version.  Current versions read SQLite first.
+// Caller holds CONFIGS_LOCK for the entire read/modify/write transaction.
+fn save_configs(configs: &HashMap<String, AgentConfig>) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(configs)
+        .map_err(|error| format!("Cannot serialize agent configs: {error}"))?;
     let dir = get_data_dir();
-    let _ = std::fs::create_dir_all(&dir);
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("Cannot create {}: {error}", dir.display()))?;
     let path = dir.join("agents.json");
-    if let Ok(json) = serde_json::to_string_pretty(configs) {
-        let _ = std::fs::write(path, json);
+    // Stage before updating SQLite; never truncate the previous compatibility
+    // mirror. NamedTempFile::persist replaces the destination on both platforms.
+    let mut mirror = tempfile::NamedTempFile::new_in(&dir)
+        .map_err(|error| format!("Cannot stage agent config mirror: {error}"))?;
+    mirror
+        .write_all(&json)
+        .and_then(|_| mirror.as_file().sync_all())
+        .map_err(|error| format!("Cannot write agent config mirror: {error}"))?;
+
+    let primary = crate::telemetry_store::shared_store();
+    if let Some(store) = &primary {
+        store
+            .app_setting_set(AGENT_CONFIGS_SETTING, configs)
+            .map_err(|error| format!("Cannot save agent configs to SQLite: {error}"))?;
     }
+    mirror.persist(&path).map_err(|error| {
+        if primary.is_some() {
+            format!(
+                "Agent configs were saved to SQLite, but the compatibility mirror {} could not be replaced: {}. The previous mirror was preserved; retry to repair it.",
+                path.display(), error.error
+            )
+        } else {
+            format!(
+                "Agent configs were not saved; the previous {} was preserved: {}",
+                path.display(), error.error
+            )
+        }
+    })?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DetectedAgentCli {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    pub imported: bool,
+}
+
+struct AgentCliCandidate {
+    id: &'static str,
+    name: &'static str,
+    command: &'static str,
+}
+
+// Product IDs, not config IDs. In particular, Qoder's desktop executable is not
+// a candidate, and nothing from this list is ever executed during onboarding.
+const AGENT_CLI_CANDIDATES: &[AgentCliCandidate] = &[
+    AgentCliCandidate {
+        id: "claude",
+        name: "Claude Code",
+        command: "claude",
+    },
+    AgentCliCandidate {
+        id: "codex",
+        name: "Codex CLI",
+        command: "codex",
+    },
+    AgentCliCandidate {
+        id: "qodercli",
+        name: "Qoder CLI",
+        command: "qodercli",
+    },
+    AgentCliCandidate {
+        id: "kimi",
+        name: "Kimi Code",
+        command: "kimi",
+    },
+    AgentCliCandidate {
+        id: "copilot",
+        name: "GitHub Copilot",
+        command: "copilot",
+    },
+];
+
+fn selected_cli_candidates(ids: &[String]) -> Result<Vec<&'static AgentCliCandidate>, String> {
+    let mut seen = HashSet::new();
+    let mut selected = Vec::new();
+    for id in ids {
+        let candidate = AGENT_CLI_CANDIDATES
+            .iter()
+            .find(|candidate| candidate.id == id)
+            .ok_or_else(|| format!("Unsupported agent CLI id: {id}"))?;
+        if seen.insert(id) {
+            selected.push(candidate);
+        }
+    }
+    Ok(selected)
+}
+
+fn unquote_cli_value(value: &str) -> &str {
+    let value = value.trim();
+    if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
+// Lexical normalization only: no filesystem access, shell parsing or basename
+// matching of unrelated absolute paths. The platform parameter keeps tests pure.
+fn normalized_absolute_cli(command: &str, windows: bool) -> Option<String> {
+    let command = unquote_cli_value(command);
+    let mut value = if windows {
+        command.replace('\\', "/").to_lowercase()
+    } else {
+        command.to_string()
+    };
+    if windows {
+        if let Some(rest) = value.strip_prefix("//?/unc/") {
+            value = format!("//{rest}");
+        } else if let Some(rest) = value.strip_prefix("//?/") {
+            value = rest.to_string();
+        }
+    }
+    let (root, rest) = if windows {
+        let bytes = value.as_bytes();
+        if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == b":/" {
+            (value[..3].to_string(), &value[3..])
+        } else if let Some(unc) = value.strip_prefix("//") {
+            let mut parts = unc.splitn(3, '/');
+            let server = parts.next()?;
+            let share = parts.next()?;
+            if [server, share]
+                .iter()
+                .any(|part| part.is_empty() || *part == "." || *part == "..")
+            {
+                return None;
+            }
+            (format!("//{server}/{share}/"), parts.next().unwrap_or(""))
+        } else {
+            return None;
+        }
+    } else {
+        ("/".to_string(), value.strip_prefix('/')?)
+    };
+    let mut components = Vec::new();
+    for component in rest.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            _ => components.push(component),
+        }
+    }
+    Some(format!("{}{}", root, components.join("/")))
+}
+
+fn cli_command_match_rank(
+    configured: &str,
+    detected: &str,
+    candidate_command: &str,
+    windows: bool,
+) -> Option<u8> {
+    if let Some(configured_path) = normalized_absolute_cli(configured, windows) {
+        return normalized_absolute_cli(detected, windows)
+            .filter(|detected_path| *detected_path == configured_path)
+            .map(|_| 0);
+    }
+    let configured = unquote_cli_value(configured);
+    let bare = if windows {
+        configured.to_ascii_lowercase()
+    } else {
+        configured.to_string()
+    };
+    let bare = if windows {
+        [".exe", ".cmd", ".bat"]
+            .iter()
+            .find_map(|extension| bare.strip_suffix(*extension))
+            .unwrap_or(&bare)
+    } else {
+        &bare
+    };
+    (bare == candidate_command).then_some(1)
+}
+
+fn matching_cli_config_id(
+    configs: &HashMap<String, AgentConfig>,
+    candidate: &AgentCliCandidate,
+    command: &str,
+    windows: bool,
+) -> Option<String> {
+    // Prefer an exact normalized path over a bare command, then the smallest
+    // config ID. HashMap iteration order must never affect repeated imports.
+    configs
+        .iter()
+        .filter_map(|(id, config)| {
+            cli_command_match_rank(&config.command, command, candidate.command, windows)
+                .map(|rank| (rank, id))
+        })
+        .min()
+        .map(|(_, id)| id.clone())
+}
+
+fn plan_cli_import(
+    configs: &HashMap<String, AgentConfig>,
+    ids: &[String],
+    detected: &[DetectedAgentCli],
+    home: &str,
+    now: &str,
+    windows: bool,
+) -> Result<(HashMap<String, AgentConfig>, Vec<String>), String> {
+    // Validate the complete selection before changing even the in-memory copy.
+    let selected = selected_cli_candidates(ids)?
+        .into_iter()
+        .map(|candidate| {
+            detected
+                .iter()
+                .find(|cli| cli.id == candidate.id)
+                .map(|cli| (candidate, cli))
+                .ok_or_else(|| {
+                    format!(
+                        "{} CLI is no longer available; detect again before importing",
+                        candidate.name
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut configs = configs.clone();
+    let mut imported = Vec::new();
+    for (candidate, cli) in selected {
+        if let Some(id) = matching_cli_config_id(&configs, candidate, &cli.command, windows) {
+            imported.push(id);
+            continue;
+        }
+        let base = format!("detected-{}", candidate.id);
+        let mut id = base.clone();
+        let mut suffix = 2;
+        while configs.contains_key(&id) {
+            id = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+        configs.insert(
+            id.clone(),
+            AgentConfig {
+                id: id.clone(),
+                name: candidate.name.to_string(),
+                description: String::new(),
+                command: cli.command.clone(),
+                args: Vec::new(),
+                working_dir: home.to_string(),
+                env: HashMap::new(),
+                port: None,
+                ui_token: None,
+                worktree_repo: None,
+                worktree_branch: None,
+                auto_restart: false,
+                created_at: now.to_string(),
+                updated_at: now.to_string(),
+            },
+        );
+        imported.push(id);
+    }
+    Ok((configs, imported))
+}
+
+fn npmrc_cli_prefix(contents: &str) -> Option<String> {
+    let mut prefix = None;
+    for line in contents.lines() {
+        // npm's INI comments can follow a value, but not inside quoted paths.
+        let mut quote = None;
+        let end = line
+            .char_indices()
+            .find_map(|(index, ch)| {
+                if ch == '\'' || ch == '"' {
+                    if quote == Some(ch) {
+                        quote = None;
+                    } else if quote.is_none() {
+                        quote = Some(ch);
+                    }
+                }
+                ((ch == '#' || ch == ';') && quote.is_none()).then_some(index)
+            })
+            .unwrap_or(line.len());
+        if let Some((key, value)) = line[..end].split_once('=') {
+            if key.trim().eq_ignore_ascii_case("prefix") {
+                let value = unquote_cli_value(value);
+                prefix = (!value.is_empty()).then(|| value.to_string());
+            }
+        }
+    }
+    prefix
+}
+
+fn npm_cli_prefix_path(value: &str, home: &Path) -> Result<PathBuf, String> {
+    // Expand npm-style ${ENV} placeholders, never shell syntax or commands.
+    let mut expanded = String::new();
+    let mut rest = unquote_cli_value(value);
+    while let Some(start) = rest.find("${") {
+        expanded.push_str(&rest[..start]);
+        let variable = &rest[start + 2..];
+        let end = variable
+            .find('}')
+            .ok_or_else(|| "Invalid npm prefix: unclosed environment placeholder".to_string())?;
+        let name = &variable[..end];
+        let value = std::env::var(name)
+            .map_err(|error| format!("Cannot expand npm prefix variable {name}: {error}"))?;
+        expanded.push_str(&value);
+        rest = &variable[end + 1..];
+    }
+    expanded.push_str(rest);
+    if expanded.is_empty() {
+        return Err("Invalid npm prefix: empty path".to_string());
+    }
+    if expanded == "~" {
+        return Ok(home.to_path_buf());
+    }
+    if let Some(rest) = expanded.strip_prefix("~/").or_else(|| {
+        if cfg!(windows) {
+            expanded.strip_prefix("~\\")
+        } else {
+            None
+        }
+    }) {
+        return Ok(home.join(rest));
+    }
+    let path = PathBuf::from(expanded);
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        home.join(path)
+    })
+}
+
+fn agent_cli_home() -> Result<PathBuf, String> {
+    dirs_next::home_dir()
+        .filter(|home| home.is_absolute())
+        .ok_or_else(|| {
+            "Cannot determine the user's home directory for agent CLI detection/import".to_string()
+        })
+}
+
+fn agent_cli_search_dirs(home: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut dirs = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        // Ignore empty PATH components rather than implicitly trusting the cwd.
+        for dir in std::env::split_paths(&path).filter(|dir| !dir.as_os_str().is_empty()) {
+            dirs.push(if dir.is_absolute() {
+                dir
+            } else {
+                std::env::current_dir()
+                    .map_err(|error| format!("Cannot resolve a relative PATH entry: {error}"))?
+                    .join(dir)
+            });
+        }
+    }
+    let mut prefixes = Vec::new();
+    for key in ["npm_config_prefix", "NPM_CONFIG_PREFIX"] {
+        if let Some(value) = std::env::var_os(key) {
+            let value = value
+                .into_string()
+                .map_err(|_| format!("Cannot read {key}: path is not valid Unicode"))?;
+            if !value.trim().is_empty() {
+                prefixes.push(npm_cli_prefix_path(&value, home)?);
+            }
+        }
+    }
+    let npmrc = home.join(".npmrc");
+    match std::fs::read_to_string(&npmrc) {
+        Ok(contents) => {
+            if let Some(prefix) = npmrc_cli_prefix(&contents) {
+                prefixes.push(npm_cli_prefix_path(&prefix, home)?);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Cannot read {} for CLI detection: {error}",
+                npmrc.display()
+            ))
+        }
+    }
+    for prefix in prefixes {
+        if cfg!(windows) {
+            dirs.push(prefix.clone());
+        }
+        dirs.push(prefix.join("bin"));
+    }
+    for relative in [
+        ".local/bin",
+        ".npm-global/bin",
+        ".npm/bin",
+        ".npm-packages/bin",
+        ".volta/bin",
+        ".bun/bin",
+    ] {
+        dirs.push(home.join(relative));
+    }
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            let appdata = PathBuf::from(appdata);
+            if appdata.is_absolute() {
+                dirs.push(appdata.join("npm"));
+            }
+        }
+        dirs.push(home.join("AppData/Roaming/npm"));
+        dirs.push(home.join(".npm-global"));
+        dirs.push(home.join(".npm-packages"));
+        dirs.push(home.join("scoop/shims"));
+        if let Some(localappdata) = std::env::var_os("LOCALAPPDATA") {
+            let localappdata = PathBuf::from(localappdata);
+            if localappdata.is_absolute() {
+                dirs.push(localappdata.join("Microsoft/WinGet/Links"));
+            }
+        }
+    }
+    #[cfg(unix)]
+    for dir in [
+        "/usr/local/bin",
+        "/opt/homebrew/bin",
+        "/usr/bin",
+        "/bin",
+        "/opt/local/bin",
+    ] {
+        dirs.push(PathBuf::from(dir));
+    }
+    if let Some(dir) = dirs.iter().find(|dir| !dir.is_absolute()) {
+        return Err(format!(
+            "Cannot resolve CLI search directory to an absolute path: {}",
+            dir.display()
+        ));
+    }
+    let mut seen = HashSet::new();
+    dirs.retain(|dir| seen.insert(dir.clone()));
+    Ok(dirs)
+}
+
+fn scan_agent_clis(home: &Path) -> Result<Vec<DetectedAgentCli>, String> {
+    let dirs = agent_cli_search_dirs(home)?;
+    let extensions: &[&str] = if cfg!(windows) {
+        &[".exe", ".cmd", ".bat"]
+    } else {
+        &[""]
+    };
+    let mut detected = Vec::new();
+    for candidate in AGENT_CLI_CANDIDATES {
+        'search: for dir in &dirs {
+            for extension in extensions {
+                let path = dir.join(format!("{}{extension}", candidate.command));
+                let metadata = match std::fs::metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(format!(
+                            "Cannot inspect CLI candidate {}: {error}",
+                            path.display()
+                        ))
+                    }
+                };
+                if !metadata.is_file() {
+                    continue;
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if metadata.permissions().mode() & 0o111 == 0 {
+                        continue;
+                    }
+                }
+                let command = path
+                    .to_str()
+                    .ok_or_else(|| format!("CLI path is not valid Unicode: {}", path.display()))?
+                    .to_string();
+                detected.push(DetectedAgentCli {
+                    id: candidate.id.to_string(),
+                    name: candidate.name.to_string(),
+                    command,
+                    imported: false,
+                });
+                break 'search;
+            }
+        }
+    }
+    Ok(detected)
+}
+
+#[tauri::command]
+pub async fn detect_agent_clis() -> Result<Vec<DetectedAgentCli>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let home = agent_cli_home()?;
+        let mut detected = scan_agent_clis(&home)?;
+        if detected.is_empty() {
+            return Ok(detected);
+        }
+        let _guard = lock_safe(&CONFIGS_LOCK);
+        let configs = load_configs_checked()?;
+        for cli in &mut detected {
+            if let Some(candidate) = AGENT_CLI_CANDIDATES
+                .iter()
+                .find(|candidate| candidate.id == cli.id)
+            {
+                cli.imported =
+                    matching_cli_config_id(&configs, candidate, &cli.command, cfg!(windows))
+                        .is_some();
+            }
+        }
+        Ok(detected)
+    })
+    .await
+    .map_err(|error| format!("Agent CLI detection task failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn import_detected_agent_clis(ids: Vec<String>) -> Result<Vec<String>, String> {
+    selected_cli_candidates(&ids)?;
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let home = agent_cli_home()?;
+        // Re-scan inside the serialized operation; never trust frontend paths or
+        // a previous detection result. No subprocess or external config writes.
+        let _guard = lock_safe(&CONFIGS_LOCK);
+        let detected = scan_agent_clis(&home)?;
+        let configs = load_configs_checked()?;
+        let home = home.to_str().ok_or_else(|| {
+            "Cannot import agent CLIs: home path is not valid Unicode".to_string()
+        })?;
+        let (configs, imported) = plan_cli_import(
+            &configs,
+            &ids,
+            &detected,
+            home,
+            &Utc::now().to_rfc3339(),
+            cfg!(windows),
+        )?;
+        // Also save on a duplicate-only retry, to repair a prior mirror failure.
+        save_configs(&configs)?;
+        Ok(imported)
+    })
+    .await
+    .map_err(|error| format!("Agent CLI import task failed: {error}"))?
 }
 
 fn is_port_open(port: u16) -> bool {
@@ -482,8 +1038,41 @@ fn spawn_agent_with_arcs(
         .stderr(Stdio::piped());
     no_window(&mut cmd);
 
-    if !config.working_dir.is_empty() {
-        cmd.current_dir(&config.working_dir);
+    // P1 Git worktree 隔离：配置了 worktree_repo 时惰性创建独立工作树并作为 cwd；
+    // 创建失败按 spawn 失败处理（状态置 Error 并写日志），不用残留 cwd 兜底。
+    let worktree_cwd = match config.worktree_repo.as_deref() {
+        Some(repo) if !repo.trim().is_empty() => {
+            match crate::worktree::ensure_worktree(id, repo, config.worktree_branch.as_deref()) {
+                Ok(dest) => {
+                    let path = dest.to_string_lossy().to_string();
+                    push_log(
+                        logs,
+                        id,
+                        LogLevel::Info,
+                        format!("Using isolated git worktree: {path}"),
+                    );
+                    Some(path)
+                }
+                Err(error) => {
+                    let mut agents_guard = lock_safe(agents);
+                    if let Some(state) = agents_guard.get_mut(id) {
+                        state.status = AgentStatus::Error;
+                    }
+                    push_log(
+                        logs,
+                        id,
+                        LogLevel::Error,
+                        format!("Failed to prepare git worktree: {error}"),
+                    );
+                    return Err(format!("Failed to prepare git worktree: {error}"));
+                }
+            }
+        }
+        _ => None,
+    };
+    let effective_dir = worktree_cwd.unwrap_or_else(|| config.working_dir.clone());
+    if !effective_dir.is_empty() {
+        cmd.current_dir(&effective_dir);
     }
     for (k, v) in &config.env {
         cmd.env(k, v);
@@ -629,9 +1218,31 @@ pub fn get_agent_logs(id: String, store: State<AgentStore>) -> Vec<LogEntry> {
     logs.get(&id).cloned().unwrap_or_default()
 }
 
+/// 解析 Agent 实际工作目录：配置了 worktree 时惰性创建并返回独立工作树
+/// 路径，否则返回 working_dir。前端打开终端前调用，与进程 spawn 共用同一
+/// 解析逻辑，保证终端与 Agent 进程落在同一目录。
+#[tauri::command]
+pub fn resolve_agent_cwd(id: String, store: State<AgentStore>) -> Result<String, String> {
+    let config = {
+        let agents = lock_safe(&store.agents);
+        agents
+            .get(&id)
+            .map(|state| state.config.clone())
+            .ok_or_else(|| format!("Agent 不存在: {id}"))?
+    };
+    match config.worktree_repo.as_deref() {
+        Some(repo) if !repo.trim().is_empty() => {
+            let dest = crate::worktree::ensure_worktree(&id, repo, config.worktree_branch.as_deref())?;
+            Ok(dest.to_string_lossy().to_string())
+        }
+        _ => Ok(config.working_dir),
+    }
+}
+
 #[tauri::command]
 pub fn save_agent_config(config: Value) -> Result<String, String> {
-    let mut configs = load_configs();
+    let _guard = lock_safe(&CONFIGS_LOCK);
+    let mut configs = load_configs_checked()?;
 
     let id = config
         .get("id")
@@ -668,6 +1279,14 @@ pub fn save_agent_config(config: Value) -> Result<String, String> {
             .as_str()
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string()),
+        worktree_repo: config["worktree_repo"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string()),
+        worktree_branch: config["worktree_branch"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string()),
         auto_restart: config["auto_restart"].as_bool().unwrap_or(false),
         created_at: configs
             .get(&id)
@@ -677,12 +1296,14 @@ pub fn save_agent_config(config: Value) -> Result<String, String> {
     };
 
     configs.insert(id.clone(), agent);
-    save_configs(&configs);
+    save_configs(&configs)?;
     Ok(id)
 }
 
 #[tauri::command]
 pub fn delete_agent(id: String, store: State<AgentStore>) -> Result<(), String> {
+    let config_guard = lock_safe(&CONFIGS_LOCK);
+    let mut configs = load_configs_checked()?;
     // 标记不再重启
     {
         let mut restarting = lock_safe(&store.restarting);
@@ -697,20 +1318,21 @@ pub fn delete_agent(id: String, store: State<AgentStore>) -> Result<(), String> 
         }
     }
 
-    let mut configs = load_configs();
     configs.remove(&id);
-    save_configs(&configs);
+    let save_result = save_configs(&configs);
+    drop(config_guard);
 
     let mut agents = lock_safe(&store.agents);
     agents.remove(&id);
+    drop(agents);
 
-    // 清理重启标记
+    // Even on persistence failure, finish cleanup of the stopped process.
     {
         let mut restarting = lock_safe(&store.restarting);
         restarting.remove(&id);
     }
 
-    Ok(())
+    save_result
 }
 
 #[tauri::command]
@@ -1553,6 +2175,275 @@ pub fn resolve_npm_global(_cmd: &str) -> Option<std::path::PathBuf> {
 #[cfg(not(windows))]
 pub fn resolve_npm_global_to_node(_cmd: &str) -> Option<(String, String)> {
     None
+}
+
+#[cfg(test)]
+mod agent_cli_import_tests {
+    use super::*;
+
+    // Fixtures and every test below are purely in-memory; no environment reads,
+    // filesystem probes, persistence, subprocesses or user configs are involved.
+    fn manual_config(id: &str, command: &str) -> AgentConfig {
+        AgentConfig {
+            id: id.to_string(),
+            name: "Manual agent".to_string(),
+            description: "Keep this description".to_string(),
+            command: command.to_string(),
+            args: vec!["--manual".to_string()],
+            working_dir: "/manual/workspace".to_string(),
+            env: HashMap::from([("CUSTOM".to_string(), "keep".to_string())]),
+            port: Some(1234),
+            ui_token: Some("fixture-token".to_string()),
+            worktree_repo: None,
+            worktree_branch: None,
+            auto_restart: true,
+            created_at: "original-created".to_string(),
+            updated_at: "original-updated".to_string(),
+        }
+    }
+
+    fn detected(id: &str, command: &str) -> DetectedAgentCli {
+        DetectedAgentCli {
+            id: id.to_string(),
+            name: "Not used as the product name".to_string(),
+            command: command.to_string(),
+            imported: false,
+        }
+    }
+
+    #[test]
+    fn windows_command_matching_normalizes_paths_and_bare_wrappers() {
+        let path = r"C:\Users\Example\npm\claude.cmd";
+        for command in [
+            "claude",
+            "CLAUDE.EXE",
+            "claude.cmd",
+            "claude.bat",
+            " \"Claude.CMD\" ",
+        ] {
+            assert_eq!(
+                cli_command_match_rank(command, path, "claude", true),
+                Some(1)
+            );
+        }
+        for command in [
+            r"c:/users/example/npm/./claude.CMD",
+            r#""C:\Users\Example\npm\claude.cmd""#,
+            r"\\?\C:\Users\Example\npm\claude.cmd",
+            r"C:\Users\Example\other\..\npm\claude.cmd",
+        ] {
+            assert_eq!(
+                cli_command_match_rank(command, path, "claude", true),
+                Some(0)
+            );
+        }
+        for command in [
+            r"C:\Other\claude.cmd",
+            r".\claude.cmd",
+            "claude --version",
+            "claude.ps1",
+            "C:claude.cmd",
+        ] {
+            assert_eq!(cli_command_match_rank(command, path, "claude", true), None);
+        }
+        assert_eq!(
+            cli_command_match_rank(r"C:\Users\Example\npm\claude.exe", path, "claude", true),
+            None
+        );
+        assert_eq!(
+            normalized_absolute_cli(r"\\?\UNC\Server\Share\bin\claude.cmd", true),
+            normalized_absolute_cli("//server/share/bin/claude.cmd", true),
+        );
+    }
+
+    #[test]
+    fn unix_matching_is_case_sensitive_and_does_not_use_path_basenames() {
+        let path = "/opt/tools/bin/claude";
+        assert_eq!(
+            cli_command_match_rank("claude", path, "claude", false),
+            Some(1)
+        );
+        assert_eq!(
+            cli_command_match_rank("'/opt/tools/bin/./claude'", path, "claude", false),
+            Some(0)
+        );
+        assert_eq!(
+            cli_command_match_rank("/opt//tools/old/../bin/claude", path, "claude", false),
+            Some(0)
+        );
+        for command in [
+            "Claude",
+            "claude.cmd",
+            "claude.sh",
+            "./claude",
+            "~/bin/claude",
+            "/other/claude",
+            "/opt/TOOLS/bin/claude",
+            "claude --help",
+        ] {
+            assert_eq!(cli_command_match_rank(command, path, "claude", false), None);
+        }
+        assert!(normalized_absolute_cli(r"C:\bin\claude.exe", false).is_none());
+    }
+
+    #[test]
+    fn only_fixed_product_ids_are_accepted_and_order_is_stable() {
+        let ids: Vec<String> = ["claude", "codex", "qodercli", "kimi", "copilot"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let selected = selected_cli_candidates(&ids).unwrap();
+        assert_eq!(selected.len(), AGENT_CLI_CANDIDATES.len());
+        assert_eq!(
+            selected
+                .iter()
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        for id in [
+            "qoder",
+            "qoder.exe",
+            "QODERCLI",
+            "claude.cmd",
+            "../claude",
+            "unknown",
+            "",
+        ] {
+            assert!(selected_cli_candidates(&[id.to_string()]).is_err());
+        }
+        let selected =
+            selected_cli_candidates(&["codex".into(), "claude".into(), "codex".into()]).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>(),
+            ["codex", "claude"]
+        );
+        assert!(selected_cli_candidates(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn duplicate_selection_prefers_exact_path_then_smallest_config_id() {
+        let path = r"C:\Tools\claude.cmd";
+        let fixtures = [
+            manual_config("00-bare", "claude"),
+            manual_config("zz-exact", path),
+            manual_config("aa-exact", "c:/tools/CLAUDE.cmd"),
+        ];
+        let mut configs = HashMap::new();
+        for config in fixtures.iter().rev() {
+            configs.insert(config.id.clone(), config.clone());
+        }
+        let before = serde_json::to_value(&configs).unwrap();
+        let (after, ids) = plan_cli_import(
+            &configs,
+            &["claude".into(), "claude".into()],
+            &[detected("claude", path)],
+            "C:\\Users\\Example",
+            "new-time",
+            true,
+        )
+        .unwrap();
+        assert_eq!(ids, ["aa-exact"]);
+        assert_eq!(serde_json::to_value(after).unwrap(), before);
+        configs.remove("aa-exact");
+        configs.remove("zz-exact");
+        configs.insert("zz-bare".into(), manual_config("zz-bare", "CLAUDE.EXE"));
+        assert_eq!(
+            matching_cli_config_id(&configs, &AGENT_CLI_CANDIDATES[0], path, true).as_deref(),
+            Some("00-bare")
+        );
+    }
+
+    #[test]
+    fn imports_never_overwrite_manual_ids_and_retries_are_idempotent() {
+        let mut configs = HashMap::new();
+        for id in ["claude", "detected-claude", "detected-claude-2"] {
+            configs.insert(id.to_string(), manual_config(id, "/manual/other-command"));
+        }
+        let detected = [detected("claude", "/opt/tools/claude")];
+        let (first, ids) = plan_cli_import(
+            &configs,
+            &["claude".into()],
+            &detected,
+            "/home/example",
+            "first-time",
+            false,
+        )
+        .unwrap();
+        assert_eq!(ids, ["detected-claude-3"]);
+        for (id, original) in &configs {
+            assert_eq!(
+                serde_json::to_value(&first[id]).unwrap(),
+                serde_json::to_value(original).unwrap()
+            );
+        }
+        let added = &first[&ids[0]];
+        assert_eq!(added.id, ids[0]);
+        assert_eq!(added.name, "Claude Code");
+        assert_eq!(added.command, "/opt/tools/claude");
+        assert_eq!(added.working_dir, "/home/example");
+        assert!(added.args.is_empty() && added.env.is_empty());
+        assert!(added.port.is_none() && added.ui_token.is_none());
+        assert!(!added.auto_restart);
+        let (second, second_ids) = plan_cli_import(
+            &first,
+            &["claude".into(), "claude".into()],
+            &detected,
+            "/home/example",
+            "later-time",
+            false,
+        )
+        .unwrap();
+        assert_eq!(second_ids, ids);
+        assert_eq!(
+            serde_json::to_value(second).unwrap(),
+            serde_json::to_value(first).unwrap()
+        );
+    }
+
+    #[test]
+    fn missing_or_unknown_selection_rejects_the_whole_import() {
+        let configs = HashMap::from([("manual".into(), manual_config("manual", "custom"))]);
+        let before = serde_json::to_value(&configs).unwrap();
+        let found = [detected("claude", "/bin/claude")];
+        for ids in [
+            vec!["claude".into(), "codex".into()],
+            vec!["claude".into(), "qoder".into()],
+        ] {
+            assert!(
+                plan_cli_import(&configs, &ids, &found, "/home/example", "now", false).is_err()
+            );
+        }
+        assert_eq!(serde_json::to_value(&configs).unwrap(), before);
+        let (unchanged, ids) =
+            plan_cli_import(&configs, &[], &found, "/home/example", "now", false).unwrap();
+        assert!(ids.is_empty());
+        assert_eq!(serde_json::to_value(unchanged).unwrap(), before);
+    }
+
+    #[test]
+    fn npmrc_prefix_parser_handles_quotes_comments_and_last_value() {
+        assert_eq!(
+            npmrc_cli_prefix("# prefix=/ignore\nregistry=https://example.invalid"),
+            None
+        );
+        assert_eq!(
+            npmrc_cli_prefix("prefix = ${HOME}/.npm-global ; comment"),
+            Some("${HOME}/.npm-global".into())
+        );
+        assert_eq!(
+            npmrc_cli_prefix("prefix=/old\nprefix = \"C:\\npm tools\\#bin\" # comment"),
+            Some(r"C:\npm tools\#bin".into())
+        );
+        assert_eq!(
+            npmrc_cli_prefix("prefix = '~/.npm-packages'"),
+            Some("~/.npm-packages".into())
+        );
+        assert_eq!(npmrc_cli_prefix("prefix=/old\nprefix="), None);
+    }
 }
 
 #[cfg(all(test, windows))]

@@ -45,6 +45,8 @@ export function AgentForm({ initial, onSave, onClose }: Props) {
   const [command, setCommand] = useState(initial?.command ?? '')
   const [args, setArgs] = useState<string[]>(initial?.args ?? [])
   const [workingDir, setWorkingDir] = useState(initial?.working_dir ?? '')
+  const [worktreeRepo, setWorktreeRepo] = useState(initial?.worktree_repo ?? '')
+  const [worktreeBranch, setWorktreeBranch] = useState(initial?.worktree_branch ?? '')
   const [port, setPort] = useState(initial?.port?.toString() ?? '')
   const [uiToken, setUiToken] = useState(initial?.ui_token ?? '')
   const [showToken, setShowToken] = useState(false)
@@ -142,6 +144,8 @@ export function AgentForm({ initial, onSave, onClose }: Props) {
         env,
         port: port ? Number(port) : undefined,
         ui_token: uiToken.trim() || undefined,
+        worktree_repo: worktreeRepo.trim() || undefined,
+        worktree_branch: worktreeRepo.trim() ? (worktreeBranch.trim() || undefined) : undefined,
         auto_restart: autoRestart,
       })
       onClose()
@@ -226,6 +230,24 @@ export function AgentForm({ initial, onSave, onClose }: Props) {
                 </div>
               )}
             </Field>
+
+            <Field label={t('agentForm.worktreeRepo')}>
+              <input value={worktreeRepo} onChange={e => setWorktreeRepo(e.target.value)}
+                placeholder={t('agentForm.worktreeRepoPlaceholder')} className="field-input font-mono" />
+              <p className="mt-1 text-xs text-gray-400 dark:text-gray-600">
+                {t('agentForm.worktreeRepoHint')}
+              </p>
+            </Field>
+
+            {worktreeRepo.trim() && (
+              <Field label={t('agentForm.worktreeBranch')}>
+                <input value={worktreeBranch} onChange={e => setWorktreeBranch(e.target.value)}
+                  placeholder={t('agentForm.worktreeBranchPlaceholder')} className="field-input font-mono" />
+                <p className="mt-1 text-xs text-gray-400 dark:text-gray-600">
+                  {t('agentForm.worktreeBranchHint')}
+                </p>
+              </Field>
+            )}
 
             <div className="border-t border-gray-200 dark:border-gray-800" />
 

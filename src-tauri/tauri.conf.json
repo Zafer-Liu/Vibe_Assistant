@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "智管-Agent Manager",
-  "version": "1.0.1",
+  "productName": "智管-Vibe Assistant",
+  "version": "1.0.2",
   "identifier": "com.agentmanager.desktop",
   "build": {
     "frontendDist": "../frontend/dist",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "智管-Agent Manager",
+        "title": "智管-Vibe Assistant",
         "width": 1200,
         "height": 800,
         "minWidth": 900,
@@ -26,7 +26,7 @@
       "capabilities": [
         {
           "identifier": "default",
-          "description": "Default permissions for Agent Manager",
+          "description": "Default permissions for Vibe Assistant",
           "windows": ["main"],
           "permissions": [
             "core:default",

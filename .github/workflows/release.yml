@@ -100,7 +100,7 @@ jobs:
             > **macOS note**: If macOS says it cannot verify the developer, right-click the app → Open → confirm. This is only needed once.
 
             ---
-            完整更新日志见 [CHANGELOG](https://github.com/Zafer-Liu/Agent_Manager/blob/main/CHANGELOG.md)（如有）。
+            完整更新日志见 [CHANGELOG](https://github.com/Zafer-Liu/Vibe_Assistant/blob/main/CHANGELOG.md)（如有）。
           releaseDraft: true    # 手动触发：先创建草稿，确认无误后手动发布
           prerelease: false
           args: --target ${{ matrix.target }}
