@@ -70,3 +70,8 @@ PRODUCT.md
 
 # zvec-grep workspace index
 .zvec-grep/
+/.tmp_diagrams
+/.tmp_shots
+.diagram-design
+.tmp_ratio.py
+gpup3.ps1

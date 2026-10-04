@@ -18,5 +18,8 @@
   "devDependencies": {
     "@tauri-apps/cli": "^2",
     "sharp": "^0.34.5"
+  },
+  "dependencies": {
+    "mermaid": "^12.1.0"
   }
 }
