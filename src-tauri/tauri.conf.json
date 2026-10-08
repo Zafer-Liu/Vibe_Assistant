@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "智管-Vibe Assistant",
+  "productName": "Vibe Assistant",
   "version": "1.0.2",
   "identifier": "com.agentmanager.desktop",
   "build": {

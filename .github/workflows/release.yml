@@ -84,7 +84,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ inputs.tag_name }}
-          releaseName: '智管-Agent Manager ${{ inputs.tag_name }}'
+          releaseName: 'Vibe Assistant ${{ inputs.tag_name }}'
           releaseBody: |
             ## 安装说明 / Installation
 

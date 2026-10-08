@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 // Replace with the actual GitHub owner/repo before publishing
-const GITHUB_REPO: &str = "Zafer-Liu/Agent_Manager";
+const GITHUB_REPO: &str = "Zafer-Liu/Vibe_Assistant";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VersionInfo {
