@@ -1083,6 +1083,8 @@ const en: TranslationSchema = {
     sponsorHint: 'Sponsor model — enter an available model ID and API key from your 88API console.',
     sponsorCredits: 'Get credits',
     sponsorModelPlaceholder: 'Find an available model ID in the 88API console',
+    fetchModels: 'Fetch models',
+    fetchModelsFound: '{{count}} models fetched. Search or select one in the field above.',
     custom: 'Custom (OpenAI-compatible)',
     add: 'Add',
     noModels: 'No custom models yet',

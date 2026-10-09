@@ -150,6 +150,7 @@ pub fn run() {
             save_llm_provider,
             delete_llm_provider,
             test_llm_provider,
+            list_llm_models,
             memory_extraction_config_get,
             memory_extraction_config_set,
             ollama_config_get,

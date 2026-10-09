@@ -381,6 +381,9 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
   // Only this card's successful save or explicit cancel drops its draft.
   // Reloading another provider must not replace these inputs.
   const [draft, setDraft] = useState<Pick<LlmProvider, 'api_key' | 'model'> | null>(null)
+  const [modelOptions, setModelOptions] = useState<string[]>([])
+  const [loadingModels, setLoadingModels] = useState(false)
+  const [modelListError, setModelListError] = useState('')
   const isSponsor = provider.id === SPONSOR_PROVIDER_ID
   const key = draft?.api_key ?? provider.api_key
   const model = draft?.model ?? provider.model
@@ -391,7 +394,27 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
   }, [provider.id, dirty, onReadinessChange])
 
   async function save() {
-    if (await onSave({ ...provider, api_key: key, model, enabled: !!key })) setDraft(null)
+    if (await onSave({ ...provider, api_key: key, model, enabled: !!key && !!model.trim() })) setDraft(null)
+  }
+
+  async function fetchModels() {
+    setLoadingModels(true)
+    setModelListError('')
+    try {
+      const models = await invoke<string[]>('list_llm_models', {
+        baseUrl: provider.base_url,
+        apiKey: key,
+      })
+      setModelOptions(models)
+      // Keep an already selected model intact; select automatically only when
+      // the field is blank, which makes a fresh 88API setup one click shorter.
+      if (!model.trim() && models[0]) setDraft({ api_key: key, model: models[0] })
+    } catch (error) {
+      setModelOptions([])
+      setModelListError(String(error))
+    } finally {
+      setLoadingModels(false)
+    }
   }
 
   return (
@@ -420,8 +443,24 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
 
       <div className="grid grid-cols-2 gap-3">
         <Field label={t('llm.model')}>
-          {id => <input id={id} value={model} onChange={e => setDraft({ api_key: key, model: e.target.value })}
-            className="field-input font-mono text-xs" placeholder={isSponsor ? t('llm.sponsorModelPlaceholder') : provider.model} />}
+          {id => <div className="flex gap-1.5">
+            <div className="min-w-0 flex-1">
+              <input id={id} value={model} list={isSponsor ? `${id}-models` : undefined} onChange={e => setDraft({ api_key: key, model: e.target.value })}
+                className="field-input w-full font-mono text-xs" placeholder={isSponsor ? t('llm.sponsorModelPlaceholder') : provider.model} />
+              {isSponsor && modelOptions.length > 0 && (
+                <datalist id={`${id}-models`}>
+                  {modelOptions.map(option => <option key={option} value={option} />)}
+                </datalist>
+              )}
+            </div>
+            {isSponsor && (
+              <button type="button" onClick={() => { void fetchModels() }} disabled={loadingModels || !key.trim()}
+                title={t('llm.fetchModels')}
+                className="shrink-0 rounded-md border border-violet-200 px-2 text-xs font-medium text-violet-700 hover:bg-violet-50 disabled:cursor-not-allowed disabled:opacity-40 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950/50">
+                {loadingModels ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : t('llm.fetchModels')}
+              </button>
+            )}
+          </div>}
         </Field>
         <Field label={t('llm.apiKey')}>
           {id => <div className="relative">
@@ -440,6 +479,12 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
           </div>}
         </Field>
       </div>
+
+      {isSponsor && (modelListError || modelOptions.length > 0) && (
+        <p className={`text-[11px] leading-4 ${modelListError ? 'text-red-600 dark:text-red-400' : 'text-gray-500 dark:text-gray-400'}`}>
+          {modelListError || t('llm.fetchModelsFound', { count: modelOptions.length })}
+        </p>
+      )}
 
       {testResult && <TestBadge result={testResult} />}
 

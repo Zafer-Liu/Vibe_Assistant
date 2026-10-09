@@ -702,6 +702,86 @@ pub async fn test_llm_provider(provider: LlmProvider) -> Result<String, String> 
     }
 }
 
+/// List model ids exposed by an OpenAI-compatible endpoint.
+///
+/// Gateways such as 88API publish dozens of models and the exact ids change
+/// over time, so typing one by hand is error-prone.  Kept separate from
+/// `test_llm_provider` because the draft provider being edited may not be
+/// saved yet: only the base URL and key are needed here.
+#[tauri::command]
+pub async fn list_llm_models(base_url: String, api_key: String) -> Result<Vec<String>, String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("Base URL 不能为空".to_string());
+    }
+    if api_key.trim().is_empty() {
+        return Err("请先填写 API 密钥再获取模型列表".to_string());
+    }
+    let url = format!("{base}/models");
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|error| format!("无法创建连接: {error}"))?;
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", api_key.trim()))
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_connect() || error.is_timeout() {
+                format!("无法连接到 {base}，请检查 Base URL 与网络")
+            } else {
+                format!("请求失败: {error}")
+            }
+        })?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let msg = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| {
+                value["error"]["message"]
+                    .as_str()
+                    .or_else(|| value["message"].as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| truncate_chars(&text, 200));
+        return Err(format!("HTTP {status}: {msg}"));
+    }
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|_| "模型列表返回的不是 JSON，可能不是 OpenAI 兼容接口".to_string())?;
+    // OpenAI 兼容实现把列表放在 data[]，个别网关直接返回数组。
+    let items = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array())
+        .ok_or("响应中没有模型列表（缺少 data 字段）")?;
+    let mut models = items
+        .iter()
+        .filter_map(|item| {
+            item.get("id")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| item.as_str())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    models.sort();
+    models.dedup();
+    if models.is_empty() {
+        return Err("接口未返回任何模型，请确认账号额度或权限".to_string());
+    }
+    Ok(models)
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= limit {
+        return trimmed.to_string();
+    }
+    trimmed.chars().take(limit).collect::<String>() + "…"
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

@@ -1081,6 +1081,8 @@ const zh = {
     sponsorHint: '赞助商模型 · 填写 88API 控制台中可用的模型 ID 与 API 密钥即可使用。',
     sponsorCredits: '获取额度',
     sponsorModelPlaceholder: '在 88API 控制台查看可用模型 ID',
+    fetchModels: '获取模型',
+    fetchModelsFound: '已获取 {{count}} 个模型，可在上方输入框中搜索或选择。',
     custom: '自定义（OpenAI 兼容）',
     add: '添加',
     noModels: '暂无自定义模型',
