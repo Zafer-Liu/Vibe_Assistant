@@ -397,11 +397,19 @@ function Card({ children }: { children: ReactNode }) {
   )
 }
 
+/** `server` | `webdav` | `s3`：决定下面显示哪些字段。 */
+type VaultKind = 'server' | 'webdav' | 's3'
+
 interface VaultSettingsView {
+  kind: VaultKind
   url: string
+  user: string
   enabled: boolean
   pat_set: boolean
   password_set: boolean
+  endpoint: string
+  region: string
+  path_style: boolean
   auto_interval_min: number
 }
 
@@ -413,22 +421,34 @@ type VaultStatus =
 
 function CloudVaultSettings() {
   const { t } = useTranslation()
+  const [kind, setKind] = useState<VaultKind>('server')
   const [url, setUrl] = useState('')
+  const [user, setUser] = useState('')
   const [pat, setPat] = useState('')
   const [password, setPassword] = useState('')
   const [passwordSet, setPasswordSet] = useState(false)
   const [autoInterval, setAutoInterval] = useState(0)
   const [enabled, setEnabled] = useState(false)
   const [patSet, setPatSet] = useState(false)
+  const [endpoint, setEndpoint] = useState('')
+  const [region, setRegion] = useState('')
+  const [pathStyle, setPathStyle] = useState(false)
   const [status, setStatus] = useState<VaultStatus>({ kind: 'idle' })
   const [loaded, setLoaded] = useState(false)
+  /** 切换目标清空了已填字段，提示用户重填，填了地址就自动消失。 */
+  const [refill, setRefill] = useState(false)
 
   useEffect(() => {
     invoke<VaultSettingsView>('cloud_vault_get_settings').then((v) => {
+      setKind(v.kind ?? 'server')
       setUrl(v.url)
+      setUser(v.user ?? '')
       setEnabled(v.enabled)
       setPatSet(v.pat_set)
       setPasswordSet(v.password_set)
+      setEndpoint(v.endpoint ?? '')
+      setRegion(v.region ?? '')
+      setPathStyle(Boolean(v.path_style))
       setAutoInterval(v.auto_interval_min)
       setLoaded(true)
     })
@@ -438,25 +458,68 @@ function CloudVaultSettings() {
     return <div className="text-xs text-gray-400">{t('settings.cloudVault.loading')}</div>
   }
 
+  const isS3 = kind === 's3'
+  const isWebdav = kind === 'webdav'
+  const urlLabel = isS3
+    ? t('settings.cloudVault.urlS3')
+    : isWebdav
+      ? t('settings.cloudVault.urlWebdav')
+      : t('settings.cloudVault.urlServer')
+  const urlPlaceholder = isS3
+    ? t('settings.cloudVault.urlPlaceholderS3')
+    : isWebdav
+      ? t('settings.cloudVault.urlPlaceholderWebdav')
+      : 'http://192.168.x.x:8787'
+  const secretLabel = isS3
+    ? t('settings.cloudVault.secretS3')
+    : isWebdav
+      ? t('settings.cloudVault.secretWebdav')
+      : t('settings.cloudVault.secretServer')
+
   const handleTest = async () => {
     setStatus({ kind: 'working', label: t('settings.cloudVault.testing') })
     try {
       // When the field is blank, let the native process use the encrypted PAT
       // already stored locally.  Never send a placeholder as a bearer token.
-      const version = await invoke<string>('cloud_vault_test_connection', { url, pat: pat || null })
-      setStatus({ kind: 'success', label: t('settings.cloudVault.testOk', { version }) })
+      const result = await invoke<string>('cloud_vault_test_connection', {
+        kind,
+        url,
+        user: user || null,
+        pat: pat || null,
+        endpoint: endpoint || null,
+        region: region || null,
+        pathStyle,
+      })
+      // 自建服务端回的是版本号；WebDAV / S3 回的是一句探测结果描述。
+      setStatus({
+        kind: 'success',
+        label:
+          kind === 'server'
+            ? t('settings.cloudVault.testOk', { version: result })
+            : t('settings.cloudVault.testOkTarget', { message: result }),
+      })
     } catch (e) {
       setStatus({ kind: 'error', label: String(e) })
     }
   }
 
   const handleSave = async () => {
+    // url 在后端是非 Option 的 String，留空保存会把已存地址覆盖成空串，库就变成「未配置」。
+    if (!url.trim()) {
+      setStatus({ kind: 'error', label: t('settings.cloudVault.needUrl') })
+      return
+    }
     setStatus({ kind: 'working', label: t('settings.cloudVault.saving') })
     try {
       await invoke('cloud_vault_save_settings', {
+        kind,
         url,
+        user: user || null,
         pat: pat || null,
         password: password || null,
+        endpoint: endpoint || null,
+        region: region || null,
+        pathStyle,
         autoIntervalMin: autoInterval,
         enabled,
       })
@@ -468,6 +531,7 @@ function CloudVaultSettings() {
         setPassword('')
         setPasswordSet(true)
       }
+      setRefill(false)
       setStatus({ kind: 'success', label: t('settings.cloudVault.saved') })
     } catch (e) {
       setStatus({ kind: 'error', label: String(e) })
@@ -478,21 +542,92 @@ function CloudVaultSettings() {
     <div className="space-y-3">
       <div className="space-y-1.5">
         <label className="text-xs font-medium text-gray-600 dark:text-gray-300">
-          {t('settings.cloudVault.url')}
+          {t('settings.cloudVault.target')}
         </label>
+        <div className="flex gap-1 rounded-lg bg-gray-100 p-1 dark:bg-gray-800">
+          {(
+            [
+              ['server', t('settings.cloudVault.kindServer')],
+              ['webdav', t('settings.cloudVault.kindWebdav')],
+              ['s3', t('settings.cloudVault.kindS3')],
+            ] as [VaultKind, string][]
+          ).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              onClick={() => {
+                if (value === kind) return
+                setKind(value)
+                // 换目标就换语义：server 的 http://192.168.x.x:8787 落到 S3::new 里只会报
+                // 一句莫名其妙的地址错误，WebDAV 用户名也不是 Access Key ID。留空让用户重填，
+                // 免得旧目标的脏值被静默提交给后端。
+                const hadValues = Boolean(url || user || endpoint || region || pathStyle)
+                setUrl('')
+                setUser('')
+                setEndpoint('')
+                setRegion('')
+                setPathStyle(false)
+                // 已保存的凭据只属于切换前的目标：换目标后必须重填，否则后端会拿
+                // 旧的 PAT 去当坚果云密码。同步密码是加密密钥，与目标无关，保留。
+                setPat('')
+                setPatSet(false)
+                setRefill(hadValues)
+              }}
+              className={`flex-1 rounded-md px-2 py-1 text-xs font-medium transition ${
+                kind === value
+                  ? 'bg-white text-cyan-700 shadow-sm dark:bg-gray-700 dark:text-cyan-200'
+                  : 'text-gray-500 hover:text-gray-700 dark:text-gray-400'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        {isWebdav && (
+          <p className="text-xs text-gray-400 dark:text-gray-500">{t('settings.cloudVault.webdavHint')}</p>
+        )}
+        {isS3 && (
+          <p className="text-xs text-gray-400 dark:text-gray-500">{t('settings.cloudVault.s3Hint')}</p>
+        )}
+        {refill && !url.trim() && (
+          <p className="text-xs text-amber-600 dark:text-amber-400">
+            {t('settings.cloudVault.refillHint')}
+          </p>
+        )}
+      </div>
+      <div className="space-y-1.5">
+        <label className="text-xs font-medium text-gray-600 dark:text-gray-300">{urlLabel}</label>
         <input
           value={url}
           onChange={(e) => setUrl(e.target.value)}
-          placeholder="http://192.168.x.x:8787"
+          placeholder={urlPlaceholder}
           className="w-full rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm text-gray-900 outline-none focus:border-cyan-400 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100"
         />
       </div>
+      {kind !== 'server' && (
+        <div className="space-y-1.5">
+          <label className="text-xs font-medium text-gray-600 dark:text-gray-300">
+            {isS3 ? t('settings.cloudVault.userS3') : t('settings.cloudVault.userWebdav')}
+          </label>
+          <input
+            value={user}
+            onChange={(e) => setUser(e.target.value)}
+            placeholder={isS3 ? 'AKIA...' : t('settings.cloudVault.userPlaceholderWebdav')}
+            className="w-full rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm text-gray-900 outline-none focus:border-cyan-400 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100"
+          />
+        </div>
+      )}
       <div className="space-y-1.5">
         <label className="text-xs font-medium text-gray-600 dark:text-gray-300">
-          {t('settings.cloudVault.pat')}
+          {secretLabel}
           {patSet && !pat && (
             <span className="ml-2 font-normal text-green-600 dark:text-green-400">
               {t('settings.cloudVault.patSaved')}
+            </span>
+          )}
+          {!patSet && (
+            <span className="ml-2 font-normal text-amber-600 dark:text-amber-400">
+              {t('settings.cloudVault.passwordNotSet')}
             </span>
           )}
         </label>
@@ -500,10 +635,45 @@ function CloudVaultSettings() {
           value={pat}
           onChange={(e) => setPat(e.target.value)}
           type="password"
-          placeholder={patSet ? '••••••••' : 'vault-...'}
+          placeholder={patSet ? '••••••••' : t('settings.cloudVault.secretPlaceholder')}
           className="w-full rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm text-gray-900 outline-none focus:border-cyan-400 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100"
         />
       </div>
+      {isS3 && (
+        <>
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-gray-600 dark:text-gray-300">
+              {t('settings.cloudVault.endpointS3')}
+            </label>
+            <input
+              value={endpoint}
+              onChange={(e) => setEndpoint(e.target.value)}
+              placeholder={t('settings.cloudVault.endpointPlaceholder')}
+              className="w-full rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm text-gray-900 outline-none focus:border-cyan-400 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-gray-600 dark:text-gray-300">
+              {t('settings.cloudVault.regionS3')}
+            </label>
+            <input
+              value={region}
+              onChange={(e) => setRegion(e.target.value)}
+              placeholder="us-east-1 / auto"
+              className="w-full rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm text-gray-900 outline-none focus:border-cyan-400 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100"
+            />
+          </div>
+          <label className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-300">
+            <input
+              type="checkbox"
+              checked={pathStyle}
+              onChange={(e) => setPathStyle(e.target.checked)}
+              className="h-3.5 w-3.5 rounded border-gray-300"
+            />
+            {t('settings.cloudVault.pathStyleS3')}
+          </label>
+        </>
+      )}
       <div className="space-y-1.5">
         <label className="text-xs font-medium text-gray-600 dark:text-gray-300">
           {t('settings.cloudVault.password')}

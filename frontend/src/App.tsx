@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { invoke } from '@tauri-apps/api/core'
 import { useAgentStore } from './store/agentStore'
@@ -100,6 +100,16 @@ export default function App() {
   const openSkills = useCallback(() => setPage('skills'), [])
   const openPublishedSkills = useCallback(() => setPage('published-skills'), [])
   const openSkillMarketplace = useCallback(() => setPage('skill-marketplace'), [])
+
+  /** 折叠分组：切换展开；若当前不在该分组内，顺手跳到它的入口页。 */
+  const toggleNavGroup = (group: string, pages: readonly string[], entry: NavPage) => {
+    setExpandedGroups(prev => {
+      const next = new Set(prev)
+      if (next.has(group)) { next.delete(group) } else { next.add(group) }
+      return next
+    })
+    if (!pages.includes(page)) setPage(entry)
+  }
   const clearSkillsAutoSync = useCallback(() => setSkillsAutoSync(false), [])
   const goSkillSync = useCallback(() => { setSkillsAutoSync(true); setPage('skills') }, [])
 
@@ -278,7 +288,7 @@ export default function App() {
         {/* App title */}
         <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3 dark:border-gray-800">
           <div className="flex items-center gap-2.5">
-            <img src={logoUrl} alt={t('app.title')} className="h-7 w-7 rounded-lg" />
+            <img src={logoUrl} alt={t('app.title')} className="h-7 w-7 rounded-xl" />
             <div className="flex flex-col leading-tight">
               <span className="text-sm font-semibold text-gray-900 dark:text-gray-100">{t('app.title')}</span>
             </div>
@@ -296,148 +306,80 @@ export default function App() {
         </div>
 
         {/* Nav */}
-        <div className="flex max-h-[45%] min-h-0 shrink flex-col gap-0.5 overflow-y-auto p-2 border-b border-gray-200 dark:border-gray-800">
-          {/* 智能体 */}
-          <button
+        {/* 智能体页要留出下面的列表区，所以给导航限高；其他页让导航撑满，
+            否则导航和页脚之间会空出一整块。 */}
+        <nav className={`flex min-h-0 shrink flex-col gap-0.5 overflow-y-auto p-2 ${
+          page === 'agents'
+            ? 'max-h-[45%] border-b border-gray-200 dark:border-gray-800'
+            : 'flex-1'
+        }`}>
+          <SidebarNavItem
+            icon={<Bot className="h-4 w-4" />}
+            label={t('nav.agents')}
+            active={page === 'agents'}
             onClick={() => setPage('agents')}
-            className={`flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium transition-colors text-left ${
-              page === 'agents'
-                ? 'bg-blue-50 text-blue-600 dark:bg-blue-600/20 dark:text-blue-400'
-                : 'text-gray-500 hover:bg-gray-100 hover:text-gray-800 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200'
-            }`}
+          />
+
+          <SidebarNavGroup
+            icon={<Brain className="h-4 w-4" />}
+            label={t('nav.memory')}
+            active={MEMORY_PAGES.includes(page as typeof MEMORY_PAGES[number])}
+            expanded={expandedGroups.has('memory')}
+            onToggle={() => toggleNavGroup('memory', MEMORY_PAGES, 'memory')}
           >
-            <Bot className="h-4 w-4" />{t('nav.agents')}
-          </button>
+            {([
+              { id: 'memory' as NavPage, label: t('nav.memoryOverview'), onClick: openMemory },
+              { id: 'pending-memories' as NavPage, label: t('nav.memoryPending'), onClick: openPendingMemories },
+              { id: 'organized-conversations' as NavPage, label: t('nav.memoryOrganized'), onClick: openOrganizedConversations },
+              { id: 'memory-injection' as NavPage, label: t('nav.memoryInjection'), onClick: openMemoryInjection },
+            ]).map(sub => (
+              <SidebarNavItem
+                key={sub.id}
+                label={sub.label}
+                active={page === sub.id}
+                onClick={sub.onClick}
+                indent
+              />
+            ))}
+          </SidebarNavGroup>
 
-          {/* 记忆中心（分组） */}
-          {(() => {
-            const isActive = MEMORY_PAGES.includes(page as typeof MEMORY_PAGES[number])
-            const isExpanded = expandedGroups.has('memory')
-            return (
-              <div>
-                <button
-                  onClick={() => {
-                    setExpandedGroups(prev => {
-                      const next = new Set(prev)
-                      if (next.has('memory')) { next.delete('memory') } else { next.add('memory') }
-                      return next
-                    })
-                    if (!isActive) setPage('memory')
-                  }}
-                  className={`flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium transition-colors text-left ${
-                    isActive
-                      ? 'bg-blue-50 text-blue-600 dark:bg-blue-600/20 dark:text-blue-400'
-                      : 'text-gray-500 hover:bg-gray-100 hover:text-gray-800 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200'
-                  }`}
-                >
-                  <Brain className="h-4 w-4" />{t('nav.memory')}
-                  {isExpanded
-                    ? <ChevronDown className="ml-auto h-3.5 w-3.5 opacity-50" />
-                    : <ChevronRight className="ml-auto h-3.5 w-3.5 opacity-50" />}
-                </button>
-                {isExpanded && (
-                  <div className="mt-0.5 flex flex-col gap-0.5">
-                    {([
-                      { id: 'memory' as NavPage, label: t('nav.memoryOverview'), onClick: openMemory },
-                      { id: 'pending-memories' as NavPage, label: t('nav.memoryPending'), onClick: openPendingMemories },
-                      { id: 'organized-conversations' as NavPage, label: t('nav.memoryOrganized'), onClick: openOrganizedConversations },
-                      { id: 'memory-injection' as NavPage, label: t('nav.memoryInjection'), onClick: openMemoryInjection },
-                    ]).map(sub => (
-                      <button
-                        key={sub.id}
-                        onClick={sub.onClick}
-                        className={`rounded-lg py-1.5 pl-9 pr-3 text-left text-[13px] transition-colors ${
-                          page === sub.id
-                            ? 'bg-blue-50 text-blue-600 font-medium dark:bg-blue-600/20 dark:text-blue-400'
-                            : 'text-gray-500 hover:bg-gray-100 hover:text-gray-800 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200'
-                        }`}
-                      >
-                        {sub.label}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )
-          })()}
+          <SidebarNavGroup
+            icon={<BookOpenText className="h-4 w-4" />}
+            label={t('nav.skills')}
+            active={SKILL_PAGES.includes(page as typeof SKILL_PAGES[number])}
+            expanded={expandedGroups.has('skills')}
+            onToggle={() => toggleNavGroup('skills', SKILL_PAGES, 'skills')}
+          >
+            {([
+              { id: 'skills' as NavPage, label: t('nav.skillsLocal'), onClick: openSkills },
+              { id: 'published-skills' as NavPage, label: t('nav.skillsPublished'), onClick: openPublishedSkills },
+              { id: 'skill-marketplace' as NavPage, label: t('nav.skillsMarketplace'), onClick: openSkillMarketplace },
+            ]).map(sub => (
+              <SidebarNavItem
+                key={sub.id}
+                label={sub.label}
+                active={page === sub.id}
+                onClick={sub.onClick}
+                indent
+              />
+            ))}
+          </SidebarNavGroup>
 
-          {/* Skill 库（分组） */}
-          {(() => {
-            const isActive = SKILL_PAGES.includes(page as typeof SKILL_PAGES[number])
-            const isExpanded = expandedGroups.has('skills')
-            return (
-              <div>
-                <button
-                  onClick={() => {
-                    setExpandedGroups(prev => {
-                      const next = new Set(prev)
-                      if (next.has('skills')) { next.delete('skills') } else { next.add('skills') }
-                      return next
-                    })
-                    if (!isActive) setPage('skills')
-                  }}
-                  className={`flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium transition-colors text-left ${
-                    isActive
-                      ? 'bg-blue-50 text-blue-600 dark:bg-blue-600/20 dark:text-blue-400'
-                      : 'text-gray-500 hover:bg-gray-100 hover:text-gray-800 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200'
-                  }`}
-                >
-                  <BookOpenText className="h-4 w-4" />{t('nav.skills')}
-                  {isExpanded
-                    ? <ChevronDown className="ml-auto h-3.5 w-3.5 opacity-50" />
-                    : <ChevronRight className="ml-auto h-3.5 w-3.5 opacity-50" />}
-                </button>
-                {isExpanded && (
-                  <div className="mt-0.5 flex flex-col gap-0.5">
-                    {([
-                      { id: 'skills' as NavPage, label: t('nav.skillsLocal'), onClick: openSkills },
-                      { id: 'published-skills' as NavPage, label: t('nav.skillsPublished'), onClick: openPublishedSkills },
-                      { id: 'skill-marketplace' as NavPage, label: t('nav.skillsMarketplace'), onClick: openSkillMarketplace },
-                    ]).map(sub => (
-                      <button
-                        key={sub.id}
-                        onClick={sub.onClick}
-                        className={`rounded-lg py-1.5 pl-9 pr-3 text-left text-[13px] transition-colors ${
-                          page === sub.id
-                            ? 'bg-blue-50 text-blue-600 font-medium dark:bg-blue-600/20 dark:text-blue-400'
-                            : 'text-gray-500 hover:bg-gray-100 hover:text-gray-800 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200'
-                        }`}
-                      >
-                        {sub.label}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )
-          })()}
-
-          {/* MCP 服务 */}
-          <button
+          <SidebarNavItem
+            icon={<Plug className="h-4 w-4" />}
+            label={t('nav.mcpLibrary')}
+            active={page === 'mcp-library'}
             onClick={() => setPage('mcp-library')}
-            className={`flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium transition-colors text-left ${
-              page === 'mcp-library'
-                ? 'bg-blue-50 text-blue-600 dark:bg-blue-600/20 dark:text-blue-400'
-                : 'text-gray-500 hover:bg-gray-100 hover:text-gray-800 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200'
-            }`}
-          >
-            <Plug className="h-4 w-4" />{t('nav.mcpLibrary')}
-          </button>
+          />
 
-          <button
-            type="button"
+          <SidebarNavItem
+            icon={<BarChart3 className="h-4 w-4" />}
+            label={t('nav.usage')}
+            active={page === 'usage'}
             onClick={openUsage}
-            aria-current={page === 'usage' ? 'page' : undefined}
-            className={`flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
-              page === 'usage'
-                ? 'bg-blue-50 text-blue-600 dark:bg-blue-600/20 dark:text-blue-400'
-                : 'text-gray-500 hover:bg-gray-100 hover:text-gray-800 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200'
-            }`}
-          >
-            <BarChart3 className="h-4 w-4" />{t('nav.usage')}
-          </button>
+          />
 
-          {/* 分隔线 */}
+          {/* 分隔线：以上为主功能，以下为工具 */}
           <div className="my-1 border-t border-gray-200 dark:border-gray-700" />
 
           {/* 工具区 */}
@@ -448,24 +390,20 @@ export default function App() {
             { id: 'proxy' as NavPage,    icon: <Shield className="h-4 w-4" />,    label: t('nav.proxy') },
             { id: 'settings' as NavPage, icon: <Settings2 className="h-4 w-4" />, label: t('nav.settings') },
           ]).map(nav => (
-            <button
+            <SidebarNavItem
               key={nav.id}
+              icon={nav.icon}
+              label={nav.label}
+              active={page === nav.id}
               onClick={() => setPage(nav.id)}
-              className={`flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium transition-colors text-left ${
-                page === nav.id
-                  ? 'bg-blue-50 text-blue-600 dark:bg-blue-600/20 dark:text-blue-400'
-                  : 'text-gray-500 hover:bg-gray-100 hover:text-gray-800 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200'
-              }`}
-            >
-              {nav.icon}{nav.label}
-            </button>
+            />
           ))}
-        </div>
+        </nav>
 
         {/* Agent list */}
         {page === 'agents' && <>
           <div className="flex items-center justify-between px-4 py-2">
-            <p className="text-xs text-gray-400">{t('app.configured', { count: agents.length })}</p>
+            <p className="text-[11px] font-medium uppercase tracking-wide text-gray-400">{t('app.configured', { count: agents.length })}</p>
             <div className="flex gap-1">
               <button onClick={openNew} className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300" title={t('common.add')}>
                 <Plus className="h-3.5 w-3.5" />
@@ -494,25 +432,24 @@ export default function App() {
           </div>
         </>}
 
-        {page !== 'agents' && <div className="flex-1" />}
-       {/* Footer: version + update check */}
-          <div className="border-t border-gray-200 px-4 py-3 space-y-2 dark:border-gray-800">
-            <div className="flex items-center justify-center gap-1 text-xs font-bold text-gray-500 dark:text-gray-400">
-              <span>v{appVersion.replace(/-beta.*$/i, ' beta')}</span>
-              <span>·</span>
-              <a
-                href="https://www.zaferliu.me"
-                target="_blank"
-                rel="noreferrer"
-                className="hover:text-gray-700 dark:hover:text-gray-200"
-              >
-                @ZaferLiu
-              </a>
-            </div>
-            <div className="flex justify-center">
-              <UpdateChecker sidebar autoCheck />
-            </div>
+        {/* Footer: version + update check */}
+        <div className="space-y-2 border-t border-gray-200 px-4 py-3 dark:border-gray-800">
+          <div className="flex items-center justify-center gap-1 text-xs font-bold text-gray-500 dark:text-gray-400">
+            <span>v{appVersion.replace(/-beta.*$/i, ' beta')}</span>
+            <span>·</span>
+            <a
+              href="https://www.zaferliu.me"
+              target="_blank"
+              rel="noreferrer"
+              className="hover:text-gray-700 dark:hover:text-gray-200"
+            >
+              @ZaferLiu
+            </a>
           </div>
+          <div className="flex justify-center">
+            <UpdateChecker sidebar autoCheck />
+          </div>
+        </div>
         </aside>
 
       {/* ── Col-resize handle ──────────────────────────── */}
@@ -790,5 +727,92 @@ export default function App() {
       {showOnboarding && <Onboarding onFinish={() => setShowOnboarding(false)} />}
     </div>
     </RecoveryNavigationContext.Provider>
+  )
+}
+
+// ---------- 侧边栏零件 ----------
+
+/**
+ * 侧边栏导航项。选中态、悬浮态、缩进态只有这一份定义——此前每个导航按钮都
+ * 各自复制了一整串三元表达式，新增一项要同步改五处。
+ */
+function SidebarNavItem({
+  icon,
+  label,
+  active,
+  onClick,
+  indent = false,
+  trailing,
+}: {
+  icon?: ReactNode
+  label: string
+  active: boolean
+  onClick: () => void
+  /** 分组里的子项：字号更细、缩进更深。 */
+  indent?: boolean
+  /** 右侧附加内容，如展开箭头。 */
+  trailing?: ReactNode
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-current={active ? 'page' : undefined}
+      className={`relative flex w-full items-center gap-2.5 rounded-lg text-left font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
+        indent ? 'py-1.5 pl-3 pr-3 text-[13px]' : 'px-3 py-2 text-sm'
+      } ${
+        active
+          ? 'bg-blue-50 text-blue-600 dark:bg-blue-600/20 dark:text-blue-400'
+          : 'text-gray-500 hover:bg-gray-100 hover:text-gray-800 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200'
+      }`}
+    >
+      {active && (
+        <span
+          className="absolute left-0 top-1/2 h-4 w-[3px] -translate-y-1/2 rounded-r-full bg-blue-500 dark:bg-blue-400"
+          aria-hidden
+        />
+      )}
+      {icon}
+      <span className="truncate">{label}</span>
+      {trailing && <span className="ml-auto flex items-center">{trailing}</span>}
+    </button>
+  )
+}
+
+/** 可折叠的导航分组：展开箭头与子项的缩进竖线由这里统一给出。 */
+function SidebarNavGroup({
+  icon,
+  label,
+  active,
+  expanded,
+  onToggle,
+  children,
+}: {
+  icon: ReactNode
+  label: string
+  active: boolean
+  expanded: boolean
+  onToggle: () => void
+  children: ReactNode
+}) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <SidebarNavItem
+        icon={icon}
+        label={label}
+        active={active}
+        onClick={onToggle}
+        trailing={
+          expanded
+            ? <ChevronDown className="h-3.5 w-3.5 opacity-50" />
+            : <ChevronRight className="h-3.5 w-3.5 opacity-50" />
+        }
+      />
+      {expanded && (
+        <div className="ml-[22px] flex flex-col gap-0.5 border-l border-gray-200 pl-1 dark:border-gray-800">
+          {children}
+        </div>
+      )}
+    </div>
   )
 }

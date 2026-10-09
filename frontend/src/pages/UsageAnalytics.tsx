@@ -23,6 +23,34 @@ interface PricingRule {
 
 const PRICING_STORAGE_KEY = 'usage-pricing-v1'
 
+// ── 用量色阶 ────────────────────────────────────────────
+// 活跃时段与 Token 活动共用同一套 1–4 级绿色和同一套分级规则：
+// 两幅图对「多少算多」必须给出同一个答案。
+const USAGE_HEAT_GREEN: Record<'light' | 'dark', string[]> = {
+  light: ['#9be9a8', '#40c463', '#30a14e', '#216e39'],
+  dark: ['#0e4429', '#006d32', '#26a641', '#39d353'],
+}
+// 0 级（无用量）：日历沿用 GitHub 的浅灰，热力图直接用白底 —— 168 个空格子
+// 铺一层淡绿会显得发脏，白色才读得出「这里真的没有用量」。
+const USAGE_HEAT_EMPTY: Record<'light' | 'dark', string> = { light: '#ebedf0', dark: '#161b22' }
+const USAGE_HEATMAP_EMPTY: Record<'light' | 'dark', string> = { light: '#ffffff', dark: '#161b22' }
+
+/** 非零值的四分位作为 1–4 级门槛：个别极端值不会把其余日子压成最浅色。 */
+function heatThresholds(values: number[]): readonly [number, number, number] | null {
+  const positive = values.filter(value => value > 0).sort((a, b) => a - b)
+  if (!positive.length) return null
+  const pick = (ratio: number) => positive[Math.min(positive.length - 1, Math.floor(ratio * positive.length))]
+  return [pick(0.25), pick(0.5), pick(0.75)] as const
+}
+
+function heatLevel(value: number, thresholds: readonly [number, number, number] | null): 0 | 1 | 2 | 3 | 4 {
+  if (!thresholds || value <= 0) return 0
+  if (value <= thresholds[0]) return 1
+  if (value <= thresholds[1]) return 2
+  if (value <= thresholds[2]) return 3
+  return 4
+}
+
 function pricingKey(group: Pick<TelemetryUsageCostGroup, 'source' | 'model'>) {
   return `${group.source}\u0000${group.model ?? ''}`
 }
@@ -176,8 +204,14 @@ function UsageTrend({ buckets, range }: { buckets: TelemetryUsageBucket[]; range
 
 function UsageHeatmap({ cells, loading }: { cells: TelemetryUsageHeatCell[]; loading: boolean }) {
   const { t } = useTranslation()
+  const { theme } = useTheme()
   const values = new Map(cells.map(cell => [`${cell.weekday}:${cell.hour}`, cell]))
   const maxTokens = Math.max(0, ...cells.map(cell => cell.input_tokens + cell.output_tokens))
+  // 与 Token 活动日历同一套四分位分级，色阶才对得上。
+  const thresholds = heatThresholds(cells.map(cell => cell.input_tokens + cell.output_tokens))
+  const scale = theme === 'dark' ? 'dark' : 'light'
+  const emptyColor = USAGE_HEATMAP_EMPTY[scale]
+  const legend = [emptyColor, ...USAGE_HEAT_GREEN[scale]]
   const dayOrder = [1, 2, 3, 4, 5, 6, 0]
   const dayLabel = (weekday: number) => new Intl.DateTimeFormat(intlLocale(), { weekday: 'short' })
     .format(new Date(2024, 0, 7 + weekday))
@@ -191,25 +225,32 @@ function UsageHeatmap({ cells, loading }: { cells: TelemetryUsageHeatCell[]; loa
       </div>
     </div>
     {loading ? <div className="mt-5 h-44 animate-pulse rounded-xl bg-slate-100 dark:bg-slate-800" /> : maxTokens === 0 ? <div className="mt-4 rounded-lg border border-dashed border-slate-200 px-4 py-8 text-center text-sm text-slate-500 dark:border-slate-800 dark:text-slate-400">{t('memory.usage.heatmapEmpty')}</div> : (
-      <div className="mt-5 overflow-x-auto pb-1">
-        <div className="grid min-w-[690px] grid-cols-[3.5rem_repeat(24,minmax(1.25rem,1fr))] gap-1" role="img" aria-label={t('memory.usage.heatmapDesc')}>
-          <span />
-          {Array.from({ length: 24 }, (_, hour) => <span key={hour} className="text-center font-mono text-[9px] tabular-nums text-slate-400">{hour % 3 === 0 ? hour.toString().padStart(2, '0') : ''}</span>)}
-          {dayOrder.flatMap(weekday => {
-            const label = dayLabel(weekday)
-            return [
-              <span key={`label-${weekday}`} className="flex items-center text-xs text-slate-500 dark:text-slate-400">{label}</span>,
-              ...Array.from({ length: 24 }, (_, hour) => {
-                const cell = values.get(`${weekday}:${hour}`)
-                const tokens = (cell?.input_tokens ?? 0) + (cell?.output_tokens ?? 0)
-                const intensity = tokens === 0 ? 0.04 : 0.16 + 0.76 * Math.sqrt(tokens / maxTokens)
-                const title = t('memory.usage.heatmapCell', { day: label, hour, tokens: amount(tokens), records: cell?.record_count ?? 0 })
-                return <span key={`${weekday}-${hour}`} title={title} aria-label={title} className="aspect-square min-h-5 rounded-[4px] border border-emerald-700/10" style={{ backgroundColor: `rgba(64, 196, 99, ${intensity})` }} />
-              }),
-            ]
-          })}
+      <>
+        <div className="mt-5 overflow-x-auto pb-1">
+          <div className="grid min-w-[690px] grid-cols-[3.5rem_repeat(24,minmax(1.25rem,1fr))] gap-1" role="img" aria-label={t('memory.usage.heatmapDesc')}>
+            <span />
+            {Array.from({ length: 24 }, (_, hour) => <span key={hour} className="text-center font-mono text-[9px] tabular-nums text-slate-400">{hour % 3 === 0 ? hour.toString().padStart(2, '0') : ''}</span>)}
+            {dayOrder.flatMap(weekday => {
+              const label = dayLabel(weekday)
+              return [
+                <span key={`label-${weekday}`} className="flex items-center text-xs text-slate-500 dark:text-slate-400">{label}</span>,
+                ...Array.from({ length: 24 }, (_, hour) => {
+                  const cell = values.get(`${weekday}:${hour}`)
+                  const tokens = (cell?.input_tokens ?? 0) + (cell?.output_tokens ?? 0)
+                  const level = heatLevel(tokens, thresholds)
+                  const title = t('memory.usage.heatmapCell', { day: label, hour, tokens: amount(tokens), records: cell?.record_count ?? 0 })
+                  return <span key={`${weekday}-${hour}`} title={title} aria-label={title} className="aspect-square min-h-5 rounded-[4px] border border-slate-900/10 transition-[background-color] duration-150 hover:ring-1 hover:ring-slate-500/70 dark:border-white/10 dark:hover:ring-slate-300/70" style={{ backgroundColor: level === 0 ? emptyColor : USAGE_HEAT_GREEN[scale][level - 1] }} />
+                }),
+              ]
+            })}
+          </div>
         </div>
-      </div>
+        <div className="mt-4 flex items-center justify-end gap-1.5 border-t border-slate-100 pt-3 text-xs text-slate-500 dark:border-slate-800 dark:text-slate-400">
+          <span>{t('memory.usage.calendarLess')}</span>
+          {legend.map(color => <span key={color} className="h-[11px] w-[11px] rounded-[3px]" style={{ backgroundColor: color }} />)}
+          <span>{t('memory.usage.calendarMore')}</span>
+        </div>
+      </>
     )}
   </section>
 }
@@ -249,8 +290,8 @@ function UsageCalendar({ buckets, loading }: { buckets: TelemetryUsageBucket[]; 
   const { theme } = useTheme()
   const [mode, setMode] = useState<CalendarMode>('daily')
   const palette = theme === 'dark'
-    ? ['#161b22', '#0e4429', '#006d32', '#26a641', '#39d353']
-    : ['#ebedf0', '#9be9a8', '#40c463', '#30a14e', '#216e39']
+    ? [USAGE_HEAT_EMPTY.dark, ...USAGE_HEAT_GREEN.dark]
+    : [USAGE_HEAT_EMPTY.light, ...USAGE_HEAT_GREEN.light]
 
   const { weeks, totalTokens, activeDays, cumulativeByDay } = useMemo(() => {
     const byDay = new Map(buckets.map(bucket => [bucket.label, bucket]))
@@ -297,17 +338,13 @@ function UsageCalendar({ buckets, loading }: { buckets: TelemetryUsageBucket[]; 
     return { weeks: built, totalTokens, activeDays, cumulativeByDay }
   }, [buckets])
 
-  const thresholds = useMemo(() => {
-    const values = mode === 'weekly'
-      ? weeks.map(week => week.tokens).filter(value => value > 0)
+  const thresholds = useMemo(() => heatThresholds(
+    mode === 'weekly'
+      ? weeks.map(week => week.tokens)
       : mode === 'cumulative'
-        ? [...cumulativeByDay.values()].filter(value => value > 0)
-        : weeks.flatMap(week => week.days.map(day => day.tokens)).filter(value => value > 0)
-    if (!values.length) return null
-    values.sort((a, b) => a - b)
-    const pick = (ratio: number) => values[Math.min(values.length - 1, Math.floor(ratio * values.length))]
-    return [pick(0.25), pick(0.5), pick(0.75)] as const
-  }, [mode, weeks, cumulativeByDay])
+        ? [...cumulativeByDay.values()]
+        : weeks.flatMap(week => week.days.map(day => day.tokens)),
+  ), [mode, weeks, cumulativeByDay])
 
   const fullDate = useMemo(() => new Intl.DateTimeFormat(intlLocale(), { year: 'numeric', month: 'short', day: 'numeric' }), [])
   const shortDate = useMemo(() => new Intl.DateTimeFormat(intlLocale(), { month: 'short', day: 'numeric' }), [])
@@ -315,14 +352,6 @@ function UsageCalendar({ buckets, loading }: { buckets: TelemetryUsageBucket[]; 
     const format = new Intl.DateTimeFormat(intlLocale(), { weekday: 'short' })
     return [0, 2, 4].map(offset => format.format(new Date(2024, 0, 1 + offset)))
   }, [])
-
-  function levelOf(value: number) {
-    if (!thresholds || value <= 0) return 0
-    if (value <= thresholds[0]) return 1
-    if (value <= thresholds[1]) return 2
-    if (value <= thresholds[2]) return 3
-    return 4
-  }
 
   function cellValue(day: CalendarDay, week: CalendarWeek) {
     if (mode === 'weekly') return week.tokens
@@ -361,7 +390,7 @@ function UsageCalendar({ buckets, loading }: { buckets: TelemetryUsageBucket[]; 
     ) : (
       <>
         <div className="mt-5 overflow-x-auto pb-1">
-          <div className="flex min-w-max gap-[3px]" role="img" aria-label={t('memory.usage.calendarAria')}>
+          <div className="flex min-w-full gap-[3px]" role="img" aria-label={t('memory.usage.calendarAria')}>
             <div className="flex w-8 shrink-0 flex-col gap-[3px]">
               <span className="h-4" />
               {[0, 1, 2, 3, 4, 5, 6].map(row => (
@@ -369,12 +398,12 @@ function UsageCalendar({ buckets, loading }: { buckets: TelemetryUsageBucket[]; 
               ))}
             </div>
             {weeks.map((week, index) => (
-              <div key={index} className="flex w-[11px] shrink-0 flex-col gap-[3px]">
+              <div key={index} className="flex min-w-[11px] flex-1 flex-col gap-[3px]">
                 <span className="h-4 whitespace-nowrap text-[10px] font-medium leading-4 text-slate-400 dark:text-slate-500">{week.monthLabel}</span>
                 {week.days.map(day => {
                   if (day.future) return <span key={day.key} className="h-[11px]" />
                   const title = cellTitle(day, week)
-                  return <span key={day.key} title={title} aria-label={title} className="h-[11px] w-[11px] rounded-[3px] transition-[background-color] duration-150 hover:ring-1 hover:ring-slate-500/70 dark:hover:ring-slate-300/70" style={{ backgroundColor: palette[levelOf(cellValue(day, week))] }} />
+                  return <span key={day.key} title={title} aria-label={title} className="h-[11px] w-full rounded-[3px] transition-[background-color] duration-150 hover:ring-1 hover:ring-slate-500/70 dark:hover:ring-slate-300/70" style={{ backgroundColor: palette[heatLevel(cellValue(day, week), thresholds)] }} />
                 })}
               </div>
             ))}

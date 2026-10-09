@@ -33,6 +33,7 @@ futures-util = "0.3"
 portable-pty = "0.9"
 aes-gcm = "0.10"
 sha2 = "0.10"
+hmac = "0.12"
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 tiktoken-rs = "0.12"
 zip = { version = "2", default-features = false, features = ["deflate"] }

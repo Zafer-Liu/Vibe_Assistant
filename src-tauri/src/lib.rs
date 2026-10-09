@@ -3,6 +3,8 @@ mod agent_http;
 mod agent_sources;
 mod backup;
 mod cloud_sync;
+#[cfg(test)]
+mod test_http;
 mod commands;
 mod env_manager;
 mod github;
@@ -25,6 +27,7 @@ mod telemetry_store;
 mod thinking;
 mod ui_window;
 mod updater;
+mod vault_remote;
 mod worktree;
 
 use agent_http::*;
