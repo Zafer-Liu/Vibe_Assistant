@@ -3,13 +3,13 @@ import { createContext, useContext, useEffect, useState } from 'react'
 type Theme = 'dark' | 'light'
 
 const ThemeCtx = createContext<{ theme: Theme; toggle: () => void }>({
-  theme: 'dark',
+  theme: 'light',
   toggle: () => {},
 })
 
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
   const [theme, setTheme] = useState<Theme>(() => {
-    return (localStorage.getItem('theme') as Theme) ?? 'dark'
+    return (localStorage.getItem('theme') as Theme) ?? 'light'
   })
 
   useEffect(() => {

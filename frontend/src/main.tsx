@@ -6,7 +6,7 @@ import App from './App.tsx'
 import { ThemeProvider } from './theme.tsx'
 
 // Apply saved theme before first render to avoid flash
-const saved = localStorage.getItem('theme') ?? 'dark'
+const saved = localStorage.getItem('theme') ?? 'light'
 if (saved === 'dark') document.documentElement.classList.add('dark')
 
 createRoot(document.getElementById('root')!).render(
