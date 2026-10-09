@@ -145,27 +145,23 @@ pub struct OllamaTestResult {
     pub models: Vec<OllamaModelInfo>,
 }
 
-// 内置 provider 默认值
+// 内置 provider 默认值。88API 是项目唯一的内置赞助商入口；模型 ID 不臆测，
+// 用户在 88API 控制台按当前可用额度选择后填写。
+pub const SPONSOR_PROVIDER_ID: &str = "88api";
+pub const SPONSOR_PROVIDER_NAME: &str = "88API";
+pub const SPONSOR_BASE_URL: &str = "https://api.88api.ai/v1";
+pub const SPONSOR_CREDITS_URL: &str = "https://88api.ai/sign-up?aff=VNNV";
+
 pub fn builtin_defaults(
 ) -> HashMap<&'static str, (&'static str, &'static str, &'static str, u32, u32)> {
     // id -> (name, base_url, model, context_window, max_output_tokens)
     let mut m = HashMap::new();
     m.insert(
-        "deepseek",
+        SPONSOR_PROVIDER_ID,
         (
-            "DeepSeek",
-            "https://api.deepseek.com",
-            "deepseek-chat",
-            64000,
-            8192,
-        ),
-    );
-    m.insert(
-        "openai",
-        (
-            "OpenAI",
-            "https://api.openai.com/v1",
-            "gpt-4o-mini",
+            SPONSOR_PROVIDER_NAME,
+            SPONSOR_BASE_URL,
+            "",
             128000,
             16384,
         ),
@@ -236,16 +232,29 @@ fn normalize_ollama_base_url(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+fn normalize_memory_extraction_config(mut config: MemoryExtractionConfig) -> MemoryExtractionConfig {
+    // The retired presets were built-ins, not user custom providers. Clear a
+    // stale selection rather than silently redirecting it to 88API without an
+    // API key and explicit model ID.
+    if matches!(config.provider_id.as_deref(), Some("deepseek" | "openai")) {
+        config.provider_id = None;
+    }
+    config
+}
+
 pub fn memory_extraction_config() -> MemoryExtractionConfig {
     if let Some(store) = crate::telemetry_store::shared_store() {
         if let Some(config) = store.app_setting_get(MEMORY_EXTRACTION_SETTING_KEY) {
-            return config;
+            let normalized = normalize_memory_extraction_config(config);
+            let _ = store.app_setting_set(MEMORY_EXTRACTION_SETTING_KEY, &normalized);
+            return normalized;
         }
     }
     let config = std::fs::read_to_string(memory_extraction_config_path())
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default();
+    let config = normalize_memory_extraction_config(config);
     if let Some(store) = crate::telemetry_store::shared_store() {
         let _ = store.app_setting_set(MEMORY_EXTRACTION_SETTING_KEY, &config);
     }
@@ -312,12 +321,25 @@ fn save_providers(providers: &[LlmProvider]) -> Result<(), String> {
     std::fs::write(path, json).map_err(|error| error.to_string())
 }
 
+/// Remove retired built-in provider records from persisted settings. They were
+/// never user-created custom providers, so the sponsor migration can remove
+/// them without touching a user's custom OpenAI-compatible endpoint.
+fn remove_retired_builtins(providers: &mut Vec<LlmProvider>) -> bool {
+    let before = providers.len();
+    providers.retain(|provider| {
+        provider.is_custom || !matches!(provider.id.as_str(), "deepseek" | "openai")
+    });
+    providers.len() != before
+}
+
 #[tauri::command]
 pub fn list_llm_providers() -> Vec<LlmProvider> {
     let mut providers = load_providers();
+    let removed_retired = remove_retired_builtins(&mut providers);
     let defaults = builtin_defaults();
 
-    // 确保内置 provider 始终存在（api_key 可为空）
+    let mut changed = removed_retired;
+    // 确保唯一内置 provider 始终存在（api_key 可为空）
     for (id, (name, base_url, model, ctx, max_out)) in &defaults {
         if !providers.iter().any(|p| p.id == *id) {
             providers.insert(
@@ -334,7 +356,13 @@ pub fn list_llm_providers() -> Vec<LlmProvider> {
                     max_output_tokens: Some(*max_out),
                 },
             );
+            changed = true;
         }
+    }
+    // Persist the one-time sponsor migration but keep listing resilient if a
+    // compatibility mirror cannot be written this instant.
+    if changed {
+        let _ = save_providers(&providers);
     }
     providers
 }
@@ -676,8 +704,49 @@ pub async fn test_llm_provider(provider: LlmProvider) -> Result<String, String> 
 
 #[cfg(test)]
 mod tests {
-    use super::{decrypt_api_key, encrypt_api_key, ENCRYPTED_KEY_PREFIX};
+    use super::{
+        builtin_defaults, decrypt_api_key, encrypt_api_key, normalize_memory_extraction_config,
+        remove_retired_builtins, LlmProvider, MemoryExtractionConfig, ENCRYPTED_KEY_PREFIX,
+        SPONSOR_BASE_URL, SPONSOR_CREDITS_URL, SPONSOR_PROVIDER_ID, SPONSOR_PROVIDER_NAME,
+    };
     use crate::thinking::strip_thinking_blocks;
+
+    #[test]
+    fn sponsor_is_the_only_builtin_provider() {
+        let defaults = builtin_defaults();
+        assert_eq!(defaults.len(), 1);
+        assert_eq!(
+            defaults.get(SPONSOR_PROVIDER_ID),
+            Some(&(SPONSOR_PROVIDER_NAME, SPONSOR_BASE_URL, "", 128000, 16384))
+        );
+        assert_eq!(SPONSOR_CREDITS_URL, "https://88api.ai/sign-up?aff=VNNV");
+    }
+
+    #[test]
+    fn sponsor_migration_removes_only_retired_builtin_records() {
+        let provider = |id: &str, is_custom: bool| LlmProvider {
+            id: id.to_string(), name: id.to_string(), base_url: String::new(), model: String::new(),
+            api_key: String::new(), is_custom, enabled: false, context_window: None,
+            max_output_tokens: None,
+        };
+        let mut providers = vec![
+            provider("deepseek", false),
+            provider("openai", false),
+            provider("openai", true),
+            provider("custom_88proxy", true),
+        ];
+        assert!(remove_retired_builtins(&mut providers));
+        assert_eq!(providers.len(), 2);
+        assert!(providers.iter().all(|provider| provider.is_custom));
+        assert_eq!(
+            normalize_memory_extraction_config(MemoryExtractionConfig { provider_id: Some("deepseek".into()) }).provider_id,
+            None
+        );
+        assert_eq!(
+            normalize_memory_extraction_config(MemoryExtractionConfig { provider_id: Some("custom_88proxy".into()) }).provider_id.as_deref(),
+            Some("custom_88proxy")
+        );
+    }
 
     #[test]
     fn api_key_round_trips_with_a_valid_gcm_nonce() {

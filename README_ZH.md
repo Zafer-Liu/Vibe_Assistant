@@ -14,6 +14,7 @@
 [![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?style=flat-square&logo=tauri)](https://tauri.app)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react)](https://react.dev)
 [![Rust](https://img.shields.io/badge/Rust-stable-CE422B?style=flat-square&logo=rust)](https://www.rust-lang.org)
+[![赞助商 88API](https://img.shields.io/badge/赞助商-88API-FF6B35?style=flat-square&logo=OpenAI&logoColor=white)](https://88api.ai/sign-up?aff=VNNV)
 
 [✨ 项目亮点](#亮点) · [🧬 记忆中心](#记忆中心) · [⚙️ 快速安装](#安装) · [🚀 快速上手](#快速上手) · [❓ FAQ](#faq)
 
@@ -24,6 +25,18 @@ English | **[简体中文](./README_ZH.md)**
 ---
 
 <a id="亮点"></a>
+
+<a id="sponsors"></a>
+
+## 💖 赞助商
+
+感谢 **[88API](https://88api.ai/sign-up?aff=VNNV)** 赞助本项目！88API 是一家由香港企业运营、主要面向开发者、创作者与 AI 应用用户的一站式多模型 API 平台，通过统一接口接入文本、图片、语音和视频模型，覆盖 AI 编程、智能翻译、内容创作、配音、图像生成、视频生成等常见工作流。可直接在智管中完成 Provider 添加并切换，支持国际主流付款方式，可提供发票，提供企业级稳定服务。**[通过此链接注册](https://88api.ai/sign-up?aff=VNNV)** 即可获得专属赠送额度！
+
+<p align="center">
+  <a href="https://88api.ai/sign-up?aff=VNNV"><img src="frontend/public/88api-banner.jpg" alt="88API — 文本、图片、语音、视频一体化 API" width="600"></a>
+</p>
+
+---
 
 ## ✨ 项目亮点
 

@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useId, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { invoke } from '@tauri-apps/api/core'
-import { Plus, Trash2, CheckCircle, XCircle, Loader2, Eye, EyeOff, AlertCircle, Brain } from 'lucide-react'
+import { Plus, Trash2, CheckCircle, XCircle, Loader2, Eye, EyeOff, AlertCircle, Brain, ExternalLink } from 'lucide-react'
+
+const SPONSOR_PROVIDER_ID = '88api'
+const SPONSOR_CREDITS_URL = 'https://88api.ai/sign-up?aff=VNNV'
 
 export interface LlmProvider {
   id: string
@@ -211,7 +214,7 @@ export function LlmSettings({ embedded = false, onBusyChange, onReadinessChange 
         <div className="flex flex-wrap items-center gap-2">
           <select aria-label={t('llm.memoryModelTitle')} value={memoryConfig.provider_id ?? ''} onChange={(event) => { void saveMemoryConfig(event.target.value) }} disabled={savingMemoryConfig} className="min-w-60 rounded-md border border-gray-300 bg-white px-2.5 py-1.5 text-sm text-gray-800 outline-none focus:border-violet-500 disabled:opacity-50 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100">
             <option value="">{t('llm.memoryModelNone')}</option>
-            {providers.filter((provider) => provider.enabled && provider.api_key.trim()).map((provider) => <option key={provider.id} value={provider.id}>{provider.name} · {provider.model}</option>)}
+            {providers.filter((provider) => provider.enabled && provider.api_key.trim() && provider.model.trim()).map((provider) => <option key={provider.id} value={provider.id}>{provider.name} · {provider.model}</option>)}
           </select>
           {savingMemoryConfig && <Loader2 size={14} className="animate-spin text-violet-600" />}
           {memoryConfig.provider_id && <span className="text-xs text-green-700 dark:text-green-400">{t('llm.memoryModelReady')}</span>}
@@ -378,6 +381,7 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
   // Only this card's successful save or explicit cancel drops its draft.
   // Reloading another provider must not replace these inputs.
   const [draft, setDraft] = useState<Pick<LlmProvider, 'api_key' | 'model'> | null>(null)
+  const isSponsor = provider.id === SPONSOR_PROVIDER_ID
   const key = draft?.api_key ?? provider.api_key
   const model = draft?.model ?? provider.model
   const dirty = key !== provider.api_key || model !== provider.model
@@ -394,18 +398,30 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
     <div className="rounded-lg border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-900 space-y-3">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
+          {isSponsor && <img src="/88api.png" alt="88API" className="h-8 w-8 rounded-lg object-cover" />}
           <span className="text-sm font-semibold text-gray-900 dark:text-gray-100">{provider.name}</span>
-          {provider.enabled && provider.api_key && (
+          {provider.enabled && provider.api_key && model && (
             <span className="rounded-full bg-green-100 px-2 py-0.5 text-xs text-green-700 dark:bg-green-900/30 dark:text-green-400">{t('llm.active')}</span>
           )}
         </div>
         <EnableToggle name={provider.name} enabled={provider.enabled} onChange={v => onSave({ ...provider, enabled: v })} />
       </div>
+      {isSponsor && (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-md bg-violet-50 px-3 py-2 text-xs text-violet-800 dark:bg-violet-950/40 dark:text-violet-200">
+          <div>
+            <p>{t('llm.sponsorHint')}</p>
+            <p className="mt-0.5 font-mono text-[11px] text-violet-600 dark:text-violet-300">https://api.88api.ai/v1</p>
+          </div>
+          <a href={SPONSOR_CREDITS_URL} target="_blank" rel="noreferrer" className="inline-flex shrink-0 items-center gap-1 font-medium text-violet-700 underline underline-offset-2 hover:text-violet-900 dark:text-violet-300 dark:hover:text-violet-100">
+            {t('llm.sponsorCredits')} <ExternalLink className="h-3 w-3" />
+          </a>
+        </div>
+      )}
 
       <div className="grid grid-cols-2 gap-3">
         <Field label={t('llm.model')}>
           {id => <input id={id} value={model} onChange={e => setDraft({ api_key: key, model: e.target.value })}
-            className="field-input font-mono text-xs" placeholder={provider.model} />}
+            className="field-input font-mono text-xs" placeholder={isSponsor ? t('llm.sponsorModelPlaceholder') : provider.model} />}
         </Field>
         <Field label={t('llm.apiKey')}>
           {id => <div className="relative">
@@ -432,7 +448,7 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
           className="rounded-lg bg-gray-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-gray-700 dark:bg-gray-100 dark:text-gray-900">
           {t('llm.save')}
         </button>
-        <button onClick={() => onTest({ ...provider, api_key: key, model })} disabled={testing || !key}
+        <button onClick={() => onTest({ ...provider, api_key: key, model })} disabled={testing || !key || !model.trim()}
           className="flex items-center gap-1 rounded-lg border border-gray-200 px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-50 disabled:opacity-40 dark:border-gray-700 dark:text-gray-400">
           {testing ? <Loader2 className="h-3 w-3 animate-spin" /> : null} {t('llm.test')}
         </button>

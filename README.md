@@ -14,6 +14,7 @@
 [![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?style=flat-square&logo=tauri)](https://tauri.app)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react)](https://react.dev)
 [![Rust](https://img.shields.io/badge/Rust-stable-CE422B?style=flat-square&logo=rust)](https://www.rust-lang.org)
+[![Sponsor 88API](https://img.shields.io/badge/Sponsor-88API-FF6B35?style=flat-square&logo=OpenAI&logoColor=white)](https://88api.ai/sign-up?aff=VNNV)
 
 [✨ Highlights](#highlights) · [🧠 Memory Center](#memory) · [⚙️ Install](#install) · [🚀 Quick Start](#quickstart) · [❓ FAQ](#faq)
 
@@ -22,6 +23,19 @@
 </div>
 
 ---
+
+<a id="sponsors"></a>
+
+## 💖 Sponsors
+
+Thanks to **[88API](https://88api.ai/sign-up?aff=VNNV)** for sponsoring this project! 88API is a one-stop multi-model API platform operated by a Hong Kong company, built for developers, creators, and AI app users. It exposes a unified interface to text, image, voice, and video models — covering AI programming, smart translation, content creation, dubbing, image generation, and video generation in common workflows. You can add and switch providers directly inside Vibe Assistant, with international payment methods, invoices, and enterprise-grade reliability. **[Sign up via this link](https://88api.ai/sign-up?aff=VNNV)** to get an exclusive bonus credit!
+
+<p align="center">
+  <a href="https://88api.ai/sign-up?aff=VNNV"><img src="frontend/public/88api-banner.jpg" alt="88API — One API for text, image, voice, video" width="600"></a>
+</p>
+
+---
+
 
 ## ✨ Highlights
 
