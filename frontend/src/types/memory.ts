@@ -161,7 +161,7 @@ export interface IngestLog {
   at: string
   agent_id: string
   kind: 'memory' | 'skill'
-  state: 'working' | 'stored' | 'retrying' | 'failed'
+  state: 'working' | 'stored' | 'retrying' | 'failed' | 'cancelled'
   detail: string
 }
 
@@ -186,6 +186,8 @@ export interface IngestStatus {
   buffered_sessions: number
   model_provider_id: string | null
   model_ready: boolean
+  manual_extraction_running: boolean
+  manual_extraction_cancelling: boolean
   recent: IngestLog[]
 }
 
@@ -204,6 +206,7 @@ export interface OrganizeConversationsResult {
   succeeded: number
   failed: number
   failure_reasons: string[]
+  cancelled: boolean
 }
 
 /** 「待提取记忆」面板的一行：已完成但尚未成功提炼为记忆的会话。 */

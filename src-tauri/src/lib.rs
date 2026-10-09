@@ -217,6 +217,7 @@ pub fn run() {
             memory_ingest_flush_pending,
             memory_ingest::memory_ingest_organize_conversations,
             memory_ingest::memory_ingest_organize_session,
+            memory_ingest::memory_ingest_cancel_organize,
             memory_ingest::memory_pending_l1_sessions,
             memory_ingest::memory_organized_l1_sessions,
             memory_ingest::memory_l1_conversation_detail,

@@ -162,7 +162,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
   const { t } = useTranslation()
   const {
     engineOnline, memories, importance, loading, lastSearchResults, lastSearchQuery, memoryCacheReady, localMemoryStats,
-    memoryMcp, ingestStatus, telemetrySummary, telemetryLiveStatus, telemetryEvents, l2Documents, l3Documents, checkIngest, checkTelemetry, checkMemoryMcp, loadMemoryLayers, consolidateShortTermMemory, draftLongTermProfile, publishLongTermProfile, updatePublishedMemoryDocument, deleteLongTermProfileDraft, setIngestEnabled, organizeConversations, importMemoryFolder,
+    memoryMcp, ingestStatus, telemetrySummary, telemetryLiveStatus, telemetryEvents, l2Documents, l3Documents, checkIngest, checkTelemetry, checkMemoryMcp, loadMemoryLayers, consolidateShortTermMemory, draftLongTermProfile, publishLongTermProfile, updatePublishedMemoryDocument, deleteLongTermProfileDraft, setIngestEnabled, organizeConversations, cancelOrganize, importMemoryFolder,
     checkEngine, stopEngine, search, listMemories, resetL1ForReextraction, updateMemory, deleteMemory, addUserMemory, dreaming, restoreConsolidation, refreshImportance, setMemoryPinned,
   } = useMemoryStore()
 
@@ -257,7 +257,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
   const refreshSummary = useCallback(() => Promise.allSettled([
     checkIngest(), checkTelemetry(),
   ]), [checkIngest, checkTelemetry])
-  useVisiblePolling(refreshSummary, 10_000, active)
+  useVisiblePolling(refreshSummary, organizingConversations || ingestStatus?.manual_extraction_running ? 2_000 : 10_000, active)
 
   const flash = useCallback((kind: 'ok' | 'err', text: string) => {
     const next = { kind, text }
@@ -438,11 +438,18 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
   }
 
   async function handleOrganizeConversations() {
+    if (organizingConversations || ingestStatus?.manual_extraction_running) return
     setOrganizingConversations(true)
     try {
       const result = await organizeConversations()
-      flash(result.failed ? 'err' : 'ok', t('memory.organizeDoneToast', { succeeded: result.succeeded, failed: result.failed, reason: result.failure_reasons[0] ? t('memory.organizeDoneReason', { reason: result.failure_reasons[0] }) : '' }))
+      flash(result.cancelled ? 'ok' : result.failed ? 'err' : 'ok', result.cancelled
+        ? t('memory.organizeConversationsInterrupted', { succeeded: result.succeeded, failed: result.failed })
+        : t('memory.organizeDoneToast', { succeeded: result.succeeded, failed: result.failed, reason: result.failure_reasons[0] ? t('memory.organizeDoneReason', { reason: result.failure_reasons[0] }) : '' }))
     } catch (error) { flash('err', `${t('common.failed')}: ${String(error)}`) } finally { setOrganizingConversations(false) }
+  }
+
+  async function handleCancelOrganize() {
+    try { await cancelOrganize() } catch (error) { flash('err', `${t('common.failed')}: ${String(error)}`) }
   }
 
   async function handleImportMemoryFolder() {
@@ -673,7 +680,8 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
         <div className="flex flex-wrap items-center gap-2 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2.5 dark:border-gray-700 dark:bg-gray-900/40">
           <FileText size={14} className="text-violet-600 dark:text-violet-400" />
           <div className="min-w-0 flex-1"><p className="text-xs font-medium text-gray-700 dark:text-gray-200">{t('memory.organizeConversationsTitle')}</p><p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">{t('memory.organizeConversationsHint')}</p></div>
-          <button onClick={() => { void handleOrganizeConversations() }} disabled={organizingConversations || !ingestStatus?.model_ready} className="inline-flex items-center gap-1.5 rounded-md bg-violet-600 px-2.5 py-1.5 text-xs font-medium text-white hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50">{organizingConversations ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}{organizingConversations ? t('memory.organizeConversationsWorking') : t('memory.organizeConversationsAction')}</button>
+          <button onClick={() => { void handleOrganizeConversations() }} disabled={organizingConversations || ingestStatus?.manual_extraction_running || !ingestStatus?.model_ready} className="inline-flex items-center gap-1.5 rounded-md bg-violet-600 px-2.5 py-1.5 text-xs font-medium text-white hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50">{organizingConversations || ingestStatus?.manual_extraction_running ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}{organizingConversations || ingestStatus?.manual_extraction_running ? t('memory.organizeConversationsWorking') : t('memory.organizeConversationsAction')}</button>
+          {ingestStatus?.manual_extraction_running && <button type="button" onClick={() => { void handleCancelOrganize() }} disabled={ingestStatus?.manual_extraction_cancelling} className="inline-flex items-center gap-1 rounded-md border border-red-300 px-2.5 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50 disabled:opacity-50 dark:border-red-700 dark:text-red-300 dark:hover:bg-red-950/40"><X size={13} />{ingestStatus?.manual_extraction_cancelling ? t('memory.pending.interrupting') : t('memory.pending.interrupt')}</button>}
         </div>
 
         <div className="flex flex-wrap items-center gap-2 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2.5 dark:border-gray-700 dark:bg-gray-900/40">
@@ -697,7 +705,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
                 <div key={`${log.at}-${log.state}-${log.detail}-${i}`} className="flex min-w-0 items-center gap-2 text-xs text-gray-600 dark:text-gray-300">
                   <span className="shrink-0 text-gray-400 font-mono">{log.at}</span>
                   <span className={`shrink-0 px-1.5 rounded ${log.state === 'retrying' ? 'bg-amber-500/10 text-amber-700 dark:text-amber-300' : log.state === 'working' ? 'bg-sky-500/10 text-sky-700 dark:text-sky-300' : 'bg-violet-500/10 text-violet-600 dark:text-violet-400'}`}>
-                    {log.state === 'retrying' ? t('memory.recordRetrying') : log.state === 'working' ? t('memory.organizeConversationsWorking') : t('memory.recordStored')}
+                    {log.state === 'cancelled' ? t('memory.pending.interrupt') : log.state === 'retrying' ? t('memory.recordRetrying') : log.state === 'working' ? t('memory.organizeConversationsWorking') : t('memory.recordStored')}
                   </span>
                   <span className="min-w-0 flex-1 truncate" title={log.detail}>{log.detail}</span>
                 </div>

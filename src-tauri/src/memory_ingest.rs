@@ -51,6 +51,59 @@ const L3_L1_EVIDENCE_LIMIT: usize = 80;
 /// 全局单例（供 agent_http 的 route 无 State 上下文使用）。
 static INGEST: OnceLock<IngestStore> = OnceLock::new();
 
+// Manual L1 extraction is shared by the Memory Center and Pending Memories.
+// Keep its cancellation flag independent of the UI so navigation cannot orphan a run.
+static MANUAL_EXTRACTION: Mutex<Option<tokio::sync::watch::Sender<bool>>> = Mutex::new(None);
+
+struct ManualExtractionGuard(tokio::sync::watch::Receiver<bool>);
+
+impl ManualExtractionGuard {
+    fn start() -> Result<Self, String> {
+        let mut active = MANUAL_EXTRACTION.lock().unwrap();
+        if active.is_some() {
+            return Err("已有记忆提取任务正在运行".into());
+        }
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        *active = Some(sender);
+        Ok(Self(receiver))
+    }
+
+    fn cancelled(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    async fn wait_for_cancel(&self) {
+        let mut receiver = self.0.clone();
+        loop {
+            if *receiver.borrow_and_update() || receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    async fn extract(&self, text: &str) -> Option<Result<Result<Vec<crate::telemetry_store::L1MemoryCandidate>, String>, tokio::time::error::Elapsed>> {
+        tokio::select! {
+            biased;
+            _ = self.wait_for_cancel() => None,
+            result = tokio::time::timeout(ORGANIZE_ONE_CONVERSATION_TIMEOUT, extract_l1_conversation(text)) => Some(result),
+        }
+    }
+
+    async fn pause_before_retry(&self) -> bool {
+        tokio::select! {
+            biased;
+            _ = self.wait_for_cancel() => false,
+            _ = tokio::time::sleep(Duration::from_millis(500)) => true,
+        }
+    }
+}
+
+impl Drop for ManualExtractionGuard {
+    fn drop(&mut self) {
+        *MANUAL_EXTRACTION.lock().unwrap() = None;
+    }
+}
+
 pub fn init_ingest(store: IngestStore) {
     let _ = INGEST.set(store);
 }
@@ -2537,6 +2590,8 @@ pub struct IngestStatus {
     pub buffered_sessions: usize,
     pub model_provider_id: Option<String>,
     pub model_ready: bool,
+    pub manual_extraction_running: bool,
+    pub manual_extraction_cancelling: bool,
     pub recent: Vec<IngestLog>,
 }
 
@@ -2546,11 +2601,14 @@ pub async fn memory_ingest_status(
 ) -> Result<IngestStatus, String> {
     let model_provider_id = crate::llm::memory_extraction_config().provider_id;
     let model_ready = crate::llm::memory_extraction_provider().is_ok();
+    let manual_extraction = MANUAL_EXTRACTION.lock().unwrap();
     Ok(IngestStatus {
         enabled: state.is_enabled(),
         buffered_sessions: state.buffered_sessions(),
         model_provider_id,
         model_ready,
+        manual_extraction_running: manual_extraction.is_some(),
+        manual_extraction_cancelling: manual_extraction.as_ref().is_some_and(|sender| *sender.borrow()),
         recent: state.recent_logs(),
     })
 }
@@ -2576,22 +2634,41 @@ pub struct OrganizeConversationsResult {
     pub succeeded: u32,
     pub failed: u32,
     pub failure_reasons: Vec<String>,
+    pub cancelled: bool,
+}
+
+#[tauri::command]
+pub fn memory_ingest_cancel_organize() -> bool {
+    let active = MANUAL_EXTRACTION.lock().unwrap();
+    if let Some(sender) = active.as_ref() {
+        sender.send_replace(true);
+        true
+    } else {
+        false
+    }
 }
 
 #[tauri::command]
 pub async fn memory_ingest_organize_conversations() -> Result<OrganizeConversationsResult, String> {
+    let run = ManualExtractionGuard::start()?;
     let ingest = ingest_store().ok_or("自动沉淀模块尚未初始化")?;
     let telemetry = crate::telemetry_store::shared_store().ok_or("本地对话账本尚未初始化")?;
     let native_imported = scan_native_transcripts(&telemetry, true)?;
-    let pending = telemetry.pending_l1_conversations(1_000)?;
+    let pending = if run.cancelled() {
+        Vec::new()
+    } else {
+        telemetry.pending_l1_conversations(1_000)?
+    };
     ingest.log(IngestLog { at: now_str(), agent_id: GLOBAL_MEMORY_OWNER.into(), kind: "memory".into(), state: "working".into(), detail: format!("整理队列开始：原生扫描新增 {native_imported}；待处理 {} 个会话，每批 {ORGANIZE_BATCH_LIMIT} 个", pending.len()) });
     let mut result = OrganizeConversationsResult {
         attempted: 0,
         succeeded: 0,
         failed: 0,
         failure_reasons: Vec::new(),
+        cancelled: false,
     };
-    for (batch_index, batch) in pending.chunks(ORGANIZE_BATCH_LIMIT as usize).enumerate() {
+    'batches: for (batch_index, batch) in pending.chunks(ORGANIZE_BATCH_LIMIT as usize).enumerate() {
+        if run.cancelled() { result.cancelled = true; break; }
         ingest.log(IngestLog {
             at: now_str(),
             agent_id: GLOBAL_MEMORY_OWNER.into(),
@@ -2604,10 +2681,12 @@ pub async fn memory_ingest_organize_conversations() -> Result<OrganizeConversati
             ),
         });
         for conversation in batch {
+            if run.cancelled() { result.cancelled = true; break 'batches; }
             result.attempted += 1;
             let mut last_error = String::new();
             let mut stored = false;
             for retry in 0..=3 {
+                if run.cancelled() { result.cancelled = true; break 'batches; }
                 ingest.log(IngestLog {
                     at: now_str(),
                     agent_id: GLOBAL_MEMORY_OWNER.into(),
@@ -2615,13 +2694,10 @@ pub async fn memory_ingest_organize_conversations() -> Result<OrganizeConversati
                     state: "working".into(),
                     detail: format!("正在提取会话要点（第 {}/4 次）", retry + 1),
                 });
-                match tokio::time::timeout(
-                    ORGANIZE_ONE_CONVERSATION_TIMEOUT,
-                    extract_l1_conversation(&conversation.conversation_text),
-                )
-                .await
-                {
-                    Ok(Ok(candidates)) => {
+                match run.extract(&conversation.conversation_text).await {
+                    None => { result.cancelled = true; break 'batches; }
+                    Some(Ok(Ok(candidates))) => {
+                        if run.cancelled() { result.cancelled = true; break 'batches; }
                         let count = telemetry
                             .store_typed_l1_memories(&conversation.event_key, &candidates)?;
                         crate::memory_backend::queue_semantic_l1_index(
@@ -2638,16 +2714,17 @@ pub async fn memory_ingest_organize_conversations() -> Result<OrganizeConversati
                         });
                         break;
                     }
-                    Err(_) => {
+                    Some(Err(_)) => {
                         last_error = format!(
                             "记忆模型在 {} 秒内未完成",
                             ORGANIZE_ONE_CONVERSATION_TIMEOUT.as_secs()
                         )
                     }
-                    Ok(Err(error)) => last_error = error,
+                    Some(Ok(Err(error))) => last_error = error,
                 }
-                if retry < 3 {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if retry < 3 && !run.pause_before_retry().await {
+                    result.cancelled = true;
+                    break 'batches;
                 }
             }
             if !stored {
@@ -2665,14 +2742,15 @@ pub async fn memory_ingest_organize_conversations() -> Result<OrganizeConversati
             }
         }
     }
+    result.cancelled |= run.cancelled();
     ingest.log(IngestLog {
         at: now_str(),
         agent_id: GLOBAL_MEMORY_OWNER.into(),
         kind: "memory".into(),
-        state: "stored".into(),
+        state: if result.cancelled { "cancelled" } else { "stored" }.into(),
         detail: format!(
-            "整理队列结束：成功 {}，失败 {}",
-            result.succeeded, result.failed
+            "整理队列{}：成功 {}，失败 {}",
+            if result.cancelled { "已中断" } else { "结束" }, result.succeeded, result.failed
         ),
     });
     Ok(result)
@@ -2716,6 +2794,7 @@ pub fn memory_l1_conversation_detail(
 pub async fn memory_ingest_organize_session(
     event_key: String,
 ) -> Result<OrganizeConversationsResult, String> {
+    let run = ManualExtractionGuard::start()?;
     let ingest = ingest_store().ok_or("自动沉淀模块尚未初始化")?;
     let telemetry = crate::telemetry_store::shared_store().ok_or("本地对话账本尚未初始化")?;
     let conversation = telemetry
@@ -2726,10 +2805,12 @@ pub async fn memory_ingest_organize_session(
         succeeded: 0,
         failed: 0,
         failure_reasons: Vec::new(),
+        cancelled: false,
     };
     let mut last_error = String::new();
     let mut stored = false;
     for retry in 0..=1 {
+        if run.cancelled() { result.cancelled = true; break; }
         ingest.log(IngestLog {
             at: now_str(),
             agent_id: GLOBAL_MEMORY_OWNER.into(),
@@ -2737,13 +2818,10 @@ pub async fn memory_ingest_organize_session(
             state: "working".into(),
             detail: format!("正在提取单个会话要点（第 {}/2 次）", retry + 1),
         });
-        match tokio::time::timeout(
-            ORGANIZE_ONE_CONVERSATION_TIMEOUT,
-            extract_l1_conversation(&conversation.conversation_text),
-        )
-        .await
-        {
-            Ok(Ok(candidates)) => {
+        match run.extract(&conversation.conversation_text).await {
+            None => { result.cancelled = true; break; }
+            Some(Ok(Ok(candidates))) => {
+                if run.cancelled() { result.cancelled = true; break; }
                 let count =
                     telemetry.store_typed_l1_memories(&conversation.event_key, &candidates)?;
                 crate::memory_backend::queue_semantic_l1_index(
@@ -2760,19 +2838,30 @@ pub async fn memory_ingest_organize_session(
                 });
                 break;
             }
-            Err(_) => {
+            Some(Err(_)) => {
                 last_error = format!(
                     "记忆模型在 {} 秒内未完成",
                     ORGANIZE_ONE_CONVERSATION_TIMEOUT.as_secs()
                 )
             }
-            Ok(Err(error)) => last_error = error,
+            Some(Ok(Err(error))) => last_error = error,
         }
-        if retry < 1 {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if retry < 1 && !run.pause_before_retry().await {
+            result.cancelled = true;
+            break;
         }
     }
-    if !stored {
+    result.cancelled = !stored && (result.cancelled || run.cancelled());
+    if result.cancelled {
+        ingest.log(IngestLog {
+            at: now_str(),
+            agent_id: GLOBAL_MEMORY_OWNER.into(),
+            kind: "memory".into(),
+            state: "cancelled".into(),
+            detail: "单会话记忆提取已中断".into(),
+        });
+    }
+    if !stored && !result.cancelled {
         telemetry.set_l1_failure(&conversation.event_key, &last_error)?;
         result.failed = 1;
         result
@@ -3144,6 +3233,34 @@ mod tests {
         read_workbuddy_session, select_l2_evidence, strip_memory_thinking,
         unwrap_markdown_document_fence,
     };
+
+    #[test]
+    fn manual_extraction_can_be_cancelled_and_restarted() {
+        let first = super::ManualExtractionGuard::start().unwrap();
+        assert!(!first.cancelled());
+        assert!(super::ManualExtractionGuard::start().is_err());
+        assert!(super::memory_ingest_cancel_organize());
+        assert!(first.cancelled());
+        drop(first);
+        assert!(!super::memory_ingest_cancel_organize());
+        let second = super::ManualExtractionGuard::start().unwrap();
+        assert!(!second.cancelled());
+    }
+
+    #[tokio::test]
+    async fn manual_extraction_interrupts_pending_request() {
+        let run = super::ManualExtractionGuard::start().unwrap();
+        let waiting = async {
+            run.wait_for_cancel().await;
+            run.cancelled()
+        };
+        assert!(super::memory_ingest_cancel_organize());
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(1), waiting).await.unwrap());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run.extract("cancelled request never reaches the model"),
+        ).await.unwrap().is_none());
+    }
 
     #[test]
     fn prompt_hook_combines_sink_and_per_turn_injection() {

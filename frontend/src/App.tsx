@@ -118,11 +118,6 @@ export default function App() {
     minH: 120, maxH: 800, defaultH: 380,
   })
 
-  const [appVersion, setAppVersion] = useState('1.0.0')
-  useEffect(() => {
-    invoke<string>('get_app_version').then(setAppVersion).catch(() => {})
-  }, [])
-
   // 启动参数（--page/--lang/--start/--open-ui，用于脚本化截图与自动化）：
   // 页面校验后才切换；--open-ui 配合 --start 时先等 Agent 端口就绪再打开。
   useEffect(() => {
@@ -435,7 +430,7 @@ export default function App() {
         {/* Footer: version + update check */}
         <div className="space-y-2 border-t border-gray-200 px-4 py-3 dark:border-gray-800">
           <div className="flex items-center justify-center gap-1 text-xs font-bold text-gray-500 dark:text-gray-400">
-            <span>v{appVersion.replace(/-beta.*$/i, ' beta')}</span>
+            <span>v1.0.0</span>
             <span>·</span>
             <a
               href="https://www.zaferliu.me"

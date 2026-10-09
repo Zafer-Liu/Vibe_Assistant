@@ -17,10 +17,6 @@ type CheckState = 'idle' | 'checking' | 'done' | 'error'
 const LAST_CHECK_KEY = 'updater_last_check'
 const CHECK_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000 // 7 days
 
-function formatVersionForDisplay(version: string) {
-  return version.replace(/-beta(?:\.\d+)?$/i, ' beta')
-}
-
 interface UpdateCheckerProps {
   /** When true, runs a silent background check on mount (skipped if checked within 7 days). */
   autoCheck?: boolean
@@ -35,12 +31,7 @@ export function UpdateChecker({ autoCheck = false, compact = false, sidebar = fa
   const [state, setState] = useState<CheckState>('idle')
   const [info, setInfo] = useState<VersionInfo | null>(null)
   const [error, setError] = useState('')
-  const [currentVersion, setCurrentVersion] = useState('')
   const [expanded, setExpanded] = useState(false)
-
-  useEffect(() => {
-    invoke<string>('get_app_version').then(setCurrentVersion).catch(() => {})
-  }, [])
 
   const check = useCallback(async (silent = false) => {
     setState('checking')
@@ -132,11 +123,9 @@ export function UpdateChecker({ autoCheck = false, compact = false, sidebar = fa
           <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
             {t('updater.title')}
           </p>
-          {currentVersion && (
-            <p className="text-xs text-gray-400 dark:text-gray-500 font-mono">
-              {t('updater.currentVersion', { version: formatVersionForDisplay(currentVersion) })}
-            </p>
-          )}
+          <p className="text-xs text-gray-400 dark:text-gray-500 font-mono">
+            {t('updater.currentVersion', { version: '1.0.0' })}
+          </p>
         </div>
 
         <button

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useId, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { invoke } from '@tauri-apps/api/core'
-import { Plus, Trash2, CheckCircle, XCircle, Loader2, Eye, EyeOff, AlertCircle, Brain, ExternalLink } from 'lucide-react'
+import { Plus, Trash2, CheckCircle, XCircle, Loader2, Eye, EyeOff, AlertCircle, Brain, ExternalLink, ChevronDown } from 'lucide-react'
 
 const SPONSOR_PROVIDER_ID = '88api'
 const SPONSOR_CREDITS_URL = 'https://88api.ai/sign-up?aff=VNNV'
@@ -382,12 +382,15 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
   // Reloading another provider must not replace these inputs.
   const [draft, setDraft] = useState<Pick<LlmProvider, 'api_key' | 'model'> | null>(null)
   const [modelOptions, setModelOptions] = useState<string[]>([])
+  const [modelPickerOpen, setModelPickerOpen] = useState(false)
+  const [modelQuery, setModelQuery] = useState('')
   const [loadingModels, setLoadingModels] = useState(false)
   const [modelListError, setModelListError] = useState('')
   const isSponsor = provider.id === SPONSOR_PROVIDER_ID
   const key = draft?.api_key ?? provider.api_key
   const model = draft?.model ?? provider.model
   const dirty = key !== provider.api_key || model !== provider.model
+  const filteredModels = modelOptions.filter(option => option.toLowerCase().includes(modelQuery.trim().toLowerCase()))
 
   useEffect(() => {
     onReadinessChange(provider.id, !dirty)
@@ -406,11 +409,14 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
         apiKey: key,
       })
       setModelOptions(models)
+      setModelPickerOpen(models.length > 0)
+      setModelQuery('')
       // Keep an already selected model intact; select automatically only when
       // the field is blank, which makes a fresh 88API setup one click shorter.
       if (!model.trim() && models[0]) setDraft({ api_key: key, model: models[0] })
     } catch (error) {
       setModelOptions([])
+      setModelPickerOpen(false)
       setModelListError(String(error))
     } finally {
       setLoadingModels(false)
@@ -443,22 +449,40 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
 
       <div className="grid grid-cols-2 gap-3">
         <Field label={t('llm.model')}>
-          {id => <div className="flex gap-1.5">
-            <div className="min-w-0 flex-1">
-              <input id={id} value={model} list={isSponsor ? `${id}-models` : undefined} onChange={e => setDraft({ api_key: key, model: e.target.value })}
-                className="field-input w-full font-mono text-xs" placeholder={isSponsor ? t('llm.sponsorModelPlaceholder') : provider.model} />
+          {id => <div className="min-w-0">
+            <div className="flex gap-1.5">
+              <input id={id} value={model} onChange={e => setDraft({ api_key: key, model: e.target.value })}
+                className="field-input min-w-0 flex-1 font-mono text-xs" placeholder={isSponsor ? t('llm.sponsorModelPlaceholder') : provider.model} />
               {isSponsor && modelOptions.length > 0 && (
-                <datalist id={`${id}-models`}>
-                  {modelOptions.map(option => <option key={option} value={option} />)}
-                </datalist>
+                <button type="button" onClick={() => setModelPickerOpen(open => !open)}
+                  aria-label={t('llm.chooseModel')} aria-expanded={modelPickerOpen} aria-controls={`${id}-models`}
+                  className="shrink-0 rounded-md border border-gray-200 px-2 text-gray-600 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-800">
+                  <ChevronDown className="h-3.5 w-3.5" />
+                </button>
+              )}
+              {isSponsor && (
+                <button type="button" onClick={() => { void fetchModels() }} disabled={loadingModels || !key.trim()}
+                  title={t('llm.fetchModels')}
+                  className="shrink-0 rounded-md border border-violet-200 px-2 text-xs font-medium text-violet-700 hover:bg-violet-50 disabled:cursor-not-allowed disabled:opacity-40 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950/50">
+                  {loadingModels ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : t('llm.fetchModels')}
+                </button>
               )}
             </div>
-            {isSponsor && (
-              <button type="button" onClick={() => { void fetchModels() }} disabled={loadingModels || !key.trim()}
-                title={t('llm.fetchModels')}
-                className="shrink-0 rounded-md border border-violet-200 px-2 text-xs font-medium text-violet-700 hover:bg-violet-50 disabled:cursor-not-allowed disabled:opacity-40 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950/50">
-                {loadingModels ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : t('llm.fetchModels')}
-              </button>
+            {isSponsor && modelPickerOpen && modelOptions.length > 0 && (
+              <div id={`${id}-models`} className="mt-1 rounded-md border border-gray-200 bg-white p-1 shadow-sm dark:border-gray-700 dark:bg-gray-900">
+                <input value={modelQuery} onChange={e => setModelQuery(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Escape') setModelPickerOpen(false) }}
+                  aria-label={t('llm.searchModels')} placeholder={t('llm.searchModels')}
+                  className="field-input mb-1 w-full font-mono text-xs" />
+                <div className="max-h-48 overflow-y-auto overscroll-contain">
+                  {filteredModels.map(option => (
+                    <button key={option} type="button" onClick={() => { setDraft({ api_key: key, model: option }); setModelPickerOpen(false) }}
+                      className={`block w-full truncate rounded px-2 py-1.5 text-left font-mono text-xs hover:bg-violet-50 dark:hover:bg-violet-950/50 ${option === model ? 'text-violet-700 dark:text-violet-300' : 'text-gray-700 dark:text-gray-200'}`}
+                      title={option}>{option}</button>
+                  ))}
+                  {filteredModels.length === 0 && <p className="px-2 py-1.5 text-xs text-gray-500 dark:text-gray-400">{t('llm.noMatchingModels')}</p>}
+                </div>
+              </div>
             )}
           </div>}
         </Field>

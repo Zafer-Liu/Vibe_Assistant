@@ -82,6 +82,7 @@ interface MemoryStore {
   setIngestEnabled: (on: boolean) => Promise<void>
   flushIngestQueue: () => Promise<number>
   organizeConversations: () => Promise<OrganizeConversationsResult>
+  cancelOrganize: () => Promise<boolean>
   loadPendingSessions: (limit?: number) => Promise<PendingMemorySession[]>
   loadOrganizedSessions: (limit?: number) => Promise<PendingMemorySession[]>
   loadConversationDetail: (eventKey: string) => Promise<MemoryConversationDetail>
@@ -247,11 +248,18 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
   },
 
   async organizeConversations() {
-    const result = await invoke<OrganizeConversationsResult>('memory_ingest_organize_conversations')
-    // This action writes new SQLite memories; bypass the in-session page
-    // cache so the count and list change immediately after a successful run.
-    await Promise.all([get().checkTelemetry(), get().listMemories(true), get().checkIngest()])
-    return result
+    try {
+      return await invoke<OrganizeConversationsResult>('memory_ingest_organize_conversations')
+    } finally {
+      // Partial results are kept when extraction is interrupted.
+      await Promise.all([get().checkTelemetry(), get().listMemories(true), get().checkIngest()])
+    }
+  },
+
+  async cancelOrganize() {
+    const requested = await invoke<boolean>('memory_ingest_cancel_organize')
+    await get().checkIngest()
+    return requested
   },
 
   async loadPendingSessions(limit?: number) {
@@ -267,9 +275,11 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
   },
 
   async organizeSession(eventKey) {
-    const result = await invoke<OrganizeConversationsResult>('memory_ingest_organize_session', { eventKey })
-    await Promise.all([get().checkTelemetry(), get().listMemories(true), get().checkIngest()])
-    return result
+    try {
+      return await invoke<OrganizeConversationsResult>('memory_ingest_organize_session', { eventKey })
+    } finally {
+      await Promise.all([get().checkTelemetry(), get().listMemories(true), get().checkIngest()])
+    }
   },
 
   async importMemoryFolder(folder) {

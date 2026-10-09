@@ -1,19 +1,20 @@
 import { memo, useCallback, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
-  ArrowLeft, Brain, CheckCircle2, Clock3, Loader2, MessagesSquare, RefreshCw, RotateCcw, XCircle,
+  ArrowLeft, Brain, CheckCircle2, Clock3, Loader2, MessagesSquare, RefreshCw, RotateCcw, XCircle, X,
 } from 'lucide-react'
 import { useMemoryStore } from '../store/memoryStore'
 import type { MemoryConversationDetail, PendingMemorySession } from '../types/memory'
 import { ConversationDialog, STATE_META, displayTime, sourceLabel } from '../components/ConversationDialog'
 import { MemoryBreadcrumb } from '../components/MemoryBreadcrumb'
+import { useVisiblePolling } from '../hooks/useVisiblePolling'
 import { ErrorRecovery } from '../components/ErrorRecovery'
 
 type StateFilter = 'all' | 'pending' | 'retrying' | 'failed'
 
 export const PendingMemories = memo(function PendingMemories({ onBack, active = true }: { onBack: () => void; active?: boolean }) {
   const { t } = useTranslation()
-  const { loadPendingSessions, loadConversationDetail, organizeSession, organizeConversations, ingestStatus, checkIngest, checkTelemetry } = useMemoryStore()
+  const { loadPendingSessions, loadConversationDetail, organizeSession, organizeConversations, cancelOrganize, ingestStatus, checkIngest, checkTelemetry } = useMemoryStore()
   const [sessions, setSessions] = useState<PendingMemorySession[] | null>(null)
   const [filter, setFilter] = useState<StateFilter>('all')
   const [refreshing, setRefreshing] = useState(false)
@@ -38,6 +39,7 @@ export const PendingMemories = memo(function PendingMemories({ onBack, active = 
     void checkIngest()
     void checkTelemetry({ limit: 20 })
   }, [reload, checkIngest, checkTelemetry, active])
+  useVisiblePolling(checkIngest, 2_000, active)
 
   const counts = useMemo(() => {
     const list = sessions ?? []
@@ -54,6 +56,7 @@ export const PendingMemories = memo(function PendingMemories({ onBack, active = 
   )
 
   const modelReady = Boolean(ingestStatus?.model_ready)
+  const extractionRunning = organizingAll || organizingKey !== null || Boolean(ingestStatus?.manual_extraction_running)
 
   async function handleRefresh() {
     if (refreshing) return
@@ -67,16 +70,16 @@ export const PendingMemories = memo(function PendingMemories({ onBack, active = 
   }
 
   async function handleOrganizeAll() {
-    if (organizingAll) return
+    if (extractionRunning) return
     setOrganizingAll(true)
     setNotice(null)
     try {
       const result = await organizeConversations()
-      setNotice(
-        result.failed > 0
+      setNotice(result.cancelled
+        ? { kind: 'ok', text: t('memory.pending.interrupted', { succeeded: result.succeeded, failed: result.failed }) }
+        : result.failed > 0
           ? { kind: 'err', text: t('memory.pending.organizeAllDonePartial', { succeeded: result.succeeded, failed: result.failed }) }
-          : { kind: 'ok', text: t('memory.pending.organizeAllDone', { succeeded: result.succeeded }) },
-      )
+          : { kind: 'ok', text: t('memory.pending.organizeAllDone', { succeeded: result.succeeded }) })
       await reload()
     } catch (error) {
       setNotice({ kind: 'err', text: t('memory.pending.organizeFailed', { error: String(error) }) })
@@ -86,22 +89,26 @@ export const PendingMemories = memo(function PendingMemories({ onBack, active = 
   }
 
   async function handleOrganizeOne(eventKey: string) {
-    if (organizingKey) return
+    if (extractionRunning) return
     setOrganizingKey(eventKey)
     setNotice(null)
     try {
       const result = await organizeSession(eventKey)
-      setNotice(
-        result.failed > 0
+      setNotice(result.cancelled
+        ? { kind: 'ok', text: t('memory.pending.interrupted', { succeeded: result.succeeded, failed: result.failed }) }
+        : result.failed > 0
           ? { kind: 'err', text: result.failure_reasons[0] ?? t('memory.pending.organizeOneFailed') }
-          : { kind: 'ok', text: t('memory.pending.organizeOneDone') },
-      )
+          : { kind: 'ok', text: t('memory.pending.organizeOneDone') })
       await reload()
     } catch (error) {
       setNotice({ kind: 'err', text: t('memory.pending.organizeFailed', { error: String(error) }) })
     } finally {
       setOrganizingKey(null)
     }
+  }
+
+  async function handleCancelOrganize() {
+    try { await cancelOrganize() } catch (error) { setNotice({ kind: 'err', text: t('memory.pending.organizeFailed', { error: String(error) }) }) }
   }
 
   async function handleOpenDetail(eventKey: string) {
@@ -135,7 +142,8 @@ export const PendingMemories = memo(function PendingMemories({ onBack, active = 
         <div className="flex flex-wrap items-center gap-2">
           {notice && <span className={`rounded-lg px-3 py-2 text-xs ${notice.kind === 'ok' ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300' : 'bg-red-500/10 text-red-700 dark:text-red-300'}`} role="status">{notice.text}</span>}
           <button type="button" onClick={() => { void handleRefresh() }} disabled={refreshing} className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:bg-slate-50 disabled:cursor-wait disabled:opacity-60 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"><RefreshCw size={16} className={refreshing ? 'animate-spin motion-reduce:animate-none' : ''} />{t('memory.pending.refresh')}</button>
-          <button type="button" onClick={() => { void handleOrganizeAll() }} disabled={organizingAll || !modelReady || (sessions ?? []).length === 0} title={modelReady ? t('memory.pending.organizeAllTitle') : t('memory.pending.modelMissingTitle')} className="inline-flex h-10 items-center gap-2 rounded-lg bg-violet-600 px-4 text-sm font-medium text-white transition hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500">{organizingAll ? <Loader2 size={16} className="animate-spin motion-reduce:animate-none" /> : <Brain size={16} />}{organizingAll ? t('memory.pending.organizing') : t('memory.pending.organizeAll')}</button>
+          <button type="button" onClick={() => { void handleOrganizeAll() }} disabled={extractionRunning || !modelReady || (sessions ?? []).length === 0} title={modelReady ? t('memory.pending.organizeAllTitle') : t('memory.pending.modelMissingTitle')} className="inline-flex h-10 items-center gap-2 rounded-lg bg-violet-600 px-4 text-sm font-medium text-white transition hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500">{extractionRunning ? <Loader2 size={16} className="animate-spin motion-reduce:animate-none" /> : <Brain size={16} />}{extractionRunning ? t('memory.pending.organizing') : t('memory.pending.organizeAll')}</button>
+          {ingestStatus?.manual_extraction_running && <button type="button" onClick={() => { void handleCancelOrganize() }} disabled={ingestStatus?.manual_extraction_cancelling} className="inline-flex h-10 items-center gap-2 rounded-lg border border-red-300 px-3 text-sm font-medium text-red-700 transition hover:bg-red-50 disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500 dark:border-red-700 dark:text-red-300 dark:hover:bg-red-950/40"><X size={16} />{ingestStatus?.manual_extraction_cancelling ? t('memory.pending.interrupting') : t('memory.pending.interrupt')}</button>}
         </div>
       </header>
       {notice?.kind === 'err' && <ErrorRecovery error={notice.text} fallback="settings" />}
@@ -185,7 +193,7 @@ export const PendingMemories = memo(function PendingMemories({ onBack, active = 
                 <span className="shrink-0 font-mono text-xs text-slate-400">{displayTime(item.occurred_at)}</span>
                 <span className="shrink-0 text-xs text-slate-400">{item.message_count} {t('memory.pending.messageCount')}</span>
                 <span className="inline-flex shrink-0 items-center gap-1 text-xs text-slate-300 transition group-hover:text-violet-500 dark:text-slate-600 dark:group-hover:text-violet-300"><MessagesSquare size={13} />{t('memory.pending.viewConversation')}</span>
-                <button type="button" onClick={(event) => { event.stopPropagation(); void handleOrganizeOne(item.event_key) }} disabled={working || organizingAll || !modelReady} title={modelReady ? t('memory.pending.organizeOneTitle') : t('memory.pending.modelMissingTitle')} className="inline-flex shrink-0 items-center gap-1 rounded-md border border-violet-200 bg-white px-2.5 py-1 text-xs font-medium text-violet-700 transition hover:bg-violet-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-violet-500/30 dark:bg-slate-900 dark:text-violet-300 dark:hover:bg-violet-500/10">{working ? <Loader2 size={12} className="animate-spin motion-reduce:animate-none" /> : <Brain size={12} />}{t('memory.pending.organize')}</button>
+                <button type="button" onClick={(event) => { event.stopPropagation(); void handleOrganizeOne(item.event_key) }} disabled={extractionRunning || !modelReady} title={modelReady ? t('memory.pending.organizeOneTitle') : t('memory.pending.modelMissingTitle')} className="inline-flex shrink-0 items-center gap-1 rounded-md border border-violet-200 bg-white px-2.5 py-1 text-xs font-medium text-violet-700 transition hover:bg-violet-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-violet-500/30 dark:bg-slate-900 dark:text-violet-300 dark:hover:bg-violet-500/10">{working ? <Loader2 size={12} className="animate-spin motion-reduce:animate-none" /> : <Brain size={12} />}{t('memory.pending.organize')}</button>
                 <p className="basis-full truncate text-xs text-slate-500 dark:text-slate-400" title={item.excerpt}>{item.excerpt.replace(/\s+/g, ' ').trim() || t('memory.pending.noExcerpt')}</p>
                 {item.error && <p className="basis-full truncate text-xs text-red-600 dark:text-red-400" title={item.error}>{t('memory.pending.lastFailed')}{item.error}</p>}
               </div>
