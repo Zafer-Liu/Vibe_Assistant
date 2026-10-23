@@ -32,7 +32,7 @@ export function StepLlm({ onNext, onBusyChange }: {
         invoke<LlmProvider[]>('list_llm_providers'),
       ])
       const provider = providers.find(item => item.id === config.provider_id)
-      if (!provider?.enabled || !provider.api_key.trim()) {
+      if (!provider?.enabled || !provider.has_api_key) {
         setError(t('onboarding.llm.chooseMemoryModel'))
         return
       }

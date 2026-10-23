@@ -4,15 +4,17 @@ import {
   ArrowLeft, ArrowRightLeft, ChevronDown, ChevronUp, FileCode2,
   FolderSync, Globe, Loader2, RotateCcw, Scale, Search, ShieldCheck, Sparkles, Trash2, X,
 } from 'lucide-react'
-import { useMemoryStore } from '../store/memoryStore'
-import type { SkillDriftAgent, SkillDriftFile, SkillItem } from '../types/memory'
-import { PublishDialog, SkillDiffPane, SOURCES } from './SkillLibrary'
+import { useSkillFields } from '../store/skillStore'
+import type { SkillDriftAgent, SkillDriftFile, SkillItem } from '../types/skill'
+import { PublishDialog } from '../features/skills/components/PublishDialog'
+import { SkillDiffPane } from '../features/skills/components/SkillDiffPane'
+import { SOURCES } from '../features/skills/sources'
 
 const sourceMeta = (id: string) => SOURCES.find(s => s.id === id)
 
 export const PublishedSkills = memo(function PublishedSkills({ onBack, onGoSync }: { onBack: () => void; onGoSync: () => void }) {
   const { t } = useTranslation()
-  const { skills, skillCacheReady, loadSkills, readSkill, setSkillStatus, publishSkill, deleteSkill, applySkillSync, publishedDrift } = useMemoryStore()
+  const { skills, skillCacheReady, loadSkills, readSkill, setSkillStatus, publishSkill, deleteSkill, applySkillSync, publishedDrift } = useSkillFields('skills', 'skillCacheReady', 'loadSkills', 'readSkill', 'setSkillStatus', 'publishSkill', 'deleteSkill', 'applySkillSync', 'publishedDrift')
   const [query, setQuery] = useState('')
   const [agentFilter, setAgentFilter] = useState<'all' | string>('all')
   const [loading, setLoading] = useState(false)
@@ -177,7 +179,7 @@ export const PublishedSkills = memo(function PublishedSkills({ onBack, onGoSync 
   return (
     <div className="flex h-full min-h-0 flex-col bg-gray-50 dark:bg-gray-950">
       {/* ── Header ── */}
-      <header className="flex items-center gap-4 border-b border-gray-200 bg-white px-6 py-4 dark:border-gray-800 dark:bg-gray-900">
+      <header className="fluent-page-header fluent-command-header flex items-center gap-4 border-b border-gray-200 bg-white px-6 py-4 dark:border-gray-800 dark:bg-gray-900">
         <button
           onClick={onBack}
           className="rounded-lg border border-gray-300 p-2 text-gray-500 transition hover:bg-gray-50 hover:text-gray-700 dark:border-gray-600 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200"
@@ -213,7 +215,7 @@ export const PublishedSkills = memo(function PublishedSkills({ onBack, onGoSync 
       {/* ── Toolbar: search + equipped-agent filters ── */}
       <div className="flex flex-wrap items-center gap-3 border-b border-gray-200 bg-white px-6 py-3 dark:border-gray-800 dark:bg-gray-900">
         <label className="relative block w-full sm:w-64">
-          <Search size={14} className="pointer-events-none absolute left-2.5 top-2.5 text-gray-400" />
+          <Search size={14} className="pointer-events-none absolute left-2.5 top-2.5 text-gray-500" />
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -222,7 +224,7 @@ export const PublishedSkills = memo(function PublishedSkills({ onBack, onGoSync 
           />
         </label>
         <div className="flex flex-wrap items-center gap-1.5">
-          <span className="text-xs text-gray-400 dark:text-gray-500">{t('skills.equippedTo')}:</span>
+          <span className="text-xs text-gray-500 dark:text-gray-400">{t('skills.equippedTo')}:</span>
           <FilterPill active={agentFilter === 'all'} onClick={() => setAgentFilter('all')}>
             {t('skills.all')} <span className="ml-1 font-mono opacity-70">{published.length}</span>
           </FilterPill>
@@ -240,7 +242,7 @@ export const PublishedSkills = memo(function PublishedSkills({ onBack, onGoSync 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {visible.length > 0 ? (
           <div className="mx-auto max-w-4xl space-y-3 p-5">
-            <p className="text-xs leading-5 text-gray-400 dark:text-gray-500">{t('skills.syncAfterChange')}</p>
+            <p className="text-xs leading-5 text-gray-500 dark:text-gray-400">{t('skills.syncAfterChange')}</p>
             {visible.map((skill) => {
               const key = `${skill.source}:${skill.name}`
               const expanded = expandedKey === key
@@ -356,7 +358,7 @@ export const PublishedSkills = memo(function PublishedSkills({ onBack, onGoSync 
                       </pre>
                       {skill.files && skill.files.length > 0 && (
                         <div className="flex flex-wrap gap-1.5 rounded-xl bg-gray-50 p-3 dark:bg-gray-800/60">
-                          <span className="w-full pb-1 text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500">
+                          <span className="w-full pb-1 text-[10px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
                             {t('skills.bundledFiles', { count: skill.files.length })} · {t('skills.bundledFilesHint')}
                           </span>
                           {skill.files.map((file) => (
@@ -454,7 +456,7 @@ export const PublishedSkills = memo(function PublishedSkills({ onBack, onGoSync 
         <div className="pointer-events-none fixed bottom-5 left-1/2 z-50 -translate-x-1/2" role="status">
           <div className="pointer-events-auto flex max-w-md items-center gap-2 rounded-xl border border-gray-200 bg-white px-4 py-2.5 text-xs text-gray-700 shadow-lg dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200">
             <span className="min-w-0 flex-1">{notice}</span>
-            <button onClick={() => setNotice(null)} aria-label={t('skills.closeNoticeAria')} className="shrink-0 rounded-md p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300">
+            <button onClick={() => setNotice(null)} aria-label={t('skills.closeNoticeAria')} className="shrink-0 rounded-md p-1 text-gray-500 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300">
               <X size={13} />
             </button>
           </div>
@@ -490,7 +492,7 @@ function ArbitrateDialog({ skill, agents, onClose, onChanged, onNotice }: {
   onNotice: (message: string) => void
 }) {
   const { t } = useTranslation()
-  const { skillDriftDetail, adoptLocalSkill, applySkillSyncOne, loadSkills } = useMemoryStore()
+  const { skillDriftDetail, adoptLocalSkill, applySkillSyncOne, loadSkills } = useSkillFields('skillDriftDetail', 'adoptLocalSkill', 'applySkillSyncOne', 'loadSkills')
   const [rows, setRows] = useState<SkillDriftAgent[]>(agents)
   const [diffAgent, setDiffAgent] = useState<string | null>(null)
   const [diffFiles, setDiffFiles] = useState<SkillDriftFile[] | null>(null)
@@ -521,10 +523,13 @@ function ArbitrateDialog({ skill, agents, onClose, onChanged, onNotice }: {
   }
 
   async function overwrite(agent: string) {
+    const agentLabel = SOURCES.find(s => s.id === agent)?.label ?? agent
+    const isMissing = rows.find(row => row.agent === agent)?.state === 'missing'
+    if (!isMissing && !window.confirm(t('skills.driftOverwriteConfirm', { name: skill.name, agent: agentLabel }))) return
     setBusy(true)
     try {
       await applySkillSyncOne(agent, skill.source, skill.name)
-      onNotice(t('skills.arbitrateOverwriteDone', { agent: SOURCES.find(s => s.id === agent)?.label ?? agent, name: skill.name }))
+      onNotice(t(isMissing ? 'skills.arbitrateDeployMissingDone' : 'skills.arbitrateOverwriteDone', { agent: agentLabel, name: skill.name }))
       setRows(rows.map(r => r.agent === agent ? { ...r, state: 'in_sync', changed_files: 0 } : r))
       setDiffAgent(null)
       setDiffFiles(null)
@@ -537,7 +542,8 @@ function ArbitrateDialog({ skill, agents, onClose, onChanged, onNotice }: {
   }
 
   async function adopt(agent: string) {
-    if (!window.confirm(t('skills.driftAdoptConfirm', { name: skill.name }))) return
+    const agentLabel = SOURCES.find(s => s.id === agent)?.label ?? agent
+    if (!window.confirm(t('skills.driftAdoptConfirm', { name: skill.name, agent: agentLabel }))) return
     setBusy(true)
     try {
       const result = await adoptLocalSkill(agent, skill.source, skill.name)
@@ -585,17 +591,21 @@ function ArbitrateDialog({ skill, agents, onClose, onChanged, onNotice }: {
             <h2 className="truncate text-sm font-semibold text-gray-800 dark:text-gray-100">
               {t('skills.arbitrateTitle')} · <span className="font-mono">{skill.name}</span>
             </h2>
-            <p className="text-[11px] text-gray-400 dark:text-gray-500">{t('skills.arbitrateHint', { version: skill.version })}</p>
+            <p className="text-[11px] text-gray-500 dark:text-gray-400">{t('skills.arbitrateHint', { version: skill.version })}</p>
           </div>
-          <button onClick={onClose} aria-label={t('skills.dialogCancel')} className="ml-auto shrink-0 rounded-md p-1.5 text-gray-400 transition hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300">
+          <button onClick={onClose} aria-label={t('skills.dialogCancel')} className="ml-auto shrink-0 rounded-md p-1.5 text-gray-500 transition hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300">
             <X size={15} />
           </button>
         </div>
 
+        <p className="border-b border-gray-100 px-5 py-2 text-[11px] leading-4 text-gray-500 dark:border-gray-800 dark:text-gray-400">
+          {t('skills.arbitrateChoices')}
+        </p>
+
         <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-5">
           {error && <p className="text-xs text-rose-500">{t('skills.driftLoadFailed', { error })}</p>}
           {rows.length === 0 && (
-            <p className="py-6 text-center text-xs text-gray-400">{t('skills.notEquipped')}</p>
+            <p className="py-6 text-center text-xs text-gray-500">{t('skills.notEquipped')}</p>
           )}
           {rows.map((row) => {
             const agent = SOURCES.find(s => s.id === row.agent)
@@ -648,12 +658,12 @@ function ArbitrateDialog({ skill, agents, onClose, onChanged, onNotice }: {
                 {diffAgent === row.agent && (
                   <div className="mt-3 border-t border-gray-100 pt-3 dark:border-gray-800">
                     {diffFiles === null ? (
-                      <div className="flex items-center justify-center gap-2 py-4 text-xs text-gray-400">
+                      <div className="flex items-center justify-center gap-2 py-4 text-xs text-gray-500">
                         <Loader2 size={14} className="animate-spin motion-reduce:animate-none" />
                         {t('skills.deployChecking')}
                       </div>
                     ) : diffFiles.length === 0 ? (
-                      <p className="py-3 text-center text-xs text-gray-400">{t('skills.driftEmpty')}</p>
+                      <p className="py-3 text-center text-xs text-gray-500">{t('skills.driftEmpty')}</p>
                     ) : (
                       <SkillDiffPane files={diffFiles} selected={diffSelected} onSelect={setDiffSelected} />
                     )}

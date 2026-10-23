@@ -1,3 +1,4 @@
+import { invoke } from '@tauri-apps/api/core'
 import type { ConsolidationCandidate, MemoryItem } from '../types/memory'
 
 type Extractor = (inputs: string | string[], options?: Record<string, unknown>) => Promise<unknown>
@@ -9,7 +10,7 @@ const extractors = new Map<string, Promise<Extractor>>()
 const vectors = new Map<string, { content: string, vector: Float32Array }>()
 
 function hasChinese(text: string) {
-  return /[\u4e00-\u9fff]/.test(text)
+  return /[一-鿿]/.test(text)
 }
 
 async function extractorFor(query: string): Promise<Extractor> {
@@ -57,12 +58,47 @@ function yieldToUi(): Promise<void> {
 // responsive at the cost of a few more extractor calls.
 const EMBED_CHUNK_SIZE = 16
 
+type RemoteEmbedResult = { vectors: number[][], dimension: number, model: string, latency_ms: number }
+
+// Tracks the last known availability of the native embedding command. When
+// the backend reports the command as missing or the configured service as
+// unreachable, we stop retrying for this session and stay on the local model.
+let remoteEmbeddingDisabled = false
+
 /**
- * Select likely duplicate groups with BGE-small entirely in the local WebView.
- * The output intentionally contains only small batches; only these candidates
- * are later sent to the configured consolidation LLM for a safety decision.
- * Embedding is chunked and yields to the UI thread, and `onProgress` reports
- * how many memories have been embedded so the caller can show live progress.
+ * Embed a batch of texts, preferring the native `memory_semantic_embed_texts`
+ * command (which honours the configured local/remote embedding service) and
+ * falling back to the in-WebView BGE-small models when the command is absent
+ * or fails. The fallback keeps older configurations usable.
+ */
+async function embedTexts(texts: string[]): Promise<Float32Array[]> {
+  if (texts.length === 0) return []
+  if (!remoteEmbeddingDisabled) {
+    try {
+      const result = await invoke<RemoteEmbedResult>('memory_semantic_embed_texts', { texts })
+      if (Array.isArray(result?.vectors) && result.vectors.length === texts.length) {
+        return result.vectors.map((row) => Float32Array.from(row))
+      }
+      // Malformed payload: treat as unavailable for this session.
+      remoteEmbeddingDisabled = true
+    } catch {
+      remoteEmbeddingDisabled = true
+    }
+  }
+  // Local fallback: pick the model from the first text (callers group by
+  // language, so a batch is effectively single-language).
+  const extractor = await extractorFor(texts[0])
+  return toVectors(await extractor(texts, { pooling: 'mean', normalize: true }))
+}
+
+/**
+ * Select likely duplicate groups, preferring the configured embedding service
+ * via `memory_semantic_embed_texts` and falling back to BGE-small in the
+ * WebView when unavailable. The output intentionally contains only small
+ * batches; only these candidates are later sent to the configured
+ * consolidation LLM for a safety decision. Embedding is chunked and yields to
+ * the UI thread, and `onProgress` reports how many memories have been
+ * embedded so the caller can show live progress.
  */
 export async function createBgeConsolidationCandidateBatches(
   memories: MemoryItem[],
@@ -80,17 +116,16 @@ export async function createBgeConsolidationCandidateBatches(
   const total = local.length
   let processed = 0
   const pairs: Array<{ left: MemoryItem, right: MemoryItem, score: number }> = []
-  for (const [isChinese, group] of byLanguage) {
+  for (const [, group] of byLanguage) {
     if (group.length < 2) {
       processed += group.length
       continue
     }
-    const extractor = await extractorFor(isChinese ? '中文' : 'english')
     // Embed in small chunks, yielding between them so the UI stays alive.
     const embedded: Float32Array[] = []
     for (let start = 0; start < group.length; start += EMBED_CHUNK_SIZE) {
       const slice = group.slice(start, start + EMBED_CHUNK_SIZE)
-      embedded.push(...toVectors(await extractor(slice.map((memory) => memory.memory), { pooling: 'mean', normalize: true })))
+      embedded.push(...await embedTexts(slice.map((memory) => memory.memory)))
       processed += slice.length
       onProgress?.(Math.min(processed, total), total)
       if (start + EMBED_CHUNK_SIZE < group.length) await yieldToUi()
@@ -141,20 +176,20 @@ export async function createBgeConsolidationCandidateBatches(
 }
 
 /**
- * Fully local BGE-small semantic recall for the memory library. The model is
- * fetched only on its first use, then retained by the WebView cache; neither
- * documents nor vectors are sent to an embedding API.
+ * Semantic recall for the memory library. Prefers the configured embedding
+ * service via `memory_semantic_embed_texts`; falls back to fully local
+ * BGE-small inference in the WebView (model fetched on first use and retained
+ * by the WebView cache) so older configurations keep working.
  */
 export async function searchMemoriesWithBge(query: string, memories: MemoryItem[], limit: number): Promise<MemoryItem[]> {
   const trimmed = query.trim()
   if (!trimmed || memories.length === 0) return []
-  const extractor = await extractorFor(trimmed)
   const missing = memories.filter((memory) => vectors.get(memory.id)?.content !== memory.memory)
   if (missing.length) {
-    const embedded = toVectors(await extractor(missing.map((memory) => memory.memory), { pooling: 'mean', normalize: true }))
+    const embedded = await embedTexts(missing.map((memory) => memory.memory))
     missing.forEach((memory, index) => vectors.set(memory.id, { content: memory.memory, vector: embedded[index] }))
   }
-  const [queryVector] = toVectors(await extractor(trimmed, { pooling: 'mean', normalize: true }))
+  const [queryVector] = await embedTexts([trimmed])
   return memories
     .map((memory) => ({ ...memory, score: cosine(queryVector, vectors.get(memory.id)!.vector), retrieval_source: 'local' as const, retrieval_method: 'semantic' as const }))
     .sort((left, right) => (right.score ?? 0) - (left.score ?? 0))

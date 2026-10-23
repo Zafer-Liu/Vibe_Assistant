@@ -78,6 +78,16 @@ jobs:
       - name: Install frontend dependencies
         run: cd frontend && npm ci
 
+      - name: Build MCP fallback launcher
+        shell: bash
+        run: |
+          cargo build --manifest-path src-tauri/mcp-launcher/Cargo.toml --release --target "${{ matrix.target }}"
+          mkdir -p src-tauri/binaries
+          suffix=''
+          if [[ '${{ matrix.os }}' == windows-* ]]; then suffix='.exe'; fi
+          cp "src-tauri/mcp-launcher/target/${{ matrix.target }}/release/mcp-launcher${suffix}" \
+             "src-tauri/binaries/mcp-launcher-${{ matrix.target }}${suffix}"
+
       - name: Build & publish release
         uses: tauri-apps/tauri-action@v0
         env:

@@ -119,7 +119,7 @@ function CopyButton({ value, label }: { value: string; label: string }) {
       onClick={copy}
       title={t('common.copy')}
       aria-label={`${t('common.copy')} ${label}`}
-      className="rounded p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:hover:bg-gray-800 dark:hover:text-gray-300"
+      className="rounded p-1 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:hover:bg-gray-800 dark:hover:text-gray-300"
     >
       {copied ? <Check className="h-3.5 w-3.5 text-emerald-500" /> : <Copy className="h-3.5 w-3.5" />}
     </button>
@@ -172,7 +172,7 @@ function StatCard({ title, value, hint, icon }: { title: string; value: string; 
         {icon}{title}
       </div>
       <p className="mt-1.5 break-all font-mono text-xl font-semibold text-gray-900 dark:text-gray-100">{value}</p>
-      {hint && <p className="mt-0.5 truncate text-xs text-gray-400 dark:text-gray-500">{hint}</p>}
+      {hint && <p className="mt-0.5 truncate text-xs text-gray-500 dark:text-gray-400">{hint}</p>}
     </div>
   )
 }
@@ -197,7 +197,7 @@ function SpeedStatValue({
         {(bps / 1_000_000).toFixed(1)}
         <span className="ml-1 font-sans text-[11px] font-normal text-gray-500 dark:text-gray-400">Mbps</span>
       </p>
-      <p className="mt-0.5 whitespace-nowrap font-mono text-[11px] text-gray-400 dark:text-gray-500">
+      <p className="mt-0.5 whitespace-nowrap font-mono text-[11px] text-gray-500 dark:text-gray-400">
         {(bps / 8 / 1_000_000).toFixed(1)} MB/s
       </p>
     </div>
@@ -211,7 +211,7 @@ function SpeedModeResultCard({ label, result }: { label: string; result: SpeedTe
     <div className="rounded-xl border border-gray-200 p-3.5 dark:border-gray-700">
       <p className="text-xs font-medium text-gray-500 dark:text-gray-400">{label}</p>
       {result.skipped ? (
-        <p className="mt-2 text-sm text-gray-400 dark:text-gray-500">
+        <p className="mt-2 text-sm text-gray-500 dark:text-gray-400">
           {result.skipped === 'no_proxy' ? t('network.proxySkipped') : t('network.modeSkipped')}
         </p>
       ) : (
@@ -384,7 +384,7 @@ export function NetworkManager() {
       <div className="border-b border-gray-200 bg-white px-6 py-4 dark:border-gray-700 dark:bg-gray-900">
         <div className="flex items-center justify-between">
           <div>
-            <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">{t('network.title')}</h2>
+            <h1 className="text-base font-semibold text-gray-900 dark:text-gray-100">{t('network.title')}</h1>
             <p className="text-xs text-gray-500 dark:text-gray-400">{t('network.subtitle', { count: interfaces.length })}</p>
           </div>
           <button
@@ -416,14 +416,14 @@ export function NetworkManager() {
               <p className="flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400">
                 <Wifi className="h-3.5 w-3.5" />{t('network.speedTitle')}
               </p>
-              <p className="text-[11px] text-gray-400 dark:text-gray-500">
+              <p className="text-[11px] text-gray-500 dark:text-gray-400">
                 <span className="mr-2 inline-flex items-center gap-1"><span className="inline-block h-0.5 w-3 rounded bg-emerald-500" />{t('network.download')}</span>
                 <span className="inline-flex items-center gap-1"><span className="inline-block h-0.5 w-3 rounded bg-sky-500" />{t('network.upload')}</span>
               </p>
             </div>
             <div className="mt-2 flex flex-wrap items-baseline gap-x-6 gap-y-1">
               {loading ? (
-                <p className="font-mono text-2xl font-semibold text-gray-400">—</p>
+                <p className="font-mono text-2xl font-semibold text-gray-500">—</p>
               ) : (
                 <>
                   <p className="flex items-baseline gap-1 whitespace-nowrap font-mono text-2xl font-semibold text-emerald-600 dark:text-emerald-400">
@@ -440,7 +440,7 @@ export function NetworkManager() {
               )}
             </div>
             <SpeedSparkline history={history} />
-            <p className="mt-1 text-[11px] text-gray-400 dark:text-gray-500">{t('network.speedHint')}</p>
+            <p className="mt-1 text-[11px] text-gray-500 dark:text-gray-400">{t('network.speedHint')}</p>
           </div>
 
           <StatCard
@@ -461,16 +461,16 @@ export function NetworkManager() {
                 disabled={ipState === 'loading'}
                 title={t('network.refresh')}
                 aria-label={t('network.refresh')}
-                className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:hover:bg-gray-800 dark:hover:text-gray-300"
+                className="rounded p-1 text-gray-500 hover:bg-gray-100 hover:text-gray-600 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:hover:bg-gray-800 dark:hover:text-gray-300"
               >
                 <RefreshCw className={`h-3.5 w-3.5 ${ipState === 'loading' ? 'animate-spin' : ''}`} />
               </button>
             </div>
-            {ipState === 'loading' && <p className="mt-1.5 text-sm text-gray-400 dark:text-gray-500">{t('network.ipFetching')}</p>}
+            {ipState === 'loading' && <p className="mt-1.5 text-sm text-gray-500 dark:text-gray-400">{t('network.ipFetching')}</p>}
             {ipState === 'error' && (
               <div className="mt-1.5">
                 <p className="text-sm text-amber-600 dark:text-amber-400">{t('network.ipFailed')}</p>
-                <p className="mt-0.5 break-words text-xs text-gray-400 dark:text-gray-500">{ipError}</p>
+                <p className="mt-0.5 break-words text-xs text-gray-500 dark:text-gray-400">{ipError}</p>
               </div>
             )}
             {ipState === 'ready' && (
@@ -478,14 +478,14 @@ export function NetworkManager() {
                 <div className="flex items-center justify-between gap-2">
                   <p className="break-all font-mono text-lg font-semibold text-gray-900 dark:text-gray-100">
                     <span className="mr-1.5 rounded bg-blue-50 px-1 py-0.5 font-sans text-[10px] font-medium text-blue-600 dark:bg-blue-900/30 dark:text-blue-400">{t('network.directIp')}·IPv4</span>
-                    {publicIp?.ipv4 ?? <span className="text-sm font-normal text-gray-400">{t('network.ipUnavailable')}</span>}
+                    {publicIp?.ipv4 ?? <span className="text-sm font-normal text-gray-500">{t('network.ipUnavailable')}</span>}
                   </p>
                   {publicIp?.ipv4 && <CopyButton value={publicIp.ipv4} label={t('network.publicIpv4')} />}
                 </div>
                 <div className="flex items-center justify-between gap-2 border-t border-gray-100 pt-1.5 dark:border-gray-800">
                   <p className="break-all font-mono text-sm text-gray-600 dark:text-gray-300">
                     <span className="mr-1.5 rounded bg-purple-50 px-1 py-0.5 font-sans text-[10px] font-medium text-purple-600 dark:bg-purple-900/30 dark:text-purple-400">{t('network.directIp')}·IPv6</span>
-                    {publicIp?.ipv6 ?? <span className="text-gray-400">{t('network.ipUnavailable')}</span>}
+                    {publicIp?.ipv6 ?? <span className="text-gray-500">{t('network.ipUnavailable')}</span>}
                   </p>
                   {publicIp?.ipv6 && <CopyButton value={publicIp.ipv6} label={t('network.publicIpv6')} />}
                 </div>
@@ -495,7 +495,7 @@ export function NetworkManager() {
                       <span className="mr-1.5 rounded bg-blue-50 px-1 py-0.5 font-sans text-[10px] font-medium text-blue-600 dark:bg-blue-900/30 dark:text-blue-400">{t('network.proxyEgress')}·IPv4</span>
                       {publicIp.proxy.ipv4
                         ?? <span className="font-sans text-xs text-amber-500 dark:text-amber-400">{t('network.proxyUnreachable')}</span>}
-                      <span className="ml-1.5 font-sans text-[11px] text-gray-400">({publicIp.proxy.server})</span>
+                      <span className="ml-1.5 font-sans text-[11px] text-gray-500">({publicIp.proxy.server})</span>
                       {publicIp.proxy.ipv6 && (
                         <span className="ml-1.5 inline-flex items-center gap-1">
                           <span className="rounded bg-purple-50 px-1 py-0.5 font-sans text-[10px] font-medium text-purple-600 dark:bg-purple-900/30 dark:text-purple-400">IPv6</span>
@@ -507,7 +507,7 @@ export function NetworkManager() {
                   </div>
                 )}
                 {!publicIp?.proxy && (
-                  <p className="border-t border-gray-100 pt-1.5 text-[11px] text-gray-400 dark:border-gray-800 dark:text-gray-500">{t('network.noProxy')}</p>
+                  <p className="border-t border-gray-100 pt-1.5 text-[11px] text-gray-500 dark:border-gray-800 dark:text-gray-400">{t('network.noProxy')}</p>
                 )}
                 {!publicIp?.ipv4 && (
                   <p className="border-t border-gray-100 pt-1.5 text-[11px] text-amber-500 dark:border-gray-800 dark:text-amber-400">{t('network.directFailedHint')}</p>
@@ -595,17 +595,17 @@ export function NetworkManager() {
                   <li key={item.name} className={`flex flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3 ${muted ? 'opacity-60' : ''}`}>
                     <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-2">
-                        <Wifi className="h-3.5 w-3.5 shrink-0 text-gray-400" />
+                        <Wifi className="h-3.5 w-3.5 shrink-0 text-gray-500" />
                         <span className="text-sm font-medium text-gray-900 dark:text-gray-100">{item.name}</span>
                         {item.is_loopback && (
                           <span className="rounded bg-gray-100 px-1.5 py-0.5 text-[10px] text-gray-500 dark:bg-gray-800 dark:text-gray-400">{t('network.loopback')}</span>
                         )}
-                        {item.mac && <span className="font-mono text-[11px] text-gray-400 dark:text-gray-500">{item.mac}</span>}
-                        {item.mtu > 0 && <span className="text-[11px] text-gray-400 dark:text-gray-500">MTU {item.mtu}</span>}
+                        {item.mac && <span className="font-mono text-[11px] text-gray-500 dark:text-gray-400">{item.mac}</span>}
+                        {item.mtu > 0 && <span className="text-[11px] text-gray-500 dark:text-gray-400">MTU {item.mtu}</span>}
                       </div>
                       <div className="mt-1 flex flex-wrap gap-1.5">
                         {[...item.ipv4, ...item.ipv6].length === 0 ? (
-                          <span className="text-xs text-gray-400 dark:text-gray-500">{t('network.noIp')}</span>
+                          <span className="text-xs text-gray-500 dark:text-gray-400">{t('network.noIp')}</span>
                         ) : (
                           <>
                             {item.ipv4.map(cidr => (
@@ -626,7 +626,7 @@ export function NetworkManager() {
                     </div>
                     {/* 实时速率集中在「实时流量」卡展示，这里只保留各接口累计流量 */}
                     {speed && (
-                      <p className="shrink-0 text-right text-[11px] text-gray-400 dark:text-gray-500">
+                      <p className="shrink-0 text-right text-[11px] text-gray-500 dark:text-gray-400">
                         {t('network.totalRx')} {formatBytes(speed.rx_total_bytes)} · {t('network.totalTx')} {formatBytes(speed.tx_total_bytes)}
                       </p>
                     )}

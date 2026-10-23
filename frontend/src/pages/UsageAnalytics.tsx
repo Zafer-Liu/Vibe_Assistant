@@ -5,11 +5,11 @@ import {
   Activity, BarChart3, CalendarDays, ChevronDown, Database, FileClock,
   Calculator, Gauge, Grid3X3, RefreshCw, SlidersHorizontal, Sparkles, Zap,
 } from 'lucide-react'
-import { useMemoryStore } from '../store/memoryStore'
+import { useTelemetryFields } from '../store/telemetryStore'
 import { useVisiblePolling } from '../hooks/useVisiblePolling'
 import { useTheme } from '../theme'
 import { ErrorRecovery } from '../components/ErrorRecovery'
-import type { TelemetryUsageAnalytics, TelemetryUsageBucket, TelemetryUsageCostGroup, TelemetryUsageHeatCell, TelemetryUsageRecord } from '../types/memory'
+import type { TelemetryUsageAnalytics, TelemetryUsageBucket, TelemetryUsageCostGroup, TelemetryUsageHeatCell, TelemetryUsageRecord } from '../types/telemetry'
 import { intlLocale, getLanguage } from '../i18n'
 
 type RangeKey = 'today' | '7d' | '30d' | 'all'
@@ -104,7 +104,7 @@ function compactAmount(value: number) {
 }
 
 function sourceLabel(source: string) {
-  return ({ codex: 'Codex', claude: 'Claude Code', qoder: 'Qoder', workbuddy: 'WorkBuddy', minimax: 'MiniMax Code', kimi: 'Kimi', copilot: 'GitHub Copilot', gemini: 'Gemini CLI', opencode: 'OpenCode', openclaw: 'OpenClaw', pi: 'Pi', grokbuild: 'Grok Build' } as Record<string, string>)[source] ?? source
+  return ({ codex: 'Codex', claude: 'Claude Code', qoder: 'Qoder', workbuddy: 'WorkBuddy', minimax: 'MiniMax Code', kimi: 'Kimi', copilot: 'GitHub Copilot', zcode: 'ZCode', dsh: 'DeepSeek Harness', gemini: 'Gemini CLI', opencode: 'OpenCode', openclaw: 'OpenClaw', pi: 'Pi', grokbuild: 'Grok Build' } as Record<string, string>)[source] ?? source
 }
 
 function parseTime(value: string) {
@@ -229,7 +229,7 @@ function UsageHeatmap({ cells, loading }: { cells: TelemetryUsageHeatCell[]; loa
         <div className="mt-5 overflow-x-auto pb-1">
           <div className="grid min-w-[690px] grid-cols-[3.5rem_repeat(24,minmax(1.25rem,1fr))] gap-1" role="img" aria-label={t('memory.usage.heatmapDesc')}>
             <span />
-            {Array.from({ length: 24 }, (_, hour) => <span key={hour} className="text-center font-mono text-[9px] tabular-nums text-slate-400">{hour % 3 === 0 ? hour.toString().padStart(2, '0') : ''}</span>)}
+            {Array.from({ length: 24 }, (_, hour) => <span key={hour} className="text-center font-mono text-[9px] tabular-nums text-slate-500">{hour % 3 === 0 ? hour.toString().padStart(2, '0') : ''}</span>)}
             {dayOrder.flatMap(weekday => {
               const label = dayLabel(weekday)
               return [
@@ -394,12 +394,12 @@ function UsageCalendar({ buckets, loading }: { buckets: TelemetryUsageBucket[]; 
             <div className="flex w-8 shrink-0 flex-col gap-[3px]">
               <span className="h-4" />
               {[0, 1, 2, 3, 4, 5, 6].map(row => (
-                <span key={row} className="h-[11px] text-[10px] leading-[11px] text-slate-400 dark:text-slate-500">{row % 2 === 0 ? weekdayLabels[row / 2] : ''}</span>
+                <span key={row} className="h-[11px] text-[10px] leading-[11px] text-slate-500 dark:text-slate-400">{row % 2 === 0 ? weekdayLabels[row / 2] : ''}</span>
               ))}
             </div>
             {weeks.map((week, index) => (
               <div key={index} className="flex min-w-[11px] flex-1 flex-col gap-[3px]">
-                <span className="h-4 whitespace-nowrap text-[10px] font-medium leading-4 text-slate-400 dark:text-slate-500">{week.monthLabel}</span>
+                <span className="h-4 whitespace-nowrap text-[10px] font-medium leading-4 text-slate-500 dark:text-slate-400">{week.monthLabel}</span>
                 {week.days.map(day => {
                   if (day.future) return <span key={day.key} className="h-[11px]" />
                   const title = cellTitle(day, week)
@@ -496,7 +496,7 @@ function PricingEstimator({
           return <div key={key} className="grid gap-3 rounded-xl bg-slate-50 px-3 py-3 dark:bg-slate-950/50 lg:grid-cols-[minmax(10rem,1fr)_repeat(3,minmax(6rem,0.65fr))_7rem] lg:items-end">
             <div className="min-w-0"><p className="truncate text-sm font-medium text-slate-800 dark:text-slate-100">{group.model || t('memory.usage.costUnknownModel')}</p><p className="mt-0.5 text-xs text-slate-500">{sourceLabel(group.source)} · {compactAmount(group.input_tokens + group.output_tokens)}</p></div>
             {(['input', 'output', 'cache'] as const).map(field => <label key={field} className="text-xs text-slate-500 dark:text-slate-400"><span className="mb-1 block">{t(`memory.usage.cost${field === 'input' ? 'Input' : field === 'output' ? 'Output' : 'Cache'}Rate`)}</span><input type="number" min="0" step="0.01" inputMode="decimal" value={rule[field] || ''} onChange={event => update(group, field, event.target.value)} className="h-9 w-full rounded-lg border border-slate-200 bg-white px-2.5 font-mono text-sm tabular-nums text-slate-800 outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/15 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100" /></label>)}
-            <div className="text-right"><p className="text-[11px] text-slate-400">{t('memory.usage.costEstimated')}</p><p className="mt-1 font-mono text-sm font-semibold tabular-nums">{estimate === null ? '—' : new Intl.NumberFormat(intlLocale(), { style: 'currency', currency: 'USD', minimumFractionDigits: estimate < 1 ? 4 : 2, maximumFractionDigits: estimate < 1 ? 4 : 2 }).format(estimate)}</p></div>
+            <div className="text-right"><p className="text-[11px] text-slate-500">{t('memory.usage.costEstimated')}</p><p className="mt-1 font-mono text-sm font-semibold tabular-nums">{estimate === null ? '—' : new Intl.NumberFormat(intlLocale(), { style: 'currency', currency: 'USD', minimumFractionDigits: estimate < 1 ? 4 : 2, maximumFractionDigits: estimate < 1 ? 4 : 2 }).format(estimate)}</p></div>
           </div>
         })}
       </div>
@@ -506,7 +506,7 @@ function PricingEstimator({
 
 export const UsageAnalytics = memo(function UsageAnalytics({ active = true }: { active?: boolean }) {
   const { t } = useTranslation()
-  const { loadUsageAnalytics, checkTelemetry } = useMemoryStore()
+  const { loadUsageAnalytics, checkTelemetry } = useTelemetryFields('loadUsageAnalytics', 'checkTelemetry')
   const [tab, setTab] = useState<TabKey>('trend')
   const [range, setRange] = useState<RangeKey>('today')
   const [source, setSource] = useState('all')
@@ -600,16 +600,16 @@ export const UsageAnalytics = memo(function UsageAnalytics({ active = true }: { 
     } finally { setRefreshing(false); setLoading(false) }
   }
 
-  return <main className="h-full overflow-y-auto bg-[#fbfcfe] text-slate-900 dark:bg-slate-950 dark:text-slate-100">
+  return <main className="fluent-usage h-full overflow-y-auto bg-gray-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
     <div className="mx-auto max-w-[1500px] px-5 py-6 lg:px-9 lg:py-8">
-      <header className="flex flex-wrap items-start justify-between gap-4">
+      <header className="fluent-page-header flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold tracking-[-0.025em]">{t('nav.usage')}</h1>
           <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">{t('memory.usage.desc')}</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <label className="sr-only" htmlFor="usage-source">{t('memory.usage.sourceLabel')}</label><div className="relative"><select id="usage-source" value={source} onChange={event => setSource(event.target.value)} className="h-10 appearance-none rounded-lg border border-slate-200 bg-white py-0 pl-3 pr-9 text-sm font-medium text-slate-700 outline-none transition hover:border-slate-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"><option value="all">{t('memory.usage.allSources')}</option>{(analytics?.sources ?? []).map(item => <option key={item} value={item}>{sourceLabel(item)}</option>)}</select><ChevronDown size={16} className="pointer-events-none absolute right-3 top-3 text-slate-400" /></div>
-          <div className="relative"><select value={range} onChange={event => setRange(event.target.value as RangeKey)} className="h-10 appearance-none rounded-lg border border-slate-200 bg-white py-0 pl-9 pr-9 text-sm font-medium text-slate-700 outline-none transition hover:border-slate-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"><option value="today">{t('memory.usage.rangeToday')}</option><option value="7d">{t('memory.usage.range7d')}</option><option value="30d">{t('memory.usage.range30d')}</option><option value="all">{t('memory.usage.rangeAll')}</option></select><CalendarDays size={16} className="pointer-events-none absolute left-3 top-3 text-slate-400" /><ChevronDown size={16} className="pointer-events-none absolute right-3 top-3 text-slate-400" /></div>
+          <label className="sr-only" htmlFor="usage-source">{t('memory.usage.sourceLabel')}</label><div className="relative"><select id="usage-source" value={source} onChange={event => setSource(event.target.value)} className="h-10 appearance-none rounded-lg border border-slate-200 bg-white py-0 pl-3 pr-9 text-sm font-medium text-slate-700 outline-none transition hover:border-slate-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"><option value="all">{t('memory.usage.allSources')}</option>{(analytics?.sources ?? []).map(item => <option key={item} value={item}>{sourceLabel(item)}</option>)}</select><ChevronDown size={16} className="pointer-events-none absolute right-3 top-3 text-slate-500" /></div>
+          <div className="relative"><select value={range} onChange={event => setRange(event.target.value as RangeKey)} className="h-10 appearance-none rounded-lg border border-slate-200 bg-white py-0 pl-9 pr-9 text-sm font-medium text-slate-700 outline-none transition hover:border-slate-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"><option value="today">{t('memory.usage.rangeToday')}</option><option value="7d">{t('memory.usage.range7d')}</option><option value="30d">{t('memory.usage.range30d')}</option><option value="all">{t('memory.usage.rangeAll')}</option></select><CalendarDays size={16} className="pointer-events-none absolute left-3 top-3 text-slate-500" /><ChevronDown size={16} className="pointer-events-none absolute right-3 top-3 text-slate-500" /></div>
           <button type="button" onClick={() => { void refresh() }} disabled={refreshing} className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:bg-slate-50 disabled:cursor-wait disabled:opacity-60 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"><RefreshCw size={16} className={refreshing ? 'animate-spin motion-reduce:animate-none' : ''} />{t('memory.usage.rescan')}</button>
         </div>
       </header>
@@ -618,9 +618,10 @@ export const UsageAnalytics = memo(function UsageAnalytics({ active = true }: { 
         <ErrorRecovery onRetry={() => { void refresh() }} disabled={refreshing} />
       </div>}
 
+
       <section className="mt-7 rounded-2xl border border-slate-200 bg-white p-5 shadow-[0_1px_2px_rgba(15,23,42,0.03)] dark:border-slate-800 dark:bg-slate-900 sm:p-7" aria-label={t('memory.usage.overviewLabel')}>
-        <div className="flex flex-wrap items-start justify-between gap-5"><div className="flex items-center gap-4"><span className="grid h-12 w-12 place-items-center rounded-2xl bg-blue-50 text-blue-500 dark:bg-blue-500/15 dark:text-blue-300"><Zap size={25} /></span><div><p className="text-sm font-medium text-slate-500 dark:text-slate-400">{t('memory.usage.totalLabel')}</p><p className="mt-0.5 font-mono text-3xl font-semibold tracking-[-0.04em] tabular-nums sm:text-4xl">{loading ? '—' : amount(currentTotal)}</p><p className="mt-1 text-xs text-slate-400">{loading ? t('memory.usage.totalLoading') : `${t('memory.usage.totalSubtext', { value: compactAmount(currentTotal) })}${estimatedTokens > 0 ? ` · ${t('memory.usage.totalSubtextEstimated', { pct: estimatedShare >= 1 ? estimatedShare.toFixed(0) : '<1' })}` : ''}`}</p></div></div><div className="grid min-w-[14rem] grid-cols-2 divide-x divide-slate-100 rounded-xl border border-slate-100 dark:divide-slate-800 dark:border-slate-800"><div className="px-4 py-3"><p className="text-xs font-medium text-slate-500">{t('memory.usage.ledgerLabel')}</p><p className="mt-1 font-mono text-xl font-semibold tabular-nums">{loading ? '—' : amount(analytics?.record_count ?? 0)}</p></div><div className="px-4 py-3"><p className="text-xs font-medium text-slate-500">{t('memory.usage.detailLabel')}</p><p className="mt-1 text-sm font-semibold text-slate-600 dark:text-slate-300">{loading ? '—' : analytics?.truncated_records ? t('memory.usage.detailLatest') : t('memory.usage.detailAll')}</p></div></div></div>
-        <div className="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-4"><Metric icon={<BarChart3 size={16} />} label={t('memory.usage.inputLabel')} value={amount(totals.input)} tone="blue" /><Metric icon={<Sparkles size={16} />} label={t('memory.usage.outputLabel')} value={amount(totals.output)} tone="violet" /><Metric icon={<Database size={16} />} label={t('memory.usage.cacheLabel')} value={amount(totals.cache)} tone="emerald" /><div className="rounded-xl border border-slate-100 px-4 py-3 dark:border-slate-800"><div className="flex items-center justify-between text-sm text-slate-500"><span>{t('memory.usage.cacheHitLabel')}</span>{analytics && analytics.cache_capable === false ? <span className="font-semibold text-slate-400 dark:text-slate-500">—</span> : <span className="font-semibold text-emerald-600 dark:text-emerald-400">{Math.min(100, cacheRatio).toFixed(1)}%</span>}</div>{analytics && analytics.cache_capable === false ? <p className="mt-3 text-xs leading-5 text-slate-400 dark:text-slate-500">{t('memory.usage.cacheUnavailable')}</p> : <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800"><div className="h-full rounded-full bg-emerald-500 transition-[width] duration-200 motion-reduce:transition-none" style={{ width: `${Math.min(100, cacheRatio)}%` }} /></div>}</div></div>
+        <div className="flex flex-wrap items-start justify-between gap-5"><div className="flex items-center gap-4"><span className="grid h-12 w-12 place-items-center rounded-2xl bg-blue-50 text-blue-500 dark:bg-blue-500/15 dark:text-blue-300"><Zap size={25} /></span><div><p className="text-sm font-medium text-slate-500 dark:text-slate-400">{t('memory.usage.totalLabel')}</p><p className="mt-0.5 font-mono text-3xl font-semibold tracking-[-0.04em] tabular-nums sm:text-4xl">{loading ? '—' : amount(currentTotal)}</p><p className="mt-1 text-xs text-slate-500">{loading ? t('memory.usage.totalLoading') : `${t('memory.usage.totalSubtext', { value: compactAmount(currentTotal) })}${estimatedTokens > 0 ? ` · ${t('memory.usage.totalSubtextEstimated', { pct: estimatedShare >= 1 ? estimatedShare.toFixed(0) : '<1' })}` : ''}`}</p></div></div><div className="grid min-w-[14rem] grid-cols-2 divide-x divide-slate-100 rounded-xl border border-slate-100 dark:divide-slate-800 dark:border-slate-800"><div className="px-4 py-3"><p className="text-xs font-medium text-slate-500">{t('memory.usage.ledgerLabel')}</p><p className="mt-1 font-mono text-xl font-semibold tabular-nums">{loading ? '—' : amount(analytics?.record_count ?? 0)}</p></div><div className="px-4 py-3"><p className="text-xs font-medium text-slate-500">{t('memory.usage.detailLabel')}</p><p className="mt-1 text-sm font-semibold text-slate-600 dark:text-slate-300">{loading ? '—' : analytics?.truncated_records ? t('memory.usage.detailLatest') : t('memory.usage.detailAll')}</p></div></div></div>
+        <div className="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-4"><Metric icon={<BarChart3 size={16} />} label={t('memory.usage.inputLabel')} value={amount(totals.input)} tone="blue" /><Metric icon={<Sparkles size={16} />} label={t('memory.usage.outputLabel')} value={amount(totals.output)} tone="violet" /><Metric icon={<Database size={16} />} label={t('memory.usage.cacheLabel')} value={amount(totals.cache)} tone="emerald" /><div className="rounded-xl border border-slate-100 px-4 py-3 dark:border-slate-800"><div className="flex items-center justify-between text-sm text-slate-500"><span>{t('memory.usage.cacheHitLabel')}</span>{analytics && analytics.cache_capable === false ? <span className="font-semibold text-slate-500 dark:text-slate-400">—</span> : <span className="font-semibold text-emerald-600 dark:text-emerald-400">{Math.min(100, cacheRatio).toFixed(1)}%</span>}</div>{analytics && analytics.cache_capable === false ? <p className="mt-3 text-xs leading-5 text-slate-500 dark:text-slate-400">{t('memory.usage.cacheUnavailable')}</p> : <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800"><div className="h-full rounded-full bg-emerald-500 transition-[width] duration-200 motion-reduce:transition-none" style={{ width: `${Math.min(100, cacheRatio)}%` }} /></div>}</div></div>
       </section>
 
       <UsageCalendar buckets={calendarBuckets ?? []} loading={calendarBuckets === null} />
@@ -650,6 +651,6 @@ function TrendMarker({ x, y, tone }: { x: number; y: number; tone: string }) { r
 
 function UsageRecords({ events, truncated }: { events: TelemetryUsageRecord[]; truncated: boolean }) {
   const { t } = useTranslation()
-  if (!events.length) return <div className="flex min-h-64 flex-col items-center justify-center text-center"><span className="grid h-11 w-11 place-items-center rounded-xl bg-slate-100 text-slate-400 dark:bg-slate-800"><FileClock size={20} /></span><h2 className="mt-3 font-medium">{t('memory.usage.recordsEmptyTitle')}</h2><p className="mt-1 max-w-md text-sm text-slate-500">{t('memory.usage.recordsEmptyDesc')}</p></div>
+  if (!events.length) return <div className="flex min-h-64 flex-col items-center justify-center text-center"><span className="grid h-11 w-11 place-items-center rounded-xl bg-slate-100 text-slate-500 dark:bg-slate-800"><FileClock size={20} /></span><h2 className="mt-3 font-medium">{t('memory.usage.recordsEmptyTitle')}</h2><p className="mt-1 max-w-md text-sm text-slate-500">{t('memory.usage.recordsEmptyDesc')}</p></div>
   return <><div className="mt-4 flex items-center justify-between text-xs text-slate-500 dark:text-slate-400"><span>{t('memory.usage.tableInfoOrder')}</span>{truncated && <span>{t('memory.usage.tableInfoTruncated')}</span>}</div><div className="mt-2 overflow-x-auto rounded-xl border border-slate-100 dark:border-slate-800"><table className="min-w-[850px] w-full text-left text-sm"><thead className="border-b border-slate-100 bg-slate-50/80 text-xs font-medium text-slate-500 dark:border-slate-800 dark:bg-slate-950/40"><tr><th className="px-5 py-3.5">{t('memory.usage.thTime')}</th><th className="px-5 py-3.5">{t('memory.usage.thSource')}</th><th className="px-5 py-3.5">{t('memory.usage.thModel')}</th><th className="px-5 py-3.5 text-right">{t('memory.usage.thInput')}</th><th className="px-5 py-3.5 text-right">{t('memory.usage.thOutput')}</th><th className="px-5 py-3.5 text-right">{t('memory.usage.thCache')}</th><th className="px-5 py-3.5 text-right">{t('memory.usage.thTotal')}</th><th className="px-5 py-3.5">{t('memory.usage.thOrigin')}</th></tr></thead><tbody className="divide-y divide-slate-100 dark:divide-slate-800">{events.map(event => <tr key={event.record_id} className="transition hover:bg-slate-50/70 dark:hover:bg-slate-800/40"><td className="whitespace-nowrap px-5 py-4 font-mono text-xs text-slate-500">{displayTime(event.occurred_at)}</td><td className="px-5 py-4 font-medium">{sourceLabel(event.source)}</td><td className="px-5 py-4 text-slate-600 dark:text-slate-300"><span className="rounded bg-slate-100 px-2 py-1 text-xs dark:bg-slate-800">{event.model ?? (event.record_kind === 'session_total' ? t('memory.usage.modelSessionTotal') : t('memory.usage.modelUnset'))}</span></td><td className="px-5 py-4 text-right font-mono tabular-nums">{amount(event.input_tokens)}</td><td className="px-5 py-4 text-right font-mono tabular-nums">{amount(event.output_tokens)}</td><td className="px-5 py-4 text-right font-mono tabular-nums text-emerald-600 dark:text-emerald-400">{amount(event.cached_tokens)}</td><td className="px-5 py-4 text-right font-mono font-semibold tabular-nums">{amount(tokenTotal(event))}</td><td className="px-5 py-4"><span className={event.origin.startsWith('native') || event.origin.startsWith('adapter') ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'}>{event.origin.startsWith('native') ? t('memory.usage.originLog') : event.origin.startsWith('adapter') ? t('memory.usage.originReported') : t('memory.usage.originEstimated')}</span></td></tr>)}</tbody></table></div></>
 }

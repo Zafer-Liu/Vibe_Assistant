@@ -34,6 +34,9 @@ jobs:
       - name: Lint and build
         run: npm run check
 
+      - name: MCP configuration regression tests
+        run: node --test ../tools/test-mcp-configuration.mjs
+
   rust:
     name: Rust tests
     runs-on: ubuntu-22.04
@@ -52,6 +55,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+
+      - name: Build MCP fallback launcher
+        run: node tools/build-mcp-launcher.mjs
 
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked

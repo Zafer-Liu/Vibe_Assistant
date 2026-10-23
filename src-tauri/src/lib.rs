@@ -1,60 +1,60 @@
-mod agent;
+mod agent_cli;
 mod agent_http;
 mod agent_sources;
 mod backup;
-mod cloud_sync;
-#[cfg(test)]
-mod test_http;
-mod commands;
+pub mod cloud_sync;
 mod env_manager;
-mod github;
+mod desktop_lifecycle;
+mod dsh_injection;
+mod dsh_mcp;
+mod dsh_observe;
+mod dsh_transcript;
+mod equipment_profiles;
 mod llm;
+mod llm_trace;
+mod model_registry;
 mod mcp;
+mod mcp_fallback_resolver;
+#[path = "../mcp-launcher/src/installation.rs"]
+mod mcp_launcher_installation;
 mod mcp_registry;
+mod mcp_stdio_relay;
+mod mcp_tool_discovery;
 mod memory_backend;
 mod memory_ingest;
 mod memory_mcp;
-mod mobile_status;
 mod network_info;
 mod ports;
+mod pricing;
 mod process_util;
-mod proxy;
-mod pty;
-mod skill_registry;
+mod provider_catalog;
+mod provider_store;
 mod skill_marketplace;
+mod skill_registry;
 mod startup;
 mod telemetry_store;
+#[cfg(test)]
+mod test_http;
 mod thinking;
-mod ui_window;
 mod updater;
 mod vault_remote;
-mod worktree;
 
-use agent_http::*;
-use commands::*;
-use github::*;
 use llm::*;
 use mcp::*;
 use memory_backend::*;
 use memory_ingest::*;
 use memory_mcp::*;
 use ports::*;
-use proxy::*;
-use pty::*;
 use skill_registry::*;
 use tauri::{Emitter, Manager};
 use telemetry_store::*;
-use ui_window::*;
 use updater::*;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(startup::parse_options(std::env::args()))
-        .manage(agent::AgentStore::new())
-        .manage(pty::PtyStore::new())
-        .manage(ui_window::UiWebviewStore::new())
-        .manage(proxy::TunnelStore::new())
+        .manage(desktop_lifecycle::DesktopLifecycle::default())
         .manage(memory_backend::MemoryBackend::new())
         .manage(memory_ingest::IngestStore::new())
         .manage(telemetry_store::TelemetryStore::new().expect("initialize telemetry store"))
@@ -62,19 +62,10 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_dialog::init())
-        .on_window_event(|window, event| {
-            // `Child` does not terminate its process on Drop.  If the optional
-            // memory backend was explicitly started, stop only the children we
-            // own when the main window is destroyed.
-            if matches!(event, tauri::WindowEvent::Destroyed) {
-                window
-                    .app_handle()
-                    .state::<memory_backend::MemoryBackend>()
-                    .stop();
-            }
-        })
+        .on_window_event(desktop_lifecycle::on_window_event)
         .setup(|_app| {
-            // 初始化全局 AgentHttpStore 并启动 HTTP server（固定端口，供记忆沉淀/遥测/agent 回调使用）
+            desktop_lifecycle::setup(_app.handle());
+            // Local memory context, capture hooks and usage telemetry share port 9420.
             let store = agent_http::init_store();
             tauri::async_runtime::spawn(async move {
                 agent_http::start_agent_http_server(agent_http::AGENT_HTTP_PORT, store).await;
@@ -104,6 +95,27 @@ pub fn run() {
                 let _ = memory_ingest::telemetry_backfill_conversations();
                 if let Some(store) = telemetry_store::shared_store() {
                     let _ = store.refresh_transcript_usage();
+                    // PRD 一期：models.dev 目录每日同步 + 历史成本回填
+                    //（只补 pricing_source IS NULL 的行，分批不锁库）。
+                    if crate::provider_store::catalog_sync_needed(&store) {
+                        let synced =
+                            crate::provider_catalog::fetch_models_dev()
+                                .ok()
+                                .and_then(|rows| {
+                                    store.conn.lock().ok().and_then(|conn| {
+                                        crate::provider_catalog::apply_model_catalog_impl(
+                                            &conn, &rows,
+                                        )
+                                        .ok()
+                                    })
+                                });
+                        if synced.is_some() && store.invalidate_catalog_prices().is_ok() {
+                            crate::provider_store::mark_catalog_synced(&store);
+                        }
+                    }
+                    let _ = store.recalculate_costs(false);
+                    // 启动时抓一次 HTTP 配额（magpie/直连端点），带 1 分钟
+                    // 节流，重复启动不会打爆供应商端点。
                 }
                 // The startup rebuild races the frontend's first read; ping
                 // the frontend so an open usage page re-queries the ledger.
@@ -119,22 +131,12 @@ pub fn run() {
             telemetry_store::start_usage_refresh_scheduler(_app.handle().clone());
             // 云端记忆库定时同步（每分钟检查设置，无需重启）
             cloud_sync::start_cloud_sync_scheduler();
-            tauri::async_runtime::spawn(mobile_status::start_mobile_status_server());
+            // 向量索引定时增量构建：新整理的记忆无需等检索即可被语义命中。
+            memory_backend::start_embedding_auto_build_scheduler(_app.handle().clone());
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            list_agents,
-            detect_agent_clis,
-            import_detected_agent_clis,
-            start_agent,
-            stop_agent,
-            get_agent_logs,
-            resolve_agent_cwd,
-            save_agent_config,
-            delete_agent,
-            get_port_status,
-            scan_project_dir,
             // MCP
             list_mcp_servers,
             save_mcp_server,
@@ -156,45 +158,6 @@ pub fn run() {
             ollama_config_get,
             ollama_config_set,
             test_ollama_connection,
-            // Agent HTTP spike (phase 4)
-            dispatch_agent_task,
-            list_agent_tasks,
-            list_agent_results,
-            // PTY terminal
-            pty_start,
-            pty_write,
-            pty_resize,
-            pty_stop,
-            pty_resolve_debug,
-            // Proxy (Caddy)
-            proxy_get_config,
-            proxy_save_config,
-            proxy_check_caddy,
-            proxy_hash_password,
-            proxy_apply,
-            proxy_stop,
-            proxy_status,
-            proxy_get_caddyfile,
-            proxy_preview_caddyfile,
-            // Cloudflare Tunnel
-            tunnel_check_cloudflared,
-            tunnel_start,
-            tunnel_stop,
-            tunnel_stop_all,
-            tunnel_list,
-            tunnel_alive,
-            // GitHub install
-            github_fetch_repo_info,
-            github_clone_repo,
-            github_check_git,
-            github_get_proxy,
-            github_save_token,
-            github_token_status,
-            // Agent UI window
-            open_agent_ui_webview,
-            update_agent_ui_webview,
-            fullscreen_agent_ui_webview,
-            close_agent_ui_webview,
             // Updater
             check_for_update,
             get_app_version,
@@ -203,6 +166,14 @@ pub fn run() {
             memory_backend_start,
             memory_backend_stop,
             memory_backend_request,
+            memory_backend::memory_semantic_config_get,
+            memory_backend::memory_semantic_config_set,
+            memory_backend::memory_semantic_test,
+            memory_backend::memory_semantic_embed_texts,
+            memory_backend::memory_semantic_index_status,
+            memory_backend::memory_semantic_index_build,
+            memory_backend::memory_embedding_auto_build_get,
+            memory_backend::memory_embedding_auto_build_set,
             memory_backend::memory_consolidate,
             memory_backend::memory_consolidation_restore,
             memory_backend::memory_importance_refresh,
@@ -240,8 +211,10 @@ pub fn run() {
             // Agent 数据源（跨设备目录覆盖）
             agent_sources::agent_sources_list,
             agent_sources::agent_source_set_override,
+            agent_sources::agent_source_set_scan_enabled,
             // Shared memory MCP (Codex / Claude one-click setup)
             memory_mcp_status,
+            memory_mcp_runtime_status,
             memory_mcp_install,
             memory_mcp_uninstall,
             claude_desktop_mcp_config_get,
@@ -253,8 +226,19 @@ pub fn run() {
             telemetry_recent_events,
             telemetry_usage_records,
             telemetry_usage_analytics,
+            telemetry_recalculate_costs,
+            provider_store::list_providers,
+            provider_store::save_provider,
+            provider_store::delete_provider,
+            provider_store::sync_model_catalog,
+            provider_store::set_model_price_override,
+            provider_store::get_provider_usage_summary,
             telemetry_search_conversations,
             memory_mcp_access_logs,
+            telemetry_refresh_mcp_calls,
+            telemetry_mcp_stats,
+            telemetry_mcp_dashboard,
+            telemetry_mcp_failed_calls,
             memory_injection_stats,
             memory_ingest::telemetry_backfill_conversations,
             // Shared Skill registry
@@ -286,11 +270,25 @@ pub fn run() {
             mcp_registry::mcp_equip,
             mcp_registry::mcp_unequip,
             mcp_registry::mcp_status_all,
+            mcp_registry::mcp_observation_status_all,
+            mcp_registry::mcp_observation_set,
+            dsh_observe::dsh_observation_status,
+            dsh_observe::dsh_observation_set,
             mcp_registry::mcp_import_from_agents,
+            mcp_registry::mcp_configuration_compare,
+            mcp_registry::mcp_configuration_resolve,
             mcp_registry::mcp_sync_agent,
             mcp_registry::mcp_profile_list,
+            equipment_profiles::equipment_profile_list,
+            equipment_profiles::equipment_profile_save,
+            equipment_profiles::equipment_profile_delete,
+            equipment_profiles::equipment_profile_preview,
+            equipment_profiles::equipment_profile_apply,
+            equipment_profiles::equipment_profile_logs,
             mcp_registry::mcp_profile_save,
             mcp_registry::mcp_profile_delete,
+            // MCP tool discovery (工具发现)
+            mcp_tool_discovery::mcp_discover_tools,
             // Backup & restore
             backup::config_export,
             backup::config_import,
@@ -303,9 +301,6 @@ pub fn run() {
             cloud_sync::cloud_vault_status,
             cloud_sync::cloud_vault_list_conflicts,
             cloud_sync::cloud_vault_resolve_conflict,
-            mobile_status::mobile_status_get_settings,
-            mobile_status::mobile_status_set_enabled,
-            mobile_status::mobile_status_rotate_token,
             // Network manager (网卡 / IP / 实时网速)
             network_info::network_interfaces,
             network_info::network_throughput,
@@ -316,13 +311,29 @@ pub fn run() {
             env_manager::env_var_set,
             env_manager::env_var_delete,
             startup::get_startup_options,
+            desktop_lifecycle::desktop_preferences_get,
+            desktop_lifecycle::desktop_preferences_set,
+            desktop_lifecycle::desktop_close_resolve,
+            desktop_lifecycle::desktop_close_cancel,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                // Hiding the window keeps collection and schedulers alive.
+                // Every real exit (including tray Quit) stops only owned children.
+                app.state::<memory_backend::MemoryBackend>().stop();
+            }
+        });
 }
 
 /// Separate from the Tauri desktop runtime so the same installed executable
 /// can act as a stdio MCP server for Codex and Claude.
 pub fn run_memory_mcp_stdio() -> Result<(), String> {
     memory_mcp::run_stdio()
+}
+
+/// Standalone transport relay used by an Agent's existing stdio MCP entry.
+pub fn run_mcp_stdio_relay(assignment_id: &str) -> Result<(), String> {
+    mcp_stdio_relay::run_stdio(assignment_id)
 }

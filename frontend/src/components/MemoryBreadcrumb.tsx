@@ -19,7 +19,7 @@ export function MemoryBreadcrumb({ currentKey, onBack }: MemoryBreadcrumbProps) 
       >
         {t('memory.title')}
       </button>
-      <ChevronRight size={14} className="text-slate-400 dark:text-slate-500" />
+      <ChevronRight size={14} className="text-slate-500 dark:text-slate-400" />
       <span aria-current="page" className="font-medium text-slate-900 dark:text-slate-100">{t(currentKey)}</span>
     </nav>
   )

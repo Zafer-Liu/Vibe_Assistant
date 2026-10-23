@@ -1,20 +1,21 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { StepWelcome } from './onboarding/StepWelcome'
-import { StepAgents } from './onboarding/StepAgents'
 import { StepLlm } from './onboarding/StepLlm'
 import { StepDone } from './onboarding/StepDone'
+import { StepModules } from './onboarding/StepModules'
+import type { OnboardingDestination } from './onboarding/modules'
 
 const STORAGE_KEY = 'onboarding-complete'
-type Step = 'welcome' | 'agents' | 'llm' | 'done'
-const STEPS: Step[] = ['welcome', 'agents', 'llm', 'done']
+type Step = 'welcome' | 'memory' | 'skills' | 'mcp' | 'llm' | 'done'
+const STEPS: Step[] = ['welcome', 'memory', 'skills', 'mcp', 'llm', 'done']
 
 export function needsOnboarding() {
   try { return !localStorage.getItem(STORAGE_KEY) } catch { return true }
 }
 
 /** First-run setup can also be reopened from Settings. */
-export function Onboarding({ onFinish }: { onFinish: () => void }) {
+export function Onboarding({ onFinish, onNavigate }: { onFinish: () => void; onNavigate?: (page: OnboardingDestination) => void }) {
   const { t } = useTranslation()
   const [step, setStep] = useState<Step>('welcome')
   const [busy, setBusy] = useState(false)
@@ -46,10 +47,11 @@ export function Onboarding({ onFinish }: { onFinish: () => void }) {
     }
   }, [busy])
 
-  function finish() {
+  function finish(destination?: OnboardingDestination) {
     if (busy) return
     try { localStorage.setItem(STORAGE_KEY, '1') } catch { /* A storage-disabled webview may show setup again. */ }
     onFinish()
+    if (destination) onNavigate?.(destination)
   }
 
   function trapFocus(event: KeyboardEvent<HTMLDivElement>) {
@@ -69,23 +71,26 @@ export function Onboarding({ onFinish }: { onFinish: () => void }) {
 
   const stepIndex = STEPS.indexOf(step)
   return (
-    <dialog ref={dialog} onCancel={event => event.preventDefault()} aria-label={t('onboarding.welcome.title')}
+    <dialog ref={dialog} onCancel={event => event.preventDefault()} aria-label={t('onboarding.guideTitle')}
       className="fixed inset-0 m-0 h-full max-h-none w-full max-w-none border-0 bg-transparent p-4 backdrop:bg-black/40 backdrop:backdrop-blur-sm open:flex open:items-center open:justify-center">
       <div ref={panel} tabIndex={-1} onKeyDown={trapFocus}
-        className={`max-h-[90vh] w-full overflow-y-auto rounded-2xl bg-white p-5 shadow-2xl outline-none dark:bg-gray-900 sm:p-8 ${step === 'llm' ? 'max-w-3xl' : 'max-w-lg'}`}>
+        className="max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-2xl bg-white p-5 shadow-2xl outline-none dark:bg-gray-900 sm:p-8">
         <div className="mb-6 flex items-center justify-between gap-4">
-          <div className="flex gap-1.5" aria-hidden="true">
-            {STEPS.map((item, index) => <div key={item} className={`h-1.5 rounded-full ${index <= stepIndex ? 'w-6 bg-blue-500' : 'w-3 bg-gray-200 dark:bg-gray-700'}`} />)}
+          <div className="min-w-0">
+            <p role="status" aria-live="polite" className="text-xs font-medium text-gray-600 dark:text-gray-300">{t('onboarding.progress', { current: stepIndex + 1, total: STEPS.length, label: t(`onboarding.steps.${step}`) })}</p>
+            <div className="mt-2 flex gap-1.5" aria-hidden="true">
+              {STEPS.map((item, index) => <div key={item} className={`h-1 rounded-full ${index <= stepIndex ? 'w-5 bg-blue-500' : 'w-3 bg-gray-200 dark:bg-gray-700'}`} />)}
+            </div>
           </div>
           <div className="flex items-center gap-3">
             {stepIndex > 0 && step !== 'done' && <button type="button" onClick={() => setStep(STEPS[stepIndex - 1])} disabled={busy} className="rounded text-xs text-gray-500 hover:text-gray-700 focus-visible:outline-2 focus-visible:outline-blue-500 disabled:opacity-50 dark:text-gray-400">{t('common.back')}</button>}
-            {step !== 'done' && <button type="button" onClick={finish} disabled={busy} className="rounded text-xs text-gray-500 hover:text-gray-700 focus-visible:outline-2 focus-visible:outline-blue-500 disabled:opacity-50 dark:text-gray-400">{t('onboarding.skip')}</button>}
+            {step !== 'done' && <button type="button" onClick={() => finish()} disabled={busy} className="rounded text-xs text-gray-500 hover:text-gray-700 focus-visible:outline-2 focus-visible:outline-blue-500 disabled:opacity-50 dark:text-gray-400">{t('onboarding.skip')}</button>}
           </div>
         </div>
-        {step === 'welcome' && <StepWelcome onNext={() => setStep('agents')} />}
-        {step === 'agents' && <StepAgents onNext={() => setStep('llm')} onBusyChange={setBusy} />}
+        {step === 'welcome' && <StepWelcome onNext={() => setStep('memory')} />}
+        {(step === 'memory' || step === 'skills' || step === 'mcp') && <StepModules module={step} onNext={() => setStep(STEPS[stepIndex + 1])} />}
         {step === 'llm' && <StepLlm onNext={ready => { setMemoryReady(ready); setStep('done') }} onBusyChange={setBusy} />}
-        {step === 'done' && <StepDone memoryReady={memoryReady} onFinish={finish} />}
+        {step === 'done' && <StepDone memoryReady={memoryReady} onFinish={() => finish()} onOpenModule={onNavigate ? destination => finish(destination) : undefined} />}
       </div>
     </dialog>
   )

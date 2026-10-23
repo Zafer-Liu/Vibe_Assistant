@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// 全部受支持的会话/Token 来源。
-pub const AGENT_SOURCE_IDS: [&str; 8] = [
+pub const AGENT_SOURCE_IDS: [&str; 9] = [
     "codex",
     "claude",
     "qoder",
@@ -19,6 +19,7 @@ pub const AGENT_SOURCE_IDS: [&str; 8] = [
     "kimi",
     "copilot",
     "zcode",
+    "dsh",
 ];
 
 pub fn is_supported_source(id: &str) -> bool {
@@ -36,14 +37,17 @@ pub fn agent_label(id: &str) -> &'static str {
         "copilot" => "GitHub Copilot",
         // ZCode（Claude Code 兼容引擎）：目录 ~/.zcode。
         "zcode" => "ZCode",
+        // DeepSeek Harness：数据根目录 ~/.dsh（$DSH_HOME 可覆盖）。
+        "dsh" => "DeepSeek Harness",
         _ => "Agent",
     }
 }
 
-/// 该 Agent 是否支持写入命令式 Hook。MiniMax Code 与 Kimi 没有文档化的
-/// 命令 Hook 入口，会话监听依靠本地转录扫描，不需要 Hook。
+/// 该 Agent 是否支持注入式采集/注入。MiniMax Code 与 Kimi 没有文档化的
+/// 命令 Hook 入口，会话监听依靠本地转录扫描。DSH 通过 cordis pre-step
+/// 插件承载等价注入（见 dsh_injection），对上层暴露与 Hook 相同的安装面。
 pub fn supports_hooks(id: &str) -> bool {
-    matches!(id, "codex" | "claude" | "qoder" | "workbuddy")
+    matches!(id, "codex" | "claude" | "qoder" | "workbuddy" | "dsh")
 }
 
 // ── 跨设备路径覆盖 ────────────────────────────────────────────────────────────
@@ -56,6 +60,9 @@ pub struct AgentSourceOverride {
     /// 自定义配置主目录（用于定位 MCP 配置等）；None 表示使用默认目录。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_home: Option<String>,
+    /// None keeps the default (enabled when a transcript reader exists).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_enabled: Option<bool>,
 }
 
 fn overrides_path() -> PathBuf {
@@ -136,6 +143,31 @@ fn kimi_code_home() -> Option<PathBuf> {
         .find(|path| path.is_dir())
         .cloned()
         .or_else(|| candidates.into_iter().next())
+}
+
+/// DeepSeek Harness 的数据根目录：显式 `$DSH_HOME` 优先（空白视为未设置），
+/// 其次默认 `~/.dsh`。会话转录在 `<home>/sessions`，用户 Skill 在
+/// `<home>/skills`，与 harness 自身 `dsh-home-paths` 的解析规则一致。
+pub(crate) fn dsh_home() -> Option<PathBuf> {
+    if let Ok(configured) = std::env::var("DSH_HOME") {
+        let trimmed = configured.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    home().map(|home| home.join(".dsh"))
+}
+
+/// 共享 agent 配置根目录（`$DSH_AGENTS_HOME` 或 `~/.agents`）：DSH 的
+/// skill-filesystem 也会扫描其中的 `skills/`（rank 500，用户共享层）。
+fn dsh_agents_home() -> Option<PathBuf> {
+    if let Ok(configured) = std::env::var("DSH_AGENTS_HOME") {
+        let trimmed = configured.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    home().map(|home| home.join(".agents"))
 }
 
 /// Qoder 国际版数据在 `~/.qoder`，国内版在 `~/.qoder-cn`，两个版本可能
@@ -228,6 +260,11 @@ fn default_transcript_roots(id: &str) -> Vec<PathBuf> {
             .join("v2")
             .join("agent-config")
             .join("claude")],
+        // DeepSeek Harness 会话：`<dshHome>/sessions/<workspace-slug>/
+        // session-<uuid>/session.vN.jsonl.zstd`（zstd 多帧压缩 JSONL）。
+        "dsh" => dsh_home()
+            .map(|dsh| vec![dsh.join("sessions")])
+            .unwrap_or_default(),
         _ => Vec::new(),
     }
 }
@@ -239,6 +276,7 @@ fn default_config_home(id: &str) -> Option<PathBuf> {
         "kimi" => kimi_code_home(),
         "copilot" => home().map(|home| home.join(".copilot")),
         "zcode" => home().map(|home| home.join(".zcode")),
+        "dsh" => dsh_home(),
         _ => None,
     }
 }
@@ -254,6 +292,11 @@ pub fn transcript_roots(id: &str) -> Vec<PathBuf> {
         }
     }
     default_transcript_roots(id)
+}
+
+pub fn transcript_scan_enabled(id: &str) -> bool {
+    let supported = id != "copilot" && is_supported_source(id);
+    supported && override_for(id).scan_enabled.unwrap_or(true)
 }
 
 /// 该 Agent 的配置主目录（MCP 配置等），同样支持跨设备覆盖。
@@ -273,6 +316,9 @@ pub fn mcp_config_path(id: &str) -> Option<PathBuf> {
         "workbuddy" => home().map(|home| home.join(".workbuddy").join(".mcp.json")),
         // ZCode 的 MCP 服务器登记在 cli/config.json 的 mcp.servers 节点。
         "zcode" => config_home(id).map(|home| home.join("cli").join("config.json")),
+        // DeepSeek Harness 的 MCP 走 desktop profile 的 cordis patch 层
+        // （YAML，非 JSON）；路径供界面展示与状态定位，读写见 dsh_mcp。
+        "dsh" => crate::dsh_mcp::patch_path(),
         _ => None,
     }
 }
@@ -295,6 +341,8 @@ fn resolved_config_home(id: &str) -> Option<PathBuf> {
         "minimax" => home.join(".minimax"),
         "kimi" => kimi_code_home().unwrap_or_else(|| home.join(".kimi-code")),
         "zcode" => home.join(".zcode"),
+        // dsh 的 default_config_home 已覆盖；此处兜底默认 ~/.dsh。
+        "dsh" => dsh_home().unwrap_or_else(|| home.join(".dsh")),
         _ => return None,
     })
 }
@@ -316,6 +364,19 @@ pub fn skill_scan_roots(id: &str) -> Vec<PathBuf> {
         "copilot" => vec![home.join("skills")],
         // ZCode 的 Skill 与 Claude Code 同构：~/.zcode/skills/<name>/SKILL.md。
         "zcode" => vec![home.join("skills")],
+        // DeepSeek Harness 与 Claude Code 的 Skill 同构（<name>/SKILL.md）；
+        // 除 <dshHome>/skills 外还扫描共享 agents 根 ~/.agents/skills
+        // （skill-filesystem 的 rank 500 用户层），两个根都可能存在技能。
+        "dsh" => {
+            let mut roots = vec![home.join("skills")];
+            if let Some(agents) = dsh_agents_home() {
+                let shared = agents.join("skills");
+                if shared != home.join("skills") {
+                    roots.push(shared);
+                }
+            }
+            roots
+        }
         _ => Vec::new(),
     }
 }
@@ -379,6 +440,23 @@ pub fn session_id_for_path(source: &str, path: &Path) -> Option<String> {
             }
             (!stem.is_empty()).then_some(stem.to_string())
         }
+        "dsh" => {
+            // <dshHome>/sessions/<workspace-slug>/session-<uuid>/session.vN.jsonl.zstd
+            // 会话 id 是目录名（session-<uuid>）。同一目录可能保留多个格式
+            // 代际（v0…v4 共存），只认最高一代，旧代文件返回 None 跳过。
+            let raw_stem = path.file_stem()?.to_str()?.trim();
+            let stem = raw_stem.strip_suffix(".jsonl").unwrap_or(raw_stem);
+            if crate::dsh_transcript::generation_of(stem).is_some()
+                && crate::dsh_transcript::is_latest_generation(path)
+            {
+                return path
+                    .parent()
+                    .and_then(|dir| dir.file_name())
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string);
+            }
+            None
+        }
         _ => (!stem.is_empty()).then_some(stem.to_string()),
     }
 }
@@ -399,6 +477,8 @@ pub struct AgentSourceInfo {
     pub id: String,
     pub label: String,
     pub supports_hooks: bool,
+    pub supports_transcript_scan: bool,
+    pub scan_enabled: bool,
     pub transcript_roots: Vec<AgentSourcePathInfo>,
     pub default_transcript_roots: Vec<String>,
     pub mcp_config_path: Option<String>,
@@ -413,6 +493,8 @@ pub fn agent_source_info(id: &str) -> Option<AgentSourceInfo> {
         id: id.into(),
         label: agent_label(id).into(),
         supports_hooks: supports_hooks(id),
+        supports_transcript_scan: id != "copilot",
+        scan_enabled: transcript_scan_enabled(id),
         transcript_roots: transcript_roots(id)
             .into_iter()
             .map(|path| AgentSourcePathInfo {
@@ -460,7 +542,8 @@ pub fn agent_source_set_override(
     let cleaned_home = config_home
         .map(|home| home.trim().to_string())
         .filter(|home| !home.is_empty());
-    if cleaned_roots.is_none() && cleaned_home.is_none() {
+    let scan_enabled = overrides.get(&id).and_then(|value| value.scan_enabled);
+    if cleaned_roots.is_none() && cleaned_home.is_none() && scan_enabled.is_none() {
         overrides.remove(&id);
     } else {
         overrides.insert(
@@ -468,8 +551,24 @@ pub fn agent_source_set_override(
             AgentSourceOverride {
                 transcript_roots: cleaned_roots,
                 config_home: cleaned_home,
+                scan_enabled,
             },
         );
+    }
+    write_overrides(&overrides)?;
+    agent_source_info(&id).ok_or_else(|| format!("暂不支持的 Agent 来源：{id}"))
+}
+
+#[tauri::command]
+pub fn agent_source_set_scan_enabled(id: String, enabled: bool) -> Result<AgentSourceInfo, String> {
+    if !is_supported_source(&id) || id == "copilot" {
+        return Err(format!("暂不支持本地转录扫描：{id}"));
+    }
+    let mut overrides = read_overrides();
+    let entry = overrides.entry(id.clone()).or_default();
+    entry.scan_enabled = if enabled { None } else { Some(false) };
+    if entry.scan_enabled.is_none() && entry.transcript_roots.is_none() && entry.config_home.is_none() {
+        overrides.remove(&id);
     }
     write_overrides(&overrides)?;
     agent_source_info(&id).ok_or_else(|| format!("暂不支持的 Agent 来源：{id}"))
@@ -511,5 +610,29 @@ mod tests {
             session_id_for_path("codex", path).as_deref(),
             Some("019f8e90-36f5-71a2-bddf-f0fe9ee23b57")
         );
+    }
+
+    #[test]
+    fn dsh_session_id_comes_from_the_session_directory() {
+        // 旧代际存在时被跳过，只有目录内最高一代产出会话 id。
+        let directory = std::env::temp_dir().join(format!(
+            "dsh-session-id-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let session_dir = directory.join("session-ae727f3e-6e3f-4b87-97de-ca5da89d2973");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("session.v3.jsonl.zstd"), []).unwrap();
+        let v4 = session_dir.join("session.v4.jsonl.zstd");
+        std::fs::write(&v4, []).unwrap();
+        assert_eq!(
+            session_id_for_path("dsh", &v4).as_deref(),
+            Some("session-ae727f3e-6e3f-4b87-97de-ca5da89d2973")
+        );
+        assert!(session_id_for_path(
+            "dsh",
+            &session_dir.join("session.v3.jsonl.zstd")
+        )
+        .is_none());
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

@@ -3,7 +3,8 @@ import { useTranslation } from 'react-i18next'
 import {
   ArrowLeft, Brain, CheckCircle2, Clock3, Loader2, MessagesSquare, RefreshCw, RotateCcw, XCircle, X,
 } from 'lucide-react'
-import { useMemoryStore } from '../store/memoryStore'
+import { useMemoryFields } from '../store/memoryStore'
+import { useTelemetryFields } from '../store/telemetryStore'
 import type { MemoryConversationDetail, PendingMemorySession } from '../types/memory'
 import { ConversationDialog, STATE_META, displayTime, sourceLabel } from '../components/ConversationDialog'
 import { MemoryBreadcrumb } from '../components/MemoryBreadcrumb'
@@ -14,7 +15,8 @@ type StateFilter = 'all' | 'pending' | 'retrying' | 'failed'
 
 export const PendingMemories = memo(function PendingMemories({ onBack, active = true }: { onBack: () => void; active?: boolean }) {
   const { t } = useTranslation()
-  const { loadPendingSessions, loadConversationDetail, organizeSession, organizeConversations, cancelOrganize, ingestStatus, checkIngest, checkTelemetry } = useMemoryStore()
+  const { loadPendingSessions, loadConversationDetail, organizeSession, organizeConversations, cancelOrganize, ingestStatus, checkIngest } = useMemoryFields('loadPendingSessions', 'loadConversationDetail', 'organizeSession', 'organizeConversations', 'cancelOrganize', 'ingestStatus', 'checkIngest')
+  const { checkTelemetry, telemetryLiveStatus } = useTelemetryFields('checkTelemetry', 'telemetryLiveStatus')
   const [sessions, setSessions] = useState<PendingMemorySession[] | null>(null)
   const [filter, setFilter] = useState<StateFilter>('all')
   const [refreshing, setRefreshing] = useState(false)
@@ -40,15 +42,17 @@ export const PendingMemories = memo(function PendingMemories({ onBack, active = 
     void checkTelemetry({ limit: 20 })
   }, [reload, checkIngest, checkTelemetry, active])
   useVisiblePolling(checkIngest, 2_000, active)
+  useVisiblePolling(checkTelemetry, 10_000, active)
 
+  // 数量卡片与记忆总览同源（telemetryLiveStatus），列表本身有 200 条截断，不能用来计数。
   const counts = useMemo(() => {
     const list = sessions ?? []
     return {
-      pending: list.filter((item) => item.l1_state === 'pending').length,
-      retrying: list.filter((item) => item.l1_state === 'retrying').length,
-      failed: list.filter((item) => item.l1_state === 'failed').length,
+      pending: telemetryLiveStatus?.pending_memory_sessions ?? list.filter((item) => item.l1_state === 'pending').length,
+      retrying: telemetryLiveStatus?.retrying_memory_sessions ?? list.filter((item) => item.l1_state === 'retrying').length,
+      failed: telemetryLiveStatus?.failed_memory_sessions ?? list.filter((item) => item.l1_state === 'failed').length,
     }
-  }, [sessions])
+  }, [sessions, telemetryLiveStatus])
 
   const visible = useMemo(
     () => (sessions ?? []).filter((item) => filter === 'all' || item.l1_state === filter),
@@ -128,9 +132,9 @@ export const PendingMemories = memo(function PendingMemories({ onBack, active = 
     setDetailError(null)
   }
 
-  return <main className="h-full overflow-y-auto bg-[#fbfcfe] text-slate-900 dark:bg-slate-950 dark:text-slate-100">
+  return <main className="h-full overflow-y-auto bg-gray-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
     <div className="mx-auto max-w-[1200px] px-5 py-6 lg:px-9 lg:py-8">
-      <header className="flex flex-wrap items-start justify-between gap-4">
+      <header className="fluent-page-header flex flex-wrap items-start justify-between gap-4">
         <div className="flex items-start gap-3">
           <button type="button" onClick={onBack} className="mt-0.5 inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white" aria-label={t('memory.pending.back')}><ArrowLeft size={19} /></button>
           <div>
@@ -147,6 +151,23 @@ export const PendingMemories = memo(function PendingMemories({ onBack, active = 
         </div>
       </header>
       {notice?.kind === 'err' && <ErrorRecovery error={notice.text} fallback="settings" />}
+
+      {ingestStatus?.manual_extraction_running && ingestStatus.extraction_progress && ingestStatus.extraction_progress.total > 0 && (() => {
+        const progress = ingestStatus.extraction_progress
+        const done = progress.succeeded + progress.failed
+        const percent = Math.min(100, Math.round((done / progress.total) * 100))
+        return <div className="mt-5 rounded-xl border border-violet-200 bg-violet-50/60 px-4 py-3 dark:border-violet-500/30 dark:bg-violet-500/10" role="status">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-violet-800 dark:text-violet-200">
+            <Loader2 size={13} className="animate-spin motion-reduce:animate-none" />
+            <span className="font-medium">{t('memory.pending.progressBatch', { batch: progress.batch_index, batches: progress.batch_total })}</span>
+            <span className="font-mono tabular-nums">{t('memory.pending.progressCount', { done, total: progress.total, succeeded: progress.succeeded, failed: progress.failed })}</span>
+            <span className="ml-auto font-mono tabular-nums">{percent}%</span>
+          </div>
+          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-violet-200/60 dark:bg-violet-900/40" aria-hidden="true">
+            <div className="h-full rounded-full bg-violet-500 transition-all" style={{ width: `${percent}%` }} />
+          </div>
+        </div>
+      })()}
 
       <section className="mt-7 grid gap-3 sm:grid-cols-3" aria-label={t('memory.pending.overviewLabel')}>
         {(['pending', 'retrying', 'failed'] as const).map((state) => {
@@ -170,8 +191,11 @@ export const PendingMemories = memo(function PendingMemories({ onBack, active = 
       )}
 
       <section className="mt-6 rounded-2xl border border-slate-200 bg-white p-5 shadow-[0_1px_2px_rgba(15,23,42,0.03)] dark:border-slate-800 dark:bg-slate-900 sm:p-6" aria-label={t('memory.pending.listLabel')}>
+        {sessions !== null && counts.pending + counts.retrying + counts.failed > sessions.length && (
+          <p className="mb-3 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">{t('memory.pending.truncated', { count: counts.pending + counts.retrying + counts.failed, shown: sessions.length })}</p>
+        )}
         {sessions === null ? (
-          <div className="flex min-h-48 items-center justify-center gap-2 text-sm text-slate-400"><Loader2 size={16} className="animate-spin motion-reduce:animate-none" />{t('memory.pending.loading')}</div>
+          <div className="flex min-h-48 items-center justify-center gap-2 text-sm text-slate-500"><Loader2 size={16} className="animate-spin motion-reduce:animate-none" />{t('memory.pending.loading')}</div>
         ) : visible.length === 0 ? (
           <div className="flex min-h-48 flex-col items-center justify-center text-center">
             <span className="grid h-11 w-11 place-items-center rounded-xl bg-emerald-500/10 text-emerald-500"><CheckCircle2 size={20} /></span>
@@ -189,10 +213,10 @@ export const PendingMemories = memo(function PendingMemories({ onBack, active = 
                 className="group -mx-2 flex cursor-pointer flex-wrap items-center gap-x-3 gap-y-2 rounded-lg px-2 py-3.5 transition hover:bg-slate-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:hover:bg-slate-800/50">
                 <span className={`inline-flex shrink-0 items-center rounded px-1.5 py-0.5 text-xs ${meta.badge}`}>{t(meta.labelKey)}</span>
                 <span className="shrink-0 text-sm font-medium">{sourceLabel(item.source)}</span>
-                <span className="min-w-0 flex-1 truncate font-mono text-xs text-slate-400" title={item.session_id}>{item.session_id}</span>
-                <span className="shrink-0 font-mono text-xs text-slate-400">{displayTime(item.occurred_at)}</span>
-                <span className="shrink-0 text-xs text-slate-400">{item.message_count} {t('memory.pending.messageCount')}</span>
-                <span className="inline-flex shrink-0 items-center gap-1 text-xs text-slate-300 transition group-hover:text-violet-500 dark:text-slate-600 dark:group-hover:text-violet-300"><MessagesSquare size={13} />{t('memory.pending.viewConversation')}</span>
+                <span className="min-w-0 flex-1 truncate font-mono text-xs text-slate-500" title={item.session_id}>{item.session_id}</span>
+                <span className="shrink-0 font-mono text-xs text-slate-500">{displayTime(item.occurred_at)}</span>
+                <span className="shrink-0 text-xs text-slate-500">{item.message_count} {t('memory.pending.messageCount')}</span>
+                <span className="inline-flex shrink-0 items-center gap-1 text-xs text-slate-300 transition group-hover:text-violet-500 dark:text-slate-400 dark:group-hover:text-violet-300"><MessagesSquare size={13} />{t('memory.pending.viewConversation')}</span>
                 <button type="button" onClick={(event) => { event.stopPropagation(); void handleOrganizeOne(item.event_key) }} disabled={extractionRunning || !modelReady} title={modelReady ? t('memory.pending.organizeOneTitle') : t('memory.pending.modelMissingTitle')} className="inline-flex shrink-0 items-center gap-1 rounded-md border border-violet-200 bg-white px-2.5 py-1 text-xs font-medium text-violet-700 transition hover:bg-violet-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-violet-500/30 dark:bg-slate-900 dark:text-violet-300 dark:hover:bg-violet-500/10">{working ? <Loader2 size={12} className="animate-spin motion-reduce:animate-none" /> : <Brain size={12} />}{t('memory.pending.organize')}</button>
                 <p className="basis-full truncate text-xs text-slate-500 dark:text-slate-400" title={item.excerpt}>{item.excerpt.replace(/\s+/g, ' ').trim() || t('memory.pending.noExcerpt')}</p>
                 {item.error && <p className="basis-full truncate text-xs text-red-600 dark:text-red-400" title={item.error}>{t('memory.pending.lastFailed')}{item.error}</p>}

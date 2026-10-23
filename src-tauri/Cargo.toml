@@ -1,9 +1,10 @@
 [package]
 name = "agent-manager"
-version = "1.0.2"
-description = "A local agent management tool"
+version = "1.1.0"
+description = "Local memory, Skill and MCP management workspace"
 authors = ["you"]
 edition = "2021"
+default-run = "agent-manager"
 
 [package.metadata.tauri]
 bundle-identifier = "com.agentmanager.app"
@@ -12,17 +13,33 @@ bundle-identifier = "com.agentmanager.app"
 name = "agent_manager_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[bin]]
+name = "agent-manager"
+path = "src/main.rs"
+
+# Observed stdio relay sidecar: survives GUI app exit because it is a
+# separate, hash-installed executable (see mcp-launcher/src/installation.rs).
+[[bin]]
+name = "mcp-relay"
+path = "src/bin/mcp-relay.rs"
+
+[[bin]]
+name = "export-vault"
+path = "src/bin/export-vault.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["unstable"] }
+tauri = { version = "2", features = ["unstable", "tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-http = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Passive YAML events never execute DSH !!js tags.
+yaml-rust2 = { version = "0.10", default-features = false }
 toml = "0.8"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
@@ -30,13 +47,17 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs-next = "2"
 reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
 futures-util = "0.3"
-portable-pty = "0.9"
 aes-gcm = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
+zeroize = "1"
+keyring = { version = "=3.6.3", default-features = false, features = ["windows-native", "apple-native", "sync-secret-service", "crypto-rust", "vendored"] }
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 tiktoken-rs = "0.12"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# DeepSeek Harness 会话转录是多个独立 Zstandard 帧拼接的 .jsonl.zstd，
+# 解压后按行解析 v4 JSON 事件（见 src/dsh_transcript.rs）。
+zstd = "0.13"
 tempfile = "3"
 sysinfo = "0.37.2"
 
@@ -46,6 +67,9 @@ windows-sys = { version = "0.60", features = [
   "Win32_UI_WindowsAndMessaging",
   "Win32_Foundation",
   "Win32_System_Environment",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+  "Win32_Security",
 ] }
 
 [profile.release]

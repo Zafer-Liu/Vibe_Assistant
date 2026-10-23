@@ -15,16 +15,26 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::process_util::no_window;
 
-const SERVER_NAME: &str = "agent-manager-memory";
+const SERVER_NAME: &str = "Vibe-Assistant-memory";
+/// 旧服务名：安装时清理旧节点，卸载与状态检查兼容历史配置。
+const LEGACY_SERVER_NAME: &str = "agent-manager-memory";
+
+/// 供 dsh_mcp 等模块引用的稳定名称访问器。
+pub(crate) fn server_name() -> &'static str {
+    SERVER_NAME
+}
+
+pub(crate) fn legacy_server_name() -> &'static str {
+    LEGACY_SERVER_NAME
+}
+
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
-/// Per-source fingerprint of the last prompt-scope payload actually handed to
-/// a UserPromptSubmit hook.  The prompt hook fires on every turn; an unchanged
-/// L3 layer is skipped so the stable tier costs one injection per content
-/// change, not one per turn of uncached input tokens.
-static LAST_PROMPT_FINGERPRINT: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+/// Only confirmed writes for a specific Agent session may suppress a later
+/// prompt. Legacy hooks without a session ID always receive the payload.
+static LAST_PROMPT_FINGERPRINT: OnceLock<Mutex<HashMap<(String, String), (String, std::time::Instant)>>> = OnceLock::new();
 
-fn prompt_gate() -> &'static Mutex<HashMap<String, String>> {
+fn prompt_gate() -> &'static Mutex<HashMap<(String, String), (String, std::time::Instant)>> {
     LAST_PROMPT_FINGERPRINT.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -69,6 +79,63 @@ pub struct MemoryMcpStatus {
     pub detail: String,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MemoryMcpRuntimeStatus {
+    pub agent_type: String,
+    pub configured: bool,
+    pub last_initialize_at: Option<String>,
+    pub last_tool_call_at: Option<String>,
+    pub probe_state: String,
+    pub probe_checked_at: Option<String>,
+    pub detail: String,
+}
+
+const MEMORY_MCP_TARGETS: [&str; 10] = [
+    "codex_cli",
+    "claude_cli",
+    "codex_desktop",
+    "claude_desktop",
+    "qoder",
+    "workbuddy",
+    "minimax",
+    "kimi",
+    "zcode",
+    "dsh",
+];
+
+fn normalized_mcp_client_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn agent_type_for_mcp_client(name: &str) -> Option<&'static str> {
+    match normalized_mcp_client_name(name).as_str() {
+        "codexcli" => Some("codex_cli"),
+        "codexdesktop" => Some("codex_desktop"),
+        "claude" | "claudecode" | "claudecodecli" | "claudecli" => Some("claude_cli"),
+        "claudedesktop" | "claude3p" => Some("claude_desktop"),
+        "qoder" => Some("qoder"),
+        "workbuddy" => Some("workbuddy"),
+        "minimax" | "minimaxcode" => Some("minimax"),
+        "kimi" | "kimicode" => Some("kimi"),
+        "zcode" => Some("zcode"),
+        // dsh-mcp-client 的 SDK clientInfo name 为 "dsh-mcp-client"。
+        "dsh" | "dshmcpclient" | "deepseekharness" | "deepseekharnessdesktop" => Some("dsh"),
+        _ => None,
+    }
+}
+
+fn latest_activity_time(current: Option<String>, candidate: Option<String>) -> Option<String> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Some(current.max(candidate)),
+        (current, None) => current,
+        (None, candidate) => candidate,
+    }
+}
+
 fn supported_agent(agent_type: &str) -> bool {
     matches!(
         agent_type,
@@ -81,6 +148,7 @@ fn supported_agent(agent_type: &str) -> bool {
             | "minimax"
             | "kimi"
             | "zcode"
+            | "dsh"
     )
 }
 
@@ -96,47 +164,67 @@ pub(crate) fn agent_label(agent_type: &str) -> &'static str {
     }
 }
 
-fn server_executable() -> Result<String, String> {
+pub(crate) fn server_executable() -> Result<String, String> {
     let current = std::env::current_exe()
         .map_err(|error| format!("无法定位 Vibe Assistant 可执行文件：{error}"))?;
-    // In `tauri dev`, Codex/Claude would otherwise keep target\debug\agent-
-    // manager.exe alive as a long-running MCP subprocess. Cargo must replace
-    // that exact file on every rebuild, which makes hot reload impossible on
-    // Windows. Give MCP a versioned private copy instead. A running old copy
-    // can never block the next development build.
-    if cfg!(debug_assertions)
-        && current
-            .components()
-            .any(|part| part.as_os_str() == "target")
-    {
-        let metadata = std::fs::metadata(&current)
-            .map_err(|error| format!("无法读取 MCP 可执行文件：{error}"))?;
-        let stamp = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs())
-            .unwrap_or_default();
-        let root = dirs_next::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("agent-manager")
-            .join("mcp-runtime");
-        std::fs::create_dir_all(&root)
-            .map_err(|error| format!("无法创建 MCP 运行目录：{error}"))?;
-        let target = root.join(format!(
-            "agent-manager-memory-{stamp}-{}.exe",
-            metadata.len()
-        ));
-        if !target.is_file() {
-            let temporary = target.with_extension("tmp");
-            std::fs::copy(&current, &temporary)
-                .map_err(|error| format!("无法复制 MCP 运行副本：{error}"))?;
-            std::fs::rename(&temporary, &target)
-                .map_err(|error| format!("无法启用 MCP 运行副本：{error}"))?;
-        }
-        return Ok(target.to_string_lossy().to_string());
+    // Cargo / 安装器必须能随时替换应用主程序文件，而 MCP 客户端会把注册的
+    // exe 当长驻子进程拉起——被占用的 exe 在 Windows 上锁死无法替换。所以
+    // 无论 dev 还是 release，都给 MCP 一份按构建时间戳命名的私有副本，
+    // 由 [`registered_command`] 的启动器在每次拉起时解析最新一份。
+    let metadata = std::fs::metadata(&current)
+        .map_err(|error| format!("无法读取 MCP 可执行文件：{error}"))?;
+    let stamp = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let root = dirs_next::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("agent-manager")
+        .join("mcp-runtime");
+    std::fs::create_dir_all(&root)
+        .map_err(|error| format!("无法创建 MCP 运行目录：{error}"))?;
+    let target = root.join(format!(
+        "agent-manager-memory-{stamp}-{}.exe",
+        metadata.len()
+    ));
+    if !target.is_file() {
+        let temporary = target.with_extension("tmp");
+        std::fs::copy(&current, &temporary)
+            .map_err(|error| format!("无法复制 MCP 运行副本：{error}"))?;
+        std::fs::rename(&temporary, &target)
+            .map_err(|error| format!("无法启用 MCP 运行副本：{error}"))?;
     }
-    Ok(current.to_string_lossy().to_string())
+    cleanup_runtime_copies(&root, &target);
+    Ok(target.to_string_lossy().to_string())
+}
+
+/// 清理 mcp-runtime 里的旧副本：仍在运行的副本被 Windows 锁住删不掉，
+/// 忽略即可——进程退出后的下一轮会清掉。绝不主动杀进程。
+fn cleanup_runtime_copies(root: &std::path::Path, keep: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("agent-manager-memory-") || !name.ends_with(".exe") {
+            continue;
+        }
+        if entry.path() == keep {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
+
+/// 注册进各 Agent MCP 配置的命令：稳定的启动器（内容哈希安装，见
+/// `mcp_launcher_installation::launcher_executable`），而不是会随构建变化的
+/// runtime 副本路径。启动器自己解析最新副本，并在应用更新杀掉旧副本后
+/// 无缝重启子进程，MCP 连接因此不再随更新断开。
+pub(crate) fn registered_command() -> Result<String, String> {
+    crate::mcp_launcher_installation::launcher_executable()
 }
 
 /// The desktop app does not necessarily inherit the user's interactive shell
@@ -446,7 +534,7 @@ pub(crate) fn desktop_config_path(agent_type: &str) -> Result<Option<PathBuf>, S
 /// 服务器定义；Kimi、Qoder、WorkBuddy 使用标准 command/args 形态。
 /// ZCode 的服务器映射嵌套在 mcp.servers，schema 未文档化扩展键，按用户
 /// 手工配置验证过的最小 command/args 形状写入。
-fn file_server_entry(agent_type: &str, executable: &str) -> Value {
+pub(crate) fn file_server_entry(agent_type: &str, executable: &str) -> Value {
     if agent_type == "minimax" {
         json!({
             "type": "stdio",
@@ -528,17 +616,22 @@ fn read_file_config(path: &std::path::Path) -> Result<Value, String> {
 fn file_config_status(agent_type: &str, executable: &str) -> Result<MemoryMcpStatus, String> {
     let path = desktop_config_path(agent_type)?.ok_or("无法定位 MCP 配置文件")?;
     let config = read_file_config(&path)?;
-    let installed = servers_map(&config, agent_type)
-        .and_then(|servers| servers.get(SERVER_NAME))
-        .is_some();
+    let entry = servers_map(&config, agent_type)
+        .and_then(|servers| servers.get(SERVER_NAME).or_else(|| servers.get(LEGACY_SERVER_NAME)));
+    let installed = entry.is_some_and(|entry| {
+        entry.get("command").and_then(Value::as_str) == Some(executable)
+            && entry.get("args") == Some(&json!(["--mcp-memory"]))
+    });
     Ok(MemoryMcpStatus {
         agent_type: agent_type.into(),
         installed,
         executable: executable.into(),
-        detail: if installed {
-            format!("已配置到 {}", path.display())
-        } else {
+        detail: if entry.is_none() {
             format!("尚未写入 {}", path.display())
+        } else if !installed {
+            format!("配置指向旧启动器或失效的观测代理，请重新连接（{}）", path.display())
+        } else {
+            format!("已配置到 {}", path.display())
         },
     })
 }
@@ -547,6 +640,7 @@ fn write_file_config(agent_type: &str, executable: &str) -> Result<MemoryMcpStat
     let path = desktop_config_path(agent_type)?.ok_or("无法定位 MCP 配置文件")?;
     let mut config = read_file_config(&path)?;
     let servers = servers_map_mut(&mut config, agent_type)?;
+    servers.remove(LEGACY_SERVER_NAME);
     servers.insert(
         SERVER_NAME.into(),
         file_server_entry(agent_type, executable),
@@ -565,7 +659,9 @@ fn write_file_config(agent_type: &str, executable: &str) -> Result<MemoryMcpStat
 fn remove_file_config(agent_type: &str) -> Result<(), String> {
     let path = desktop_config_path(agent_type)?.ok_or("无法定位 MCP 配置文件")?;
     let mut config = read_file_config(&path)?;
-    servers_map_mut(&mut config, agent_type)?.remove(SERVER_NAME);
+    let servers = servers_map_mut(&mut config, agent_type)?;
+    servers.remove(SERVER_NAME);
+    servers.remove(LEGACY_SERVER_NAME);
     std::fs::write(
         &path,
         serde_json::to_string_pretty(&config).map_err(|error| error.to_string())?,
@@ -586,8 +682,20 @@ pub async fn memory_mcp_status(agent_type: String) -> Result<MemoryMcpStatus, St
     if !supported_agent(&agent_type) {
         return Err(format!("暂不支持 {agent_type} 的 MCP 配置"));
     }
-    let executable = server_executable()?;
+    // 确保最新 runtime 副本存在（启动器靠它解析），配置里注册的则是稳定启动器。
+    server_executable()?;
+    let executable = registered_command()?;
+    if agent_type == "dsh" {
+        let (installed, detail) = crate::dsh_mcp::memory_status(&executable)?;
+        return Ok(MemoryMcpStatus {
+            agent_type,
+            installed,
+            executable,
+            detail,
+        });
+    }
     if is_file_config_agent(&agent_type) {
+        crate::mcp_registry::repair_orphaned_memory_relay(&agent_type, &executable)?;
         return file_config_status(&agent_type, &executable);
     }
     let cli = if agent_type.starts_with("codex") {
@@ -597,12 +705,28 @@ pub async fn memory_mcp_status(agent_type: String) -> Result<MemoryMcpStatus, St
     };
     let output = run_agent_cli(cli, &status_args(&agent_type));
     match output {
-        Ok(output) => Ok(MemoryMcpStatus {
-            agent_type,
-            installed: output.status.success(),
-            executable,
-            detail: cli_detail(&output),
-        }),
+        Ok(output) => {
+            // CLI get 输出里没有当前启动器路径 = 还钉着旧的 runtime 副本。
+            let detail = cli_detail(&output);
+            let outdated = output.status.success()
+                && !String::from_utf8_lossy(&output.stdout).contains(
+                    std::path::Path::new(&executable)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default(),
+                );
+            Ok(MemoryMcpStatus {
+                agent_type,
+                installed: output.status.success(),
+                executable,
+                detail: if outdated {
+                    "配置指向旧路径，请在 Vibe Assistant 里重新安装后生效"
+                } else {
+                    &detail
+                }
+                .to_string(),
+            })
+        }
         Err(error) => Ok(MemoryMcpStatus {
             agent_type,
             installed: false,
@@ -612,6 +736,64 @@ pub async fn memory_mcp_status(agent_type: String) -> Result<MemoryMcpStatus, St
     }
 }
 
+#[tauri::command]
+pub async fn memory_mcp_runtime_status(
+    state: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
+) -> Result<Vec<MemoryMcpRuntimeStatus>, String> {
+    let activity = state.mcp_access_activity()?;
+    let generic_codex = activity.iter().filter(|item| matches!(
+        normalized_mcp_client_name(&item.client_name).as_str(), "codex" | "codexmcpclient"
+    )).fold((None::<String>, None::<String>), |(initialize, tool), item| {
+        (latest_activity_time(initialize, item.last_initialize_at.clone()),
+         latest_activity_time(tool, item.last_tool_call_at.clone()))
+    });
+    let mut result = Vec::with_capacity(MEMORY_MCP_TARGETS.len());
+    for agent_type in MEMORY_MCP_TARGETS {
+        let configured = match memory_mcp_status(agent_type.to_string()).await {
+            Ok(status) => status,
+            Err(error) => MemoryMcpStatus {
+                agent_type: agent_type.into(),
+                installed: false,
+                executable: String::new(),
+                detail: error,
+            },
+        };
+        let mapped = activity.iter()
+            .filter(|item| agent_type_for_mcp_client(&item.client_name) == Some(agent_type))
+            .fold((None, None), |(initialize, tool), item| {
+                let initialize = match (initialize, item.last_initialize_at.clone()) {
+                    (Some(current), Some(candidate)) if current >= candidate => Some(current),
+                    (_, candidate) => candidate,
+                };
+                let tool = match (tool, item.last_tool_call_at.clone()) {
+                    (Some(current), Some(candidate)) if current >= candidate => Some(current),
+                    (_, candidate) => candidate,
+                };
+                (initialize, tool)
+            });
+        let activity_note = if mapped.0.is_some() || mapped.1.is_some() {
+            "最近活动时间来自历史访问日志，不代表客户端当前在线".to_string()
+        } else if agent_type.starts_with("codex_")
+            && (generic_codex.0.is_some() || generic_codex.1.is_some()) {
+            format!("已观测 Codex MCP 活动（握手：{}，工具：{}），客户端名称无法区分 CLI 与 Desktop",
+                generic_codex.0.as_deref().unwrap_or("未观测"),
+                generic_codex.1.as_deref().unwrap_or("未观测"))
+        } else {
+            "尚未观测到可映射的共享记忆 MCP 活动".to_string()
+        };
+        result.push(MemoryMcpRuntimeStatus {
+            agent_type: agent_type.into(),
+            configured: configured.installed,
+            last_initialize_at: mapped.0,
+            last_tool_call_at: mapped.1,
+            probe_state: "not_probed".into(),
+            probe_checked_at: None,
+            detail: format!("{}；{}", configured.detail, activity_note),
+        });
+    }
+    Ok(result)
+}
+
 /// Configure the user-level MCP registry through the Agent's own CLI.  This
 /// avoids hand-editing Codex TOML or Claude JSON and keeps removal reversible.
 #[tauri::command]
@@ -619,7 +801,19 @@ pub async fn memory_mcp_install(agent_type: String) -> Result<MemoryMcpStatus, S
     if !supported_agent(&agent_type) {
         return Err(format!("暂不支持 {agent_type} 的 MCP 配置"));
     }
-    let executable = server_executable()?;
+    // 先确保最新 runtime 副本在位，再把稳定启动器写进配置。
+    server_executable()?;
+    let executable = registered_command()?;
+    if agent_type == "dsh" {
+        crate::dsh_mcp::write_server(&crate::dsh_mcp::DshMcpServer::memory_server(&executable))?;
+        let (installed, detail) = crate::dsh_mcp::memory_status(&executable)?;
+        return Ok(MemoryMcpStatus {
+            agent_type,
+            installed,
+            executable,
+            detail,
+        });
+    }
     if is_file_config_agent(&agent_type) {
         return write_file_config(&agent_type, &executable);
     }
@@ -642,6 +836,12 @@ pub async fn memory_mcp_install(agent_type: String) -> Result<MemoryMcpStatus, S
             ));
         }
     }
+    // 旧名称的历史节点一并清理；不存在时忽略 CLI 的非零返回。
+    let legacy_remove = vec!["mcp".into(), "remove".into(), LEGACY_SERVER_NAME.into()];
+    let _ = run_agent_cli(
+        if agent_type.starts_with("codex") { "codex" } else { "claude" },
+        &legacy_remove,
+    );
     let args = match agent_type.as_str() {
         "codex_cli" | "codex_desktop" => vec![
             "mcp".into(),
@@ -689,18 +889,29 @@ pub async fn memory_mcp_uninstall(agent_type: String) -> Result<(), String> {
     if !supported_agent(&agent_type) {
         return Err(format!("暂不支持 {agent_type} 的 MCP 配置"));
     }
+    if agent_type == "dsh" {
+        crate::dsh_mcp::remove_server(server_name())?;
+        // 旧名称的历史条目一并清理；不存在时视为已卸载。
+        let _ = crate::dsh_mcp::remove_server(legacy_server_name());
+        return Ok(());
+    }
     if is_file_config_agent(&agent_type) {
         return remove_file_config(&agent_type);
     }
-    let mut args = vec!["mcp".into(), "remove".into()];
-    args.push(SERVER_NAME.into());
     let cli = if agent_type.starts_with("codex") {
         "codex"
     } else {
         "claude"
     };
+    let args = vec!["mcp".into(), "remove".into(), SERVER_NAME.into()];
     let output = run_agent_cli(cli, &args)?;
     if output.status.success() {
+        return Ok(());
+    }
+    // 新名称不存在时尝试移除旧名称的节点。
+    let legacy_args = vec!["mcp".into(), "remove".into(), LEGACY_SERVER_NAME.into()];
+    let legacy = run_agent_cli(cli, &legacy_args)?;
+    if legacy.status.success() {
         Ok(())
     } else {
         Err(format!(
@@ -738,13 +949,13 @@ pub(crate) const MEMORY_LAYER_INJECTION_TOKENS: usize = 10_000;
 
 /// L3 中 MCP 调用提示的去重标记：整理侧生成草案与注入侧兜底补写都用它
 /// 判断提示是否已存在，避免重复追加。
-pub(crate) const L3_MCP_HINT_MARKER: &str = "agent-manager-memory-mcp";
+pub(crate) const L3_MCP_HINT_MARKER: &str = "Vibe-Assistant-memory-mcp";
 
 /// 永久写入长期记忆的 MCP 调用提示：告知任何接入的 Agent 可以主动调用
-/// agent-manager-memory MCP 工具按需检索更多记忆。文案刻意避开
+/// Vibe-Assistant-memory MCP 工具按需检索更多记忆。文案刻意避开
 /// `is_l3_volatile_bullet` 的易变标记（token/模型/端点等），保证能通过
 /// L3 持久化校验。
-pub(crate) const L3_MCP_HINT_SECTION: &str = "## Memory query\n- Agents can call the agent-manager-memory-mcp tools at any time to retrieve more shared memory: recall_memory for semantic search over past decisions and preferences, get_user_profile for the long-term profile, list_shared_skills and read_shared_skill for reusable workflows.\n- 智能体可随时调用 agent-manager-memory-mcp 的工具查询更多记忆：recall_memory 语义检索历史决策与偏好，get_user_profile 获取长期画像，list_shared_skills / read_shared_skill 读取共享技能。";
+pub(crate) const L3_MCP_HINT_SECTION: &str = "## Memory query\n- Agents can call the Vibe-Assistant-memory-mcp tools at any time to retrieve more shared memory: recall_memory for semantic search over past decisions and preferences, get_user_profile for the long-term profile, list_shared_skills and read_shared_skill for reusable workflows.\n- 智能体可随时调用 Vibe-Assistant-memory-mcp 的工具查询更多记忆：recall_memory 语义检索历史决策与偏好，get_user_profile 获取长期画像，list_shared_skills / read_shared_skill 读取共享技能。";
 
 /// 若 L3 正文缺少 MCP 调用提示则原样保留并追加该提示区块；已含标记
 /// （整理侧已写入或用户手写）时保持正文不变。
@@ -868,49 +1079,43 @@ pub(crate) fn shared_context_instructions() -> String {
 /// per-turn gate, so the first UserPromptSubmit of this conversation skips a
 /// byte-identical L3 payload instead of duplicating what SessionStart just
 /// delivered.
-pub(crate) fn hook_session_start_context(source: &str) -> String {
+pub(crate) fn hook_session_start_context(_source: &str) -> (String, String) {
     let context = load_shared_context_documents();
     let rendered = render_shared_context(SharedContextScope::SessionStart, context.as_ref());
-    let prompt_payload = render_shared_context(SharedContextScope::Prompt, context.as_ref());
-    remember_prompt_fingerprint(source, &prompt_payload);
-    rendered
+    let prompt = render_shared_context(SharedContextScope::Prompt, context.as_ref());
+    (rendered, context_fingerprint(&prompt))
 }
 
 /// UserPromptSubmit Hook payload after content gating.
 pub(crate) struct PromptInjection {
-    /// Rendered payload; `None` when byte-identical to the payload this source
-    /// already received — the caller returns an empty hook body so the turn
-    /// costs zero injected tokens.
+    /// Rendered payload; `None` only when this specific session previously
+    /// received the same bytes through a confirmed HTTP response write.
     pub(crate) context: Option<String>,
     /// Short fingerprint of the rendered payload (telemetry only).
     pub(crate) fingerprint: String,
 }
 
-pub(crate) fn hook_prompt_context_gated(source: &str) -> PromptInjection {
+pub(crate) fn hook_prompt_context_gated(source: &str, session_id: Option<&str>) -> PromptInjection {
     let context = load_shared_context_documents();
     let rendered = render_shared_context(SharedContextScope::Prompt, context.as_ref());
     let fingerprint = context_fingerprint(&rendered);
-    let unchanged = match prompt_gate().lock() {
-        Ok(mut gate) => {
-            let unchanged = gate.get(source).is_some_and(|last| *last == fingerprint);
-            gate.insert(source.to_string(), fingerprint.clone());
-            unchanged
-        }
-        // A poisoned lock must degrade to injecting, never to skipping.
-        Err(_) => false,
-    };
+    let unchanged = session_id.filter(|id| !id.is_empty() && id.len() <= 256)
+        .and_then(|id| prompt_gate().lock().ok().and_then(|gate| {
+            gate.get(&(source.to_string(), id.to_string()))
+                .map(|(last, _)| last == &fingerprint)
+        })).unwrap_or(false);
     PromptInjection {
         context: (!unchanged).then_some(rendered),
         fingerprint,
     }
 }
 
-/// Record the prompt-scope payload a source received outside the per-turn
-/// path (SessionStart delivered the same L3 content), so the next
-/// UserPromptSubmit does not re-send it.
-fn remember_prompt_fingerprint(source: &str, prompt_payload: &str) {
+/// Commit the gate only after the HTTP response has been written successfully.
+pub(crate) fn hook_commit_prompt_fingerprint(source: &str, session_id: Option<&str>, fingerprint: &str) {
+    let Some(id) = session_id.filter(|id| !id.is_empty() && id.len() <= 256) else { return; };
     if let Ok(mut gate) = prompt_gate().lock() {
-        gate.insert(source.to_string(), context_fingerprint(prompt_payload));
+        gate.retain(|_, (_, seen)| seen.elapsed() < std::time::Duration::from_secs(86_400));
+        gate.insert((source.to_string(), id.to_string()), (fingerprint.to_string(), std::time::Instant::now()));
     }
 }
 
@@ -967,15 +1172,10 @@ fn recall(arguments: &Value) -> Result<Value, String> {
     let local_memories = store.search_local_l1_memories(query, limit)?;
     // The optional vector sidecar is only a mirror of durable L1. Never
     // return an orphaned vector record after a user intentionally resets L1.
-    let durable_l1 = store
-        .local_l1_memory_snapshot()?
-        .into_iter()
-        .map(|memory| normalized_memory_content(&memory.memory))
-        .collect::<HashSet<_>>();
-    let ids = local_memories
-        .iter()
-        .map(|memory| memory.id.clone())
-        .collect::<Vec<_>>();
+    let durable_ids = store.local_l1_memory_snapshot()?.into_iter()
+        .map(|memory| (normalized_memory_content(&memory.memory), memory.id))
+        .collect::<HashMap<_, _>>();
+    let durable_l1 = durable_ids.keys().cloned().collect::<HashSet<_>>();
     let semantic = crate::memory_backend::search_semantic_l1_memories(query, limit);
     let (semantic_memories, semantic_status) = match semantic {
         Ok(memories) => (memories, "semantic"),
@@ -984,18 +1184,6 @@ fn recall(arguments: &Value) -> Result<Value, String> {
             (Vec::new(), "local_fallback")
         }
     };
-    // The desktop app may be committing an incoming Hook at this moment.  A
-    // recall must remain read-available in that small SQLite write window;
-    // importance telemetry is useful but never worth delaying an Agent turn.
-    if let Err(error) = store.try_record_memory_recall(&ids) {
-        eprintln!("[memory-mcp] recall telemetry skipped: {error}");
-    }
-    let profile = store
-        .active_memory_layer_document("l3")?
-        .map(|item| item.content);
-    let working_memory = store
-        .active_memory_layer_document("l2")?
-        .map(|item| item.content);
     let semantic_candidate_count = semantic_memories.len();
     let local_candidate_count = local_memories.len();
     let memories = fuse_recall_candidates(
@@ -1004,11 +1192,15 @@ fn recall(arguments: &Value) -> Result<Value, String> {
         &durable_l1,
         limit as usize,
     );
+    let ids = memories.iter().filter_map(|memory| memory.get("content").and_then(Value::as_str))
+        .filter_map(|content| durable_ids.get(&normalized_memory_content(content)).cloned())
+        .collect::<Vec<_>>();
+    // Importance telemetry must never delay the result while a Hook is writing.
+    if let Err(error) = store.try_record_memory_recall(&ids) {
+        eprintln!("[memory-mcp] recall telemetry skipped: {error}");
+    }
     Ok(json!({
         "query": query,
-        "profile": profile,
-        "working_memory": working_memory
-            .map(|content| truncate_injection(&content, MEMORY_LAYER_INJECTION_TOKENS)),
         "retrieval": {
             "mode": semantic_status,
             "semantic_candidates": semantic_candidate_count,
@@ -1273,7 +1465,8 @@ pub fn run_stdio() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        context_fingerprint, fuse_recall_candidates, handle_request, hook_prompt_context_gated,
+        context_fingerprint, fuse_recall_candidates, handle_request, hook_commit_prompt_fingerprint,
+        hook_prompt_context_gated,
         normalized_memory_content, render_shared_context, truncate_injection, with_l3_mcp_hint,
         SharedContextDocuments, SharedContextScope, L3_MCP_HINT_MARKER,
     };
@@ -1399,7 +1592,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             response["result"]["serverInfo"]["name"],
-            "agent-manager-memory"
+            "Vibe-Assistant-memory"
         );
     }
 
@@ -1525,15 +1718,17 @@ mod tests {
     }
 
     #[test]
-    fn prompt_injection_gate_skips_unchanged_payloads_per_source() {
-        // 同一 source 的第二次拉取必须跳过（返回 None）；不同 source 互不影响。
-        let first = hook_prompt_context_gated("gate-test-a");
+    fn prompt_injection_gate_skips_only_confirmed_payloads_in_the_same_session() {
+        let first = hook_prompt_context_gated("gate-test-a", Some("session-a"));
         assert!(first.context.is_some());
-        let second = hook_prompt_context_gated("gate-test-a");
+        assert!(hook_prompt_context_gated("gate-test-a", Some("session-a")).context.is_some());
+        hook_commit_prompt_fingerprint("gate-test-a", Some("session-a"), &first.fingerprint);
+        let second = hook_prompt_context_gated("gate-test-a", Some("session-a"));
         assert!(second.context.is_none());
         assert_eq!(second.fingerprint, first.fingerprint);
-        let other = hook_prompt_context_gated("gate-test-b");
+        let other = hook_prompt_context_gated("gate-test-a", Some("session-b"));
         assert!(other.context.is_some());
+        assert!(hook_prompt_context_gated("gate-test-a", None).context.is_some());
     }
 
     fn semantic_candidate(id: &str, content: &str) -> crate::memory_backend::SemanticMemory {

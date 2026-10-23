@@ -55,6 +55,32 @@ static INGEST: OnceLock<IngestStore> = OnceLock::new();
 // Keep its cancellation flag independent of the UI so navigation cannot orphan a run.
 static MANUAL_EXTRACTION: Mutex<Option<tokio::sync::watch::Sender<bool>>> = Mutex::new(None);
 
+/// 手动整理的实时进度（memory_ingest_status 轮询给前端）。
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ExtractionProgress {
+    pub total: u32,
+    pub attempted: u32,
+    pub succeeded: u32,
+    pub failed: u32,
+    pub batch_index: u32,
+    pub batch_total: u32,
+}
+
+static EXTRACTION_PROGRESS: Mutex<ExtractionProgress> = Mutex::new(ExtractionProgress {
+    total: 0,
+    attempted: 0,
+    succeeded: 0,
+    failed: 0,
+    batch_index: 0,
+    batch_total: 0,
+});
+
+fn update_extraction_progress(apply: impl FnOnce(&mut ExtractionProgress)) {
+    let mut progress = EXTRACTION_PROGRESS.lock().unwrap();
+    apply(&mut progress);
+}
+
 struct ManualExtractionGuard(tokio::sync::watch::Receiver<bool>);
 
 impl ManualExtractionGuard {
@@ -245,17 +271,27 @@ impl IngestStore {
                     conversation_state = "partial";
                     conversation_messages.push(("assistant".to_string(), reply.to_string()));
                 }
+                let mut already_captured = false;
                 if let Some(store) = crate::telemetry_store::shared_store() {
-                    if let Err(error) = store.record_conversation(
+                    match store.record_conversation(
                         source,
                         &parsed,
                         conversation_state,
                         &conversation_messages,
                     ) {
-                        eprintln!("[memory-ingest] failed to annotate hook receipt: {error}");
+                        Ok(event_key) => {
+                            already_captured = store.conversation_is_covered(&event_key).unwrap_or(false);
+                        }
+                        Err(error) => eprintln!("[memory-ingest] failed to annotate hook receipt: {error}"),
                     }
                 }
-                self.flush_session(backend, &session_id);
+                // Without a complete Hook transcript, the enabled native
+                // reader owns this session's L0 body and later L1 extraction.
+                if already_captured || (conversation_state != "full" && crate::agent_sources::transcript_scan_enabled(source)) {
+                    self.inner.lock().unwrap().sessions.remove(&session_id);
+                } else {
+                    self.flush_session(backend, &session_id);
+                }
             }
             _ => {}
         }
@@ -381,7 +417,7 @@ impl IngestStore {
             .collect::<Vec<_>>()
             .join("\n\n");
         let extraction_messages = l1_extraction_messages(&transcript);
-        let extracted = match llm::complete_text(&provider, &extraction_messages).await {
+        let extracted = match llm::complete_text_for(&provider, &extraction_messages, None, crate::llm_trace::ModelPurpose::MemoryExtract).await {
             Ok(text) => match parse_typed_l1_candidates(&text) {
                 Ok(candidates) => candidates,
                 Err(error) => {
@@ -562,7 +598,7 @@ async fn extract_l1_conversation(
     transcript: &str,
 ) -> Result<Vec<crate::telemetry_store::L1MemoryCandidate>, String> {
     let provider = llm::memory_extraction_provider()?;
-    let text = llm::complete_text(&provider, &l1_extraction_messages(transcript)).await?;
+    let text = llm::complete_text_for(&provider, &l1_extraction_messages(transcript), None, crate::llm_trace::ModelPurpose::MemoryExtract).await?;
     parse_typed_l1_candidates(&text)
 }
 
@@ -856,7 +892,8 @@ pub fn telemetry_backfill_conversations() -> Result<u32, String> {
 /// 重录自动修复（同 event_key 覆盖正文、重新进入待提取队列）。
 /// v2：结构化块只保留 text 类；v3：注入包裹剥离下沉到读取器，
 ///     保证内容指纹反映清洗后文本（否则指纹不变的旧行永不重录）。
-const TRANSCRIPT_SCANNER_VERSION: i64 = 3;
+// v4: reconcile native transcript L0 against turns already captured by Hooks.
+const TRANSCRIPT_SCANNER_VERSION: i64 = 4;
 
 fn scan_native_transcripts(
     store: &crate::telemetry_store::TelemetryStore,
@@ -873,6 +910,9 @@ fn scan_native_transcripts(
     let mut imported = 0u32;
     // 转录根目录来自统一的 Agent 数据源注册表，支持按设备覆盖。
     for source in crate::agent_sources::AGENT_SOURCE_IDS {
+        if !crate::agent_sources::transcript_scan_enabled(source) {
+            continue;
+        }
         for root in crate::agent_sources::transcript_roots(source) {
             let mut pending = vec![root];
             let mut visited = 0usize;
@@ -891,7 +931,13 @@ fn scan_native_transcripts(
                         pending.push(path);
                         continue;
                     }
-                    if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+                    // DeepSeek Harness 的转录是 `session.vN.jsonl.zstd`
+                    // （扩展名 zstd），其余 Agent 均为明文 jsonl。
+                    let is_transcript = matches!(
+                        path.extension().and_then(|extension| extension.to_str()),
+                        Some("jsonl") | Some("zstd")
+                    );
+                    if !is_transcript {
                         continue;
                     }
                     let modified = entry
@@ -971,6 +1017,7 @@ fn read_native_session(source: &str, path: &Path) -> Result<Vec<(String, String)
         "workbuddy" => read_workbuddy_session(path),
         "minimax" => read_minimax_session(path),
         "kimi" => read_kimi_session(path),
+        "dsh" => read_dsh_session(path),
         _ => Ok(Vec::new()),
     }
 }
@@ -1073,6 +1120,58 @@ fn read_kimi_session(path: &Path) -> Result<Vec<(String, String)>, String> {
                     continue;
                 };
                 let text = text.trim().to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                append_native_message(&mut messages, &mut total_chars, "assistant", text);
+            }
+            _ => {}
+        }
+    }
+    Ok(messages)
+}
+
+/// DeepSeek Harness（DSH）会话是 `<dshHome>/sessions/<workspace>/
+/// session-<uuid>/session.vN.jsonl.zstd`：多个独立 Zstandard 帧拼接，
+/// 解压后逐行 JSON 事件。用户消息在 `user/message` 的 `data.content`，
+/// 助手正文在 `assistant/message` 的 `data.message.content`；`reasoning`、
+/// `tool-call` 等结构化块由 qoder_transcript_text 统一剔除。撕裂的末帧
+/// 只贡献完整解出的行（遇解压错误即停止并保留已读内容），与 DSH 自身的
+/// 崩溃恢复语义一致。
+fn read_dsh_session(path: &Path) -> Result<Vec<(String, String)>, String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    // 压缩文件 64 MiB 已远超单会话常态；解析在字符上限处提前停止，
+    // 不会真的解压全部内容。
+    if metadata.len() > 64 * 1024 * 1024 {
+        return Ok(Vec::new());
+    }
+    let reader = crate::dsh_transcript::open_lines(path)?;
+    let mut messages = Vec::new();
+    let mut total_chars = 0usize;
+    for line in reader.lines() {
+        if messages.len() >= NATIVE_SESSION_MAX_MESSAGES || total_chars >= NATIVE_SESSION_MAX_CHARS
+        {
+            break;
+        }
+        // 撕裂尾部帧：保留已读消息，按空会话/部分会话处理。
+        let Ok(line) = line else { break };
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let data = entry.get("data");
+        match entry.get("type").and_then(Value::as_str) {
+            Some("user/message") => {
+                let text = qoder_transcript_text(data.and_then(|data| data.get("content")));
+                if text.is_empty() {
+                    continue;
+                }
+                append_native_message(&mut messages, &mut total_chars, "user", text);
+            }
+            Some("assistant/message") => {
+                let text = qoder_transcript_text(
+                    data.and_then(|data| data.get("message"))
+                        .and_then(|message| message.get("content")),
+                );
                 if text.is_empty() {
                     continue;
                 }
@@ -2086,15 +2185,15 @@ pub(crate) async fn consolidate_l2(
     for chunk in evidence.chunks(50) {
         let text = l2_evidence_text(chunk);
         maps.push(truncate_text(
-            &llm::complete_text(&provider, &l2_map_messages(&text)).await?,
+            &llm::complete_text_for(&provider, &l2_map_messages(&text), None, crate::llm_trace::ModelPurpose::MemoryConsolidate).await?,
             8_000,
         ));
     }
     let mut content =
-        normalize_l2_document(&llm::complete_text(&provider, &l2_reduce_messages(&maps)).await?);
+        normalize_l2_document(&llm::complete_text_for(&provider, &l2_reduce_messages(&maps), None, crate::llm_trace::ModelPurpose::MemoryConsolidate).await?);
     if is_l2_analysis_preamble(&content) || !has_l2_final_heading(&content) {
         content = normalize_l2_document(
-            &llm::complete_text(&provider, &l2_final_retry_messages(&maps)).await?,
+            &llm::complete_text_for(&provider, &l2_final_retry_messages(&maps), None, crate::llm_trace::ModelPurpose::MemoryConsolidate).await?,
         );
     }
     // Normalise before truncation.  Otherwise a long exposed planning preamble
@@ -2203,10 +2302,11 @@ pub(crate) async fn draft_l3(
     // even when the final persisted Profile itself is deliberately short.
     // Treat any empty/invalid first response like malformed output and retry
     // once with a much smaller final-body contract.
-    let initial = llm::complete_text_with_limit(
+    let initial = llm::complete_text_for(
         &provider,
         &l3_profile_messages(&baseline, &input, language),
         None,
+        crate::llm_trace::ModelPurpose::ProfileBuild,
     )
     .await;
     let initial_error = initial.as_ref().err().cloned();
@@ -2215,10 +2315,11 @@ pub(crate) async fn draft_l3(
         .map(|text| filter_l3_profile(&normalize_l3_profile(&text)))
         .unwrap_or_default();
     if !is_usable_l3_profile(&content, &input) {
-        let retry = llm::complete_text_with_limit(
+        let retry = llm::complete_text_for(
             &provider,
             &l3_profile_retry_messages(&baseline, &input, language),
             None,
+            crate::llm_trace::ModelPurpose::ProfileBuild,
         )
         .await;
         content = match retry {
@@ -2356,10 +2457,8 @@ fn hook_command(agent_type: &str) -> Result<String, String> {
 }
 
 /// SessionStart 注入 hook：拉取 L3 长期记忆 + L2 近 30 天工作记忆合并写到
-/// stdout。端点已按来源返回 Claude 形态的结构化 JSON
-/// （hookSpecificOutput.additionalContext），curl 只需透传，harness 解析后注入
-/// 模型上下文。应用未运行时 curl 静默失败，不阻塞会话启动。URL 携带 source
-/// 标识，端点据此把注入计入记忆注入摘要。
+/// stdout。stdin 的事件 JSON 一并送到端点，供会话级门控识别 session_id。
+/// 端点按来源返回 Claude 形态的结构化 JSON。
 fn hook_inject_command(agent_type: &str) -> String {
     let url = format!(
         "http://127.0.0.1:{}/memory/context?source={agent_type}&event=SessionStart",
@@ -2367,33 +2466,25 @@ fn hook_inject_command(agent_type: &str) -> String {
     );
     let marker = format!(r#" -H "{HOOK_MARKER}: 1""#);
     if cfg!(windows) {
-        format!(r#"curl.exe -fsS --max-time 5 "{url}"{marker}"#)
+        format!(r#"curl.exe -fsS --max-time 5 -X POST "{url}" -H "Content-Type: application/json" --data-binary "@-"{marker}"#)
     } else {
-        format!(r#"curl -fsS --max-time 5 '{url}'{marker}"#)
+        format!(r#"curl -fsS --max-time 5 -X POST '{url}' -H 'Content-Type: application/json' --data-binary '@-' {marker}"#)
     }
 }
 
-/// UserPromptSubmit 组合 hook：先透传 stdin 事件到沉淀端点（出站），再拉取
-/// L3 长期记忆写到 stdout（入站）。端点按内容指纹门控：L3 未变化时返回空
-/// 正文，本轮零注入成本。两条 curl 用分隔符串联：沉淀失败（应用未运行）
-/// 不阻断注入；注入失败时 stdout 为空，harness 按无附加上下文继续，不阻塞
-/// 提问。端点带 event=UserPromptSubmit，按事件名返回协议格式并单独计入
-/// 记忆注入摘要（跳过也会留痕，正文不重复存储）。
+/// UserPromptSubmit 由同一 POST 完成记忆沉淀与 L3 注入，避免 stdin 被第一
+/// 条命令消费后丢失 session_id。端点按会话和内容指纹门控；写出成功后才
+/// 更新门控和 Hook 账本。应用未运行时 curl 失败，不阻断提问。
 fn hook_prompt_command(agent_type: &str) -> Result<String, String> {
-    let sink = hook_command(agent_type)?;
     let inject_url = format!(
         "http://127.0.0.1:{}/memory/context?source={agent_type}&event=UserPromptSubmit",
         crate::agent_http::AGENT_HTTP_PORT
     );
     let marker = format!(r#" -H "{HOOK_MARKER}: 1""#);
     if cfg!(windows) {
-        Ok(format!(
-            r#"{sink} & curl.exe -fsS --max-time 5 "{inject_url}"{marker}"#
-        ))
+        Ok(format!(r#"curl.exe -fsS --max-time 5 -X POST "{inject_url}" -H "Content-Type: application/json" --data-binary "@-"{marker}"#))
     } else {
-        Ok(format!(
-            r#"{sink}; curl -fsS --max-time 5 '{inject_url}'{marker}"#
-        ))
+        Ok(format!(r#"curl -fsS --max-time 5 -X POST '{inject_url}' -H 'Content-Type: application/json' --data-binary '@-' {marker}"#))
     }
 }
 
@@ -2404,6 +2495,8 @@ fn hook_prompt_command(agent_type: &str) -> Result<String, String> {
 pub fn memory_hook_install(agent_type: String) -> Result<Vec<String>, String> {
     match agent_type.as_str() {
         "claude" | "qoder" | "codex" | "workbuddy" => install_command_hooks(&agent_type),
+        // DSH 无命令式 Hook：注入由 cordis pre-step 插件承载（见 dsh_injection）。
+        "dsh" => crate::dsh_injection::install(),
         other => Err(format!("暂不支持的 Agent 类型: {other}")),
     }
 }
@@ -2425,9 +2518,8 @@ fn install_command_hooks(agent_type: &str) -> Result<Vec<String>, String> {
     let inject_command = hook_inject_command(agent_type);
     let prompt_command = hook_prompt_command(agent_type)?;
     let mut installed = Vec::new();
-    // 出站沉淀（Agent → 本应用）与入站注入：SessionStart 注入 L3+L2 完整
-    // 稳定层；UserPromptSubmit 用组合命令沉淀当前轮，并按内容指纹门控注入
-    // L3（内容未变化时端点返回空正文，本轮跳过）。
+    // SessionStart 注入 L3+L2；UserPromptSubmit 单次 POST 完成沉淀与 L3
+    // 更新。两者均传递事件 JSON，以便端点按 session_id 独立门控。
     for (event, command) in [
         ("UserPromptSubmit", &prompt_command),
         ("PostToolUse", &command),
@@ -2479,6 +2571,9 @@ fn install_command_hooks(agent_type: &str) -> Result<Vec<String>, String> {
 /// 卸载本工具注入的 hook 回调（只移除包含 memory/hook 的命令，保留其他配置）。
 #[tauri::command]
 pub fn memory_hook_uninstall(agent_type: String) -> Result<(), String> {
+    if agent_type == "dsh" {
+        return crate::dsh_injection::uninstall();
+    }
     if !matches!(
         agent_type.as_str(),
         "claude" | "qoder" | "codex" | "workbuddy"
@@ -2528,6 +2623,14 @@ pub struct HookStatus {
 /// 检查某类 Agent 是否已安装记忆 hook。
 #[tauri::command]
 pub async fn memory_hook_status(agent_type: String) -> Result<HookStatus, String> {
+    if agent_type == "dsh" {
+        let (installed, events) = crate::dsh_injection::status();
+        return Ok(HookStatus {
+            installed,
+            agent_type,
+            events,
+        });
+    }
     if matches!(
         agent_type.as_str(),
         "claude" | "qoder" | "codex" | "workbuddy"
@@ -2558,7 +2661,9 @@ pub async fn memory_hook_status(agent_type: String) -> Result<HookStatus, String
                                                 // 沉淀不注入。两者均视为未启用以引导升级。
                                                 && ((**e != "SessionStart"
                                                     && **e != "UserPromptSubmit")
-                                                    || item.contains("memory/context?source="))
+                                                    || (item.contains("memory/context?source=")
+                                                        && item.contains("-X POST")
+                                                        && item.contains("--data-binary")))
                                         })
                                         .unwrap_or(false)
                                 })
@@ -2568,7 +2673,8 @@ pub async fn memory_hook_status(agent_type: String) -> Result<HookStatus, String
                     .map(|s| s.to_string())
                     .collect::<Vec<_>>();
                 return Ok(HookStatus {
-                    installed: !events.is_empty(),
+                    installed: events.iter().any(|event| event == "SessionStart")
+                        && events.iter().any(|event| event == "UserPromptSubmit"),
                     agent_type,
                     events,
                 });
@@ -2592,6 +2698,7 @@ pub struct IngestStatus {
     pub model_ready: bool,
     pub manual_extraction_running: bool,
     pub manual_extraction_cancelling: bool,
+    pub extraction_progress: ExtractionProgress,
     pub recent: Vec<IngestLog>,
 }
 
@@ -2609,6 +2716,7 @@ pub async fn memory_ingest_status(
         model_ready,
         manual_extraction_running: manual_extraction.is_some(),
         manual_extraction_cancelling: manual_extraction.as_ref().is_some_and(|sender| *sender.borrow()),
+        extraction_progress: EXTRACTION_PROGRESS.lock().unwrap().clone(),
         recent: state.recent_logs(),
     })
 }
@@ -2660,6 +2768,16 @@ pub async fn memory_ingest_organize_conversations() -> Result<OrganizeConversati
         telemetry.pending_l1_conversations(1_000)?
     };
     ingest.log(IngestLog { at: now_str(), agent_id: GLOBAL_MEMORY_OWNER.into(), kind: "memory".into(), state: "working".into(), detail: format!("整理队列开始：原生扫描新增 {native_imported}；待处理 {} 个会话，每批 {ORGANIZE_BATCH_LIMIT} 个", pending.len()) });
+    update_extraction_progress(|progress| {
+        *progress = ExtractionProgress {
+            total: pending.len() as u32,
+            attempted: 0,
+            succeeded: 0,
+            failed: 0,
+            batch_index: 0,
+            batch_total: pending.len().div_ceil(ORGANIZE_BATCH_LIMIT as usize) as u32,
+        };
+    });
     let mut result = OrganizeConversationsResult {
         attempted: 0,
         succeeded: 0,
@@ -2669,6 +2787,7 @@ pub async fn memory_ingest_organize_conversations() -> Result<OrganizeConversati
     };
     'batches: for (batch_index, batch) in pending.chunks(ORGANIZE_BATCH_LIMIT as usize).enumerate() {
         if run.cancelled() { result.cancelled = true; break; }
+        update_extraction_progress(|progress| progress.batch_index = batch_index as u32 + 1);
         ingest.log(IngestLog {
             at: now_str(),
             agent_id: GLOBAL_MEMORY_OWNER.into(),
@@ -2683,6 +2802,7 @@ pub async fn memory_ingest_organize_conversations() -> Result<OrganizeConversati
         for conversation in batch {
             if run.cancelled() { result.cancelled = true; break 'batches; }
             result.attempted += 1;
+            update_extraction_progress(|progress| progress.attempted += 1);
             let mut last_error = String::new();
             let mut stored = false;
             for retry in 0..=3 {
@@ -2704,6 +2824,7 @@ pub async fn memory_ingest_organize_conversations() -> Result<OrganizeConversati
                             candidates.iter().map(|item| item.content.clone()).collect(),
                         );
                         result.succeeded += 1;
+                        update_extraction_progress(|progress| progress.succeeded += 1);
                         stored = true;
                         ingest.log(IngestLog {
                             at: now_str(),
@@ -2730,6 +2851,7 @@ pub async fn memory_ingest_organize_conversations() -> Result<OrganizeConversati
             if !stored {
                 telemetry.set_l1_failure(&conversation.event_key, &last_error)?;
                 result.failed += 1;
+                update_extraction_progress(|progress| progress.failed += 1);
                 let reason = format!("{}：{}", conversation.event_key, last_error);
                 result.failure_reasons.push(reason.clone());
                 ingest.log(IngestLog {
@@ -3225,6 +3347,8 @@ async fn refresh_l3_if_due(
 
 #[cfg(test)]
 mod tests {
+    static MANUAL_EXTRACTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     use super::{
         filter_l3_profile, has_l2_final_heading, hook_inject_command, hook_prompt_command,
         is_l2_analysis_preamble, is_usable_l3_profile, normalize_l2_document,
@@ -3236,6 +3360,7 @@ mod tests {
 
     #[test]
     fn manual_extraction_can_be_cancelled_and_restarted() {
+        let _lock = MANUAL_EXTRACTION_TEST_LOCK.lock().unwrap();
         let first = super::ManualExtractionGuard::start().unwrap();
         assert!(!first.cancelled());
         assert!(super::ManualExtractionGuard::start().is_err());
@@ -3249,6 +3374,7 @@ mod tests {
 
     #[tokio::test]
     async fn manual_extraction_interrupts_pending_request() {
+        let _lock = MANUAL_EXTRACTION_TEST_LOCK.lock().unwrap();
         let run = super::ManualExtractionGuard::start().unwrap();
         let waiting = async {
             run.wait_for_cancel().await;
@@ -3263,14 +3389,13 @@ mod tests {
     }
 
     #[test]
-    fn prompt_hook_combines_sink_and_per_turn_injection() {
+    fn prompt_hook_posts_event_once_for_ingest_and_injection() {
         let command = hook_prompt_command("qoder").expect("command must build");
-        // 出站沉淀与入站注入必须在同一条命令里，且都带来源标识。
-        assert!(command.contains("/memory/hook?source=qoder"));
         assert!(command.contains("/memory/context?source=qoder&event=UserPromptSubmit"));
         assert!(command.contains("X-Agent-Manager-Hook: 1"));
-        // 沉淀失败不阻断注入：分隔符串联而非 && 短路。
-        assert!(command.contains('&') || command.contains(';'));
+        assert!(command.contains("-X POST"));
+        assert!(command.contains("--data-binary"));
+        assert!(!command.contains("/memory/hook?source="));
     }
 
     #[test]

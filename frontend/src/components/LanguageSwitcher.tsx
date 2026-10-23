@@ -29,7 +29,7 @@ export function LanguageSwitcher() {
     <div ref={ref} className="relative">
       <button
         onClick={() => setOpen(o => !o)}
-        className="rounded-md p-1.5 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300"
+        className="app-icon-button"
         title={LANGUAGES.find(l => l.code === current)?.label}
       >
         <Languages className="h-4 w-4" />

@@ -240,5 +240,5 @@ export function CloudVaultCard({ onSynced }: { onSynced?: () => void }) {
 }
 
 function ConflictPane({ title, value, changedAt }: { title: string; value: string; changedAt: string | null }) {
-  return <article className="min-w-0 rounded-lg border border-gray-200 bg-gray-50/70 dark:border-gray-700 dark:bg-gray-800/60"><header className="flex items-center justify-between border-b border-gray-200 px-3 py-2 text-xs font-medium text-gray-700 dark:border-gray-700 dark:text-gray-200"><span>{title}</span>{changedAt && <time className="font-normal text-gray-400">{new Date(changedAt).toLocaleString()}</time>}</header><pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words p-3 text-xs leading-5 text-gray-700 dark:text-gray-300">{value}</pre></article>
+  return <article className="min-w-0 rounded-lg border border-gray-200 bg-gray-50/70 dark:border-gray-700 dark:bg-gray-800/60"><header className="flex items-center justify-between border-b border-gray-200 px-3 py-2 text-xs font-medium text-gray-700 dark:border-gray-700 dark:text-gray-200"><span>{title}</span>{changedAt && <time className="font-normal text-gray-500">{new Date(changedAt).toLocaleString()}</time>}</header><pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words p-3 text-xs leading-5 text-gray-700 dark:text-gray-300">{value}</pre></article>
 }

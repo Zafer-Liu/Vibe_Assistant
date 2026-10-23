@@ -1,82 +1,53 @@
 import { useTranslation } from 'react-i18next'
 import { invoke } from '@tauri-apps/api/core'
 import { save, open } from '@tauri-apps/plugin-dialog'
-import { Download, Upload, Loader2, CheckCircle2, AlertCircle, Brain, Info, DatabaseBackup, Cloud, Smartphone, Copy, RotateCcw, Timer } from 'lucide-react'
+import { Download, Upload, Loader2, CheckCircle2, AlertCircle, Brain, Info, DatabaseBackup, Cloud, Timer, PanelBottomClose, Search } from 'lucide-react'
 import { useState, useCallback, useEffect, type ReactNode } from 'react'
+import { WindowBehaviorSettings } from '../features/desktop/WindowBehaviorSettings'
 import { LlmSettings } from './LlmSettings'
+import { SemanticSearchSettings } from '../features/memory/SemanticSearchSettings'
 import { ErrorRecovery } from '../components/ErrorRecovery'
 
-export function Settings({ onOpenOnboarding }: { onOpenOnboarding: () => void }) {
+export type SettingsSection = 'general' | 'llm' | 'memory' | 'cloud'
+
+export function Settings({ section, onSectionChange: _onSectionChange, onOpenOnboarding }: {
+  section: SettingsSection
+  onSectionChange?: (s: SettingsSection) => void
+  onOpenOnboarding: () => void
+}) {
   const { t } = useTranslation()
 
+  const sectionTitles: Record<SettingsSection, string> = {
+    general: t('nav.settingsGeneral'),
+    llm: t('nav.settingsLlm'),
+    memory: t('nav.settingsMemory'),
+    cloud: t('nav.settingsCloud'),
+  }
+
   return (
-    <div className="flex h-full flex-col overflow-y-auto bg-gray-50 dark:bg-gray-950">
-      <div className="mx-auto w-full max-w-3xl px-6 py-8 space-y-6">
+    <div className="flex h-full flex-col overflow-y-auto bg-[var(--app-canvas)]">
+      <div className="mx-auto w-full max-w-3xl px-6 py-8 space-y-8">
       {/* Page header */}
       <div>
-        <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
-          {t('settings.title')}
-        </h2>
-        <p className="text-xs text-gray-500 mt-0.5">{t('settings.subtitle')}</p>
-        <button type="button" onClick={onOpenOnboarding} className="mt-3 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-white focus-visible:outline-2 focus-visible:outline-blue-500 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-800">{t('onboarding.reopen')}</button>
+        <h1 className="text-lg font-semibold text-[var(--app-text)]">
+          {sectionTitles[section]}
+        </h1>
+        <p className="text-xs text-[var(--app-secondary)] mt-0.5">{t('settings.subtitle')}</p>
+        <button type="button" onClick={onOpenOnboarding} className="mt-3 rounded-lg border border-[var(--app-stroke)] px-3 py-1.5 text-xs font-medium text-[var(--app-secondary)] hover:bg-[var(--app-hover)] focus-visible:outline-2 focus-visible:outline-[var(--app-focus)]">{t('onboarding.reopen')}</button>
       </div>
 
-      {/* LLM & Memory */}
+      {section === 'general' && (<>
       <SettingsSection
-        icon={<Brain size={15} className="text-violet-600 dark:text-violet-400" />}
-        title={t('settings.sectionLlm')}
-        desc={t('settings.sectionLlmHint')}
+        icon={<PanelBottomClose size={15} className="text-[var(--app-accent)]" />}
+        title={t('desktop.settingsTitle')}
+        desc={t('desktop.settingsDescription')}
       >
-        <LlmSettings embedded />
-      </SettingsSection>
-
-      {/* Memory scheduled refresh */}
-      <SettingsSection
-        icon={<Timer size={15} className="text-sky-600 dark:text-sky-400" />}
-        title={t('settings.memoryAutoRefresh.title')}
-        desc={t('settings.memoryAutoRefresh.hint')}
-      >
-        <Card>
-        <MemoryAutoRefreshSettings />
-        </Card>
-      </SettingsSection>
-
-      {/* Backup & Restore */}
-      <SettingsSection
-        icon={<DatabaseBackup size={15} className="text-blue-600 dark:text-blue-400" />}
-        title={t('settings.sectionBackup')}
-        desc={t('settings.sectionBackupHint')}
-      >
-        <Card>
-        <BackupRestore />
-        </Card>
-      </SettingsSection>
-
-      {/* Cloud Memory Vault */}
-      <SettingsSection
-        icon={<Cloud size={15} className="text-cyan-600 dark:text-cyan-400" />}
-        title={t('settings.cloudVault.title')}
-        desc={t('settings.cloudVault.hint')}
-      >
-        <Card>
-        <CloudVaultSettings />
-        </Card>
-      </SettingsSection>
-
-      {/* Mobile read-only status */}
-      <SettingsSection
-        icon={<Smartphone size={15} className="text-emerald-600 dark:text-emerald-400" />}
-        title={t('settings.mobileStatus.title')}
-        desc={t('settings.mobileStatus.hint')}
-      >
-        <Card>
-          <MobileStatusSettings />
-        </Card>
+        <Card><WindowBehaviorSettings /></Card>
       </SettingsSection>
 
       {/* About */}
       <SettingsSection
-        icon={<Info size={15} className="text-gray-500" />}
+        icon={<Info size={15} className="text-[var(--app-secondary)]" />}
         title={t('settings.sectionAbout')}
       >
         <Card>
@@ -91,16 +62,71 @@ export function Settings({ onOpenOnboarding }: { onOpenOnboarding: () => void })
         </div>
         </Card>
       </SettingsSection>
+      </>)}
+
+      {section === 'llm' && (
+      <SettingsSection
+        icon={<Brain size={15} className="text-[var(--app-accent)]" />}
+        title={t('settings.sectionLlm')}
+        desc={t('settings.sectionLlmHint')}
+      >
+        <LlmSettings embedded />
+      </SettingsSection>
+      )}
+
+      {section === 'memory' && (<>
+      <SettingsSection
+        icon={<Search size={15} className="text-[var(--app-accent)]" />}
+        title={t('settings.semanticSearch.title')}
+        desc={t('settings.semanticSearch.hint')}
+      >
+        {/* No Card wrapper: the panel uses one banner + flat field groups,
+            so an extra bordered box would read as a nested card. */}
+        <SemanticSearchSettings />
+      </SettingsSection>
+
+      <hr className="border-[var(--app-stroke)]" />
+
+      {/* Memory scheduled refresh */}
+      <SettingsSection
+        icon={<Timer size={15} className="text-[var(--app-accent)]" />}
+        title={t('settings.memoryAutoRefresh.title')}
+        desc={t('settings.memoryAutoRefresh.hint')}
+      >
+        <Card>
+        <MemoryAutoRefreshSettings />
+        </Card>
+      </SettingsSection>
+      </>)}
+
+      {section === 'cloud' && (<>
+      {/* Cloud Memory Vault */}
+      <SettingsSection
+        icon={<Cloud size={15} className="text-[var(--app-accent)]" />}
+        title={t('settings.cloudVault.title')}
+        desc={t('settings.cloudVault.hint')}
+      >
+        <Card>
+        <CloudVaultSettings />
+        </Card>
+      </SettingsSection>
+
+      <hr className="border-[var(--app-stroke)]" />
+
+      {/* Backup & Restore */}
+      <SettingsSection
+        icon={<DatabaseBackup size={15} className="text-[var(--app-accent)]" />}
+        title={t('settings.sectionBackup')}
+        desc={t('settings.sectionBackupHint')}
+      >
+        <Card>
+        <BackupRestore />
+        </Card>
+      </SettingsSection>
+      </>)}
       </div>
     </div>
   )
-}
-
-interface MobileStatusSettingsView {
-  enabled: boolean
-  url: string
-  port: number
-  token_set: boolean
 }
 
 interface MemoryAutoRefreshView {
@@ -164,15 +190,15 @@ function MemoryAutoRefreshSettings() {
   }
 
   if (!config && !error) {
-    return <div className="flex items-center gap-2 text-xs text-gray-400"><Loader2 size={14} className="animate-spin" />{t('settings.mobileStatus.loading')}</div>
+    return <div className="flex items-center gap-2 text-xs text-[var(--app-secondary)]"><Loader2 size={14} className="animate-spin" />{t('settings.mobileStatus.loading')}</div>
   }
 
   return (
     <div className="space-y-3">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <div className="text-sm font-medium text-gray-800 dark:text-gray-200">{t('settings.memoryAutoRefresh.enable')}</div>
-          <p className="mt-0.5 text-xs leading-5 text-gray-500 dark:text-gray-400">{t('settings.memoryAutoRefresh.enableHint')}</p>
+          <div className="text-sm font-medium text-[var(--app-text)]">{t('settings.memoryAutoRefresh.enable')}</div>
+          <p className="mt-0.5 text-xs leading-5 text-[var(--app-secondary)]">{t('settings.memoryAutoRefresh.enableHint')}</p>
         </div>
         <button
           type="button"
@@ -181,7 +207,7 @@ function MemoryAutoRefreshSettings() {
           aria-label={t('settings.memoryAutoRefresh.enable')}
           disabled={working || !config}
           onClick={() => { void save({ enabled: !(config?.enabled ?? false) }) }}
-          className={`relative mt-0.5 h-6 w-11 shrink-0 rounded-full transition ${config?.enabled ? 'bg-sky-600' : 'bg-gray-300 dark:bg-gray-700'} disabled:opacity-50`}
+          className={`relative mt-0.5 h-6 w-11 shrink-0 rounded-full transition ${config?.enabled ? 'bg-[var(--app-accent)]' : 'bg-[var(--app-control-stroke)]'} disabled:opacity-50`}
         >
           <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-all ${config?.enabled ? 'left-5.5' : 'left-0.5'}`} />
         </button>
@@ -189,8 +215,8 @@ function MemoryAutoRefreshSettings() {
 
       {config?.enabled && draft && (
         <div className="grid gap-3 sm:grid-cols-2">
-          <label className="block rounded-lg border border-sky-200 bg-sky-50/60 p-3 dark:border-sky-900/60 dark:bg-sky-950/20">
-            <span className="text-xs font-medium text-sky-900 dark:text-sky-200">{t('settings.memoryAutoRefresh.l2Label')}</span>
+          <label className="block rounded-lg border border-[var(--app-stroke)] bg-[var(--app-layer)] p-3">
+            <span className="text-xs font-medium text-[var(--app-text)]">{t('settings.memoryAutoRefresh.l2Label')}</span>
             <div className="mt-1.5 flex items-center gap-2">
               <input
                 type="number"
@@ -202,15 +228,15 @@ function MemoryAutoRefreshSettings() {
                 onChange={(e) => { setDraft({ ...draft, l2: e.target.value }) }}
                 onBlur={() => { commitDays('l2') }}
                 onKeyDown={(e) => { if (e.key === 'Enter') { e.currentTarget.blur() } }}
-                className="w-20 rounded-md border border-gray-300 bg-white px-2 py-1 text-sm text-gray-900 focus:border-sky-500 focus:outline-none dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100"
+                className="w-20 rounded-md border border-[var(--app-control-stroke)] bg-[var(--app-surface)] px-2 py-1 text-sm text-[var(--app-text)] focus:border-[var(--app-accent)] focus:outline-none"
               />
-              <span className="text-xs text-gray-500 dark:text-gray-400">{t('settings.memoryAutoRefresh.daysUnit')}</span>
+              <span className="text-xs text-[var(--app-secondary)]">{t('settings.memoryAutoRefresh.daysUnit')}</span>
               {saved && <CheckCircle2 size={14} className="text-emerald-500" />}
             </div>
-            <p className="mt-1.5 text-[11px] leading-4 text-sky-800/80 dark:text-sky-300/80">{t('settings.memoryAutoRefresh.l2Hint')}</p>
+            <p className="mt-1.5 text-[11px] leading-4 text-[var(--app-secondary)]">{t('settings.memoryAutoRefresh.l2Hint')}</p>
           </label>
-          <label className="block rounded-lg border border-sky-200 bg-sky-50/60 p-3 dark:border-sky-900/60 dark:bg-sky-950/20">
-            <span className="text-xs font-medium text-sky-900 dark:text-sky-200">{t('settings.memoryAutoRefresh.l3Label')}</span>
+          <label className="block rounded-lg border border-[var(--app-stroke)] bg-[var(--app-layer)] p-3">
+            <span className="text-xs font-medium text-[var(--app-text)]">{t('settings.memoryAutoRefresh.l3Label')}</span>
             <div className="mt-1.5 flex items-center gap-2">
               <input
                 type="number"
@@ -222,17 +248,17 @@ function MemoryAutoRefreshSettings() {
                 onChange={(e) => { setDraft({ ...draft, l3: e.target.value }) }}
                 onBlur={() => { commitDays('l3') }}
                 onKeyDown={(e) => { if (e.key === 'Enter') { e.currentTarget.blur() } }}
-                className="w-20 rounded-md border border-gray-300 bg-white px-2 py-1 text-sm text-gray-900 focus:border-sky-500 focus:outline-none dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100"
+                className="w-20 rounded-md border border-[var(--app-control-stroke)] bg-[var(--app-surface)] px-2 py-1 text-sm text-[var(--app-text)] focus:border-[var(--app-accent)] focus:outline-none"
               />
-              <span className="text-xs text-gray-500 dark:text-gray-400">{t('settings.memoryAutoRefresh.daysUnit')}</span>
+              <span className="text-xs text-[var(--app-secondary)]">{t('settings.memoryAutoRefresh.daysUnit')}</span>
               {saved && <CheckCircle2 size={14} className="text-emerald-500" />}
             </div>
-            <p className="mt-1.5 text-[11px] leading-4 text-sky-800/80 dark:text-sky-300/80">{t('settings.memoryAutoRefresh.l3Hint')}</p>
+            <p className="mt-1.5 text-[11px] leading-4 text-[var(--app-secondary)]">{t('settings.memoryAutoRefresh.l3Hint')}</p>
           </label>
         </div>
       )}
 
-      <p className="border-t border-gray-100 pt-3 text-xs leading-5 text-gray-400 dark:border-gray-800 dark:text-gray-500">{t('settings.memoryAutoRefresh.footer')}</p>
+      <p className="border-t border-[var(--app-stroke)] pt-3 text-xs leading-5 text-[var(--app-secondary)]">{t('settings.memoryAutoRefresh.footer')}</p>
 
       {error && (
         <div role="alert" className="flex items-start gap-2 text-xs text-red-600 dark:text-red-400">
@@ -245,121 +271,6 @@ function MemoryAutoRefreshSettings() {
   )
 }
 
-function MobileStatusSettings() {
-  const { t } = useTranslation()
-  const [settings, setSettings] = useState<MobileStatusSettingsView | null>(null)
-  const [working, setWorking] = useState(false)
-  const [copied, setCopied] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    invoke<MobileStatusSettingsView>('mobile_status_get_settings')
-      .then(setSettings)
-      .catch((cause) => setError(String(cause)))
-  }, [])
-
-  async function toggle(enabled: boolean) {
-    setWorking(true)
-    setError(null)
-    try {
-      setSettings(await invoke<MobileStatusSettingsView>('mobile_status_set_enabled', { enabled }))
-    } catch (cause) {
-      setError(String(cause))
-    } finally {
-      setWorking(false)
-    }
-  }
-
-  async function rotateToken() {
-    setWorking(true)
-    setError(null)
-    try {
-      setSettings(await invoke<MobileStatusSettingsView>('mobile_status_rotate_token'))
-    } catch (cause) {
-      setError(String(cause))
-    } finally {
-      setWorking(false)
-    }
-  }
-
-  async function copyUrl() {
-    if (!settings) return
-    try {
-      await navigator.clipboard.writeText(settings.url)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1800)
-    } catch (cause) {
-      setError(String(cause))
-    }
-  }
-
-  if (!settings && !error) {
-    return <div className="flex items-center gap-2 text-xs text-gray-400"><Loader2 size={14} className="animate-spin" />{t('settings.mobileStatus.loading')}</div>
-  }
-
-  return (
-    <div className="space-y-3">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <div className="text-sm font-medium text-gray-800 dark:text-gray-200">{t('settings.mobileStatus.enable')}</div>
-          <p className="mt-0.5 text-xs leading-5 text-gray-500 dark:text-gray-400">{t('settings.mobileStatus.enableHint')}</p>
-        </div>
-        <button
-          type="button"
-          role="switch"
-          aria-checked={settings?.enabled ?? false}
-          aria-label={t('settings.mobileStatus.enable')}
-          disabled={working || !settings}
-          onClick={() => { void toggle(!(settings?.enabled ?? false)) }}
-          className={`relative mt-0.5 h-6 w-11 shrink-0 rounded-full transition ${settings?.enabled ? 'bg-emerald-600' : 'bg-gray-300 dark:bg-gray-700'} disabled:opacity-50`}
-        >
-          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-all ${settings?.enabled ? 'left-5.5' : 'left-0.5'}`} />
-        </button>
-      </div>
-
-      {settings?.enabled && (
-        <div className="rounded-lg border border-emerald-200 bg-emerald-50/70 p-3 dark:border-emerald-900/60 dark:bg-emerald-950/20">
-          <div className="text-xs font-medium text-emerald-900 dark:text-emerald-200">{t('settings.mobileStatus.url')}</div>
-          <div className="mt-2 flex items-start gap-2">
-            <code className="min-w-0 flex-1 break-all rounded-md bg-white px-2.5 py-2 text-xs leading-5 text-gray-700 dark:bg-gray-900 dark:text-gray-200">{settings.url}</code>
-            <button
-              type="button"
-              onClick={() => { void copyUrl() }}
-              className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-emerald-300 bg-white px-2.5 py-2 text-xs font-medium text-emerald-800 hover:bg-emerald-50 dark:border-emerald-800 dark:bg-gray-900 dark:text-emerald-300 dark:hover:bg-gray-800"
-            >
-              {copied ? <CheckCircle2 size={14} /> : <Copy size={14} />}
-              {copied ? t('common.copied') : t('common.copy')}
-            </button>
-          </div>
-          <p className="mt-2 text-xs leading-5 text-emerald-800/80 dark:text-emerald-300/80">{t('settings.mobileStatus.urlHint', { port: settings.port })}</p>
-        </div>
-      )}
-
-      <div className="flex flex-wrap items-center justify-between gap-3 border-t border-gray-100 pt-3 dark:border-gray-800">
-        <p className="max-w-xl text-xs leading-5 text-gray-400 dark:text-gray-500">{t('settings.mobileStatus.security')}</p>
-        <button
-          type="button"
-          disabled={working || !settings}
-          onClick={() => { void rotateToken() }}
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-800"
-        >
-          {working ? <Loader2 size={14} className="animate-spin" /> : <RotateCcw size={14} />}
-          {t('settings.mobileStatus.rotate')}
-        </button>
-      </div>
-
-      {error && (
-        <div role="alert" className="flex items-start gap-2 text-xs text-red-600 dark:text-red-400">
-          <AlertCircle size={14} className="mt-0.5 shrink-0" />
-          <span className="break-all">{error}</span>
-        </div>
-      )}
-    </div>
-  )
-}
-
-/// Section header with icon badge — no card wrapper so children manage
-/// their own visual containment (avoids cards-in-cards nesting).
 function SettingsSection({
   icon,
   title,
@@ -374,13 +285,13 @@ function SettingsSection({
   return (
     <section className="space-y-3">
       <div className="flex items-center gap-2.5">
-        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-gray-100 dark:bg-gray-800">
+        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-[var(--app-layer)]">
           {icon}
         </div>
         <div>
-          <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200">{title}</h3>
+          <h3 className="text-sm font-semibold text-[var(--app-text)]">{title}</h3>
           {desc && (
-            <p className="text-xs leading-5 text-gray-500 dark:text-gray-400">{desc}</p>
+            <p className="text-xs leading-5 text-[var(--app-secondary)]">{desc}</p>
           )}
         </div>
       </div>
@@ -391,7 +302,7 @@ function SettingsSection({
 
 function Card({ children }: { children: ReactNode }) {
   return (
-    <div className="rounded-lg border border-gray-200 bg-white p-4 dark:border-gray-800 dark:bg-gray-900">
+    <div className="rounded-lg border border-[var(--app-stroke)] bg-[var(--app-surface)] p-4">
       {children}
     </div>
   )
@@ -455,7 +366,7 @@ function CloudVaultSettings() {
   }, [])
 
   if (!loaded) {
-    return <div className="text-xs text-gray-400">{t('settings.cloudVault.loading')}</div>
+    return <div className="text-xs text-gray-500">{t('settings.cloudVault.loading')}</div>
   }
 
   const isS3 = kind === 's3'
@@ -584,10 +495,10 @@ function CloudVaultSettings() {
           ))}
         </div>
         {isWebdav && (
-          <p className="text-xs text-gray-400 dark:text-gray-500">{t('settings.cloudVault.webdavHint')}</p>
+          <p className="text-xs text-gray-500 dark:text-gray-400">{t('settings.cloudVault.webdavHint')}</p>
         )}
         {isS3 && (
-          <p className="text-xs text-gray-400 dark:text-gray-500">{t('settings.cloudVault.s3Hint')}</p>
+          <p className="text-xs text-gray-500 dark:text-gray-400">{t('settings.cloudVault.s3Hint')}</p>
         )}
         {refill && !url.trim() && (
           <p className="text-xs text-amber-600 dark:text-amber-400">
@@ -752,7 +663,7 @@ function CloudVaultSettings() {
           </div>
         </div>
       )}
-      <p className="text-xs text-gray-400 dark:text-gray-500">
+      <p className="text-xs text-gray-500 dark:text-gray-400">
         {t('settings.cloudVault.passwordStoreHint')}
       </p>
     </div>
@@ -911,7 +822,7 @@ function BackupRestore() {
         </div>
       )}
 
-      <p className="text-xs text-gray-400 dark:text-gray-500">{t('backup.importWarning')}</p>
+      <p className="text-xs text-gray-500 dark:text-gray-400">{t('backup.importWarning')}</p>
     </div>
   )
 }

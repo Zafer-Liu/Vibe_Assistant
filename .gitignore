@@ -5,6 +5,8 @@ frontend/dist/
 
 # ---------- Rust / Tauri ----------
 src-tauri/target/
+src-tauri/mcp-launcher/target/
+src-tauri/binaries/
 src-tauri/gen/
 src-tauri/.tauri/
 # Cargo.lock 应保留（二进制应用），如需忽略请取消下一行注释
@@ -75,3 +77,4 @@ PRODUCT.md
 .diagram-design
 .tmp_ratio.py
 gpup3.ps1
+DESIGN.md

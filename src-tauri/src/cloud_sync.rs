@@ -168,6 +168,15 @@ pub struct CloudVaultStatus {
     pub auto_interval_min: i64,
 }
 
+#[derive(Serialize)]
+pub struct CloudVaultExport {
+    pub path: String,
+    pub bytes: u64,
+    pub objects: u32,
+    pub tombstones: u32,
+    pub usage_objects: u32,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct RemoteObject {
     key: String,
@@ -2248,52 +2257,100 @@ pub fn start_cloud_sync_scheduler() {
     });
 }
 
+/// 把自建服务端（Railway）的全部远端对象导出为一个加密信封文件（vault.amv），
+/// 与 WebDAV/S3 使用的格式完全一致。可直接覆盖到坚果云的 agent-manager/ 目录。
+///
+/// 不修改本地数据库、不推进游标、不写回远端——纯只读导出。
+pub fn run_vault_export(output_path: &str) -> Result<String, String> {
+    let store = TelemetryStore::new().map_err(|e| format!("打开本地数据库失败：{e}"))?;
+    let config = vault_config(&store)?;
+    if config.password.is_empty() {
+        return Err("未设置同步密码：无法加密导出文件".into());
+    }
+    if config.remote.kind != RemoteKind::Server {
+        return Err("当前同步目标不是自建服务端（Railway）。请先切回 server 模式再导出".into());
+    }
+    let url = config.remote.url.trim().trim_end_matches('/').to_string();
+    let pat = config.remote.credential.clone();
+    if url.is_empty() || pat.is_empty() {
+        return Err("Railway 服务端地址或 PAT 未配置".into());
+    }
+
+    // 全量拉取远端对象（since_rev=0），不做本地落地，只收集 RemoteObject。
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(format!("{url}/objects"))
+        .query(&[("since_rev", "0")])
+        .bearer_auth(&pat)
+        .send()
+        .map_err(|e| format!("连接 Railway 失败：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Railway 拉取失败：HTTP {}", resp.status()));
+    }
+    let list: RemoteList = resp
+        .json()
+        .map_err(|e| format!("Railway 响应解析失败：{e}"))?;
+
+    // 过滤旧版 usage: 分片（与 pull() 的清理逻辑一致）
+    let objects: Vec<RemoteObject> = list
+        .objects
+        .into_iter()
+        .filter(|obj| !obj.key.starts_with("usage:"))
+        .collect();
+    let object_count = objects.len();
+    let tombstone_count = list.tombstones.len();
+    let revision = objects
+        .iter()
+        .map(|obj| obj.revision)
+        .chain(list.tombstones.iter().map(|tomb| tomb.revision))
+        .max()
+        .unwrap_or(0);
+
+    // 构建信封并加密
+    let envelope = VaultEnvelope {
+        format: ENVELOPE_FORMAT,
+        revision,
+        objects,
+        tombstones: list.tombstones,
+    };
+    let key = vault_key(&config.password);
+    let sealed = encode_envelope(&key, &envelope)?;
+
+    // 写入文件
+    let path = std::path::Path::new(output_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("创建输出目录失败：{e}"))?;
+    }
+    std::fs::write(path, &sealed).map_err(|e| format!("写入导出文件失败：{e}"))?;
+
+    // 回读验证
+    let written = std::fs::read(path).map_err(|e| format!("回读失败：{e}"))?;
+    let _ = decode_envelope(&key, &written)?; // 确认能解密
+
+    Ok(format!(
+        "导出成功：{object_count} 个对象 · {tombstone_count} 个墓碑 · {} 字节 → {}",
+        sealed.len(),
+        path.display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::telemetry_store::TelemetryStore;
     use crate::test_http::fake_dav;
     use crate::vault_remote::PutOutcome;
-    use rusqlite::Connection;
-    use std::sync::{Arc, Mutex};
 
     const SYNC_PASSWORD: &str = "envelope-test-password";
     const REMOTE_PATH: &str = fake_dav::VAULT_PATH;
 
-    /// `TelemetryStore::new()` 打开的是用户配置目录里真实的
-    /// telemetry.sqlite3：并行跑会互相踩、还会弄脏本机数据，所以这里改用内存库，
-    /// 但建表脚本**直接取生产那份**——自己维护一份简化过的测试库等于没测，
-    /// 结构一旦漂移还会骗过断言。提取标记对不上必须响报错，
-    /// 不能悄悄退化成空库继续跑。
+    /// Use the production initializer without opening the user database.
     fn new_store() -> TelemetryStore {
-        let source = include_str!("telemetry_store.rs");
-        let quoted = source
-            .find("\"PRAGMA journal_mode=WAL;")
-            .expect("telemetry_store.rs 里找不到建表脚本起点");
-        let tail = source[quoted..]
-            .strip_prefix('"')
-            .expect("建表脚本应以引号开头");
-        let end = tail
-            .find(",\n        )\n        .map_err")
-            .expect("telemetry_store.rs 里找不到建表脚本终点");
-        // 结束标记从逗号起算，前面那个引号要还回去。
-        let schema = tail[..end]
-            .strip_suffix('"')
-            .expect("建表脚本应以引号收尾");
-        let head: String = schema.chars().take(20).collect();
-        assert!(
-            schema.starts_with("PRAGMA journal_mode=WAL;"),
-            "建表脚本起点不对，取到的是：{head}"
-        );
-        assert!(
-            schema.contains("cloud_sync_meta") && schema.contains("local_memory_items"),
-            "取出来的不是完整建表脚本"
-        );
-        let conn = Connection::open_in_memory().expect("打开内存 SQLite 失败");
-        conn.execute_batch(schema).expect("按生产脚本建表失败");
-        TelemetryStore {
-            conn: Arc::new(Mutex::new(conn)),
-        }
+        TelemetryStore::in_memory()
     }
 
     /// 一台配好同一云端的设备：独立的 store + 独立的 device_id。

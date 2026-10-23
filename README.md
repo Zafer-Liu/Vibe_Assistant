@@ -4,9 +4,9 @@
 
 # 智管-Vibe Assistant
 
-**One window for every local AI Agent — process, memory, and network.**
+**One workspace for memory, Skills, and MCP.**
 
-[![Version](https://img.shields.io/badge/Version-v1.0.2-blue.svg)](https://github.com/Zafer-Liu/Vibe_Assistant/releases)
+[![Version](https://img.shields.io/badge/Version-v1.1.0-blue.svg)](https://github.com/Zafer-Liu/Vibe_Assistant/releases)
 [![License](https://img.shields.io/badge/License-Apache%202.0-yellow.svg)](LICENSE)
 [![Stars](https://img.shields.io/github/stars/Zafer-Liu/Vibe_Assistant?style=flat-square)](https://github.com/Zafer-Liu/Vibe_Assistant/stargazers)
 [![CI](https://img.shields.io/github/actions/workflow/status/Zafer-Liu/Vibe_Assistant/ci.yml?style=flat-square&label=CI)](https://github.com/Zafer-Liu/Vibe_Assistant/actions)
@@ -39,77 +39,31 @@ Thanks to **[88API](https://88api.ai/sign-up?aff=VNNV)** for sponsoring this pro
 
 ## ✨ Highlights
 
-**智管-Vibe Assistant** is a Tauri 2 + React 19 + Rust desktop app built around one idea: **every local Agent, managed from one window.**
+**Vibe Assistant** is a local Tauri 2 + React 19 + Rust desktop workspace focused on:
 
-<img src="./Images/en/diagram-architecture.png" alt="Architecture" width="100%" />
+- **Memory management**: capture and search conversations, maintain working memory and a long-term Profile, and inject context into connected clients.
+- **Skill management**: browse, publish, and deploy skills, review local differences, and reuse equipment profiles.
+- **MCP management**: manage services and client configurations, discover tools, and inspect calls and errors.
+- Supporting tools: token usage, ports, networking, environment variables, backups, and cloud memory sync; Chinese/English and light/dark themes.
 
-- **Launch & monitor** any local Agent — one-click start/stop, streaming logs, embedded Web UI tabs and an interactive terminal. No extra terminals, no memorized commands.
-- **One shared brain** — a layered memory system (L0–L3) that captures knowledge from every coding Agent session, distills it, and injects it back automatically.
-- **Publish to the internet in one click** — temporary Cloudflare Tunnel links for demos, Caddy reverse proxy for long-term hosting.
-- **A real system toolkit** — port manager, network monitor with speed test, and a user/system environment variable editor.
-- **Full English / Chinese UI** with live language switching.
+Process launching, embedded terminals and Web UIs, collaboration tasks, and proxy publishing have been removed. Existing clients such as Claude and Codex still use their memory, Skill, and MCP integrations. Saved memories, configurations, and historical output files are preserved.
 
 ---
 
 ## 📑 Table of Contents
 
-- [Agent Management](#agents)
+- [Memory Center](#memory)
+- [Skill management](#skills)
 - [MCP Server Center](#mcp)
-- [Proxy Publishing & Sharing](#share)
 - [System Toolkit](#system)
-  - [Port Manager](#ports)
-  - [Network Manager](#network)
-  - [Environment Variables](#env)
-- [Memory Center — Cross-Agent Layered Memory](#memory)
-- [Mobile Read-Only Status](#mobile)
 - [Install](#install)
 - [Quick Start](#quickstart)
-- [LLM Configuration](#llm-config)
-- [Supported Project Types](#project-types)
-- [Data Storage Paths](#data-paths)
-- [Telemetry & External Access](#telemetry)
-- [What's New](#whats-new)
+- [Model configuration](#llm-config)
+- [Data Storage](#data-paths)
+- [Telemetry and hooks](#telemetry)
 - [FAQ](#faq)
 - [Contributing](#contributing)
 - [License](#license)
-
----
-
-<a id="agents"></a>
-
-## 🤖 Agent Management
-
-### Auto-detected project types
-
-Pick a project directory and Vibe Assistant detects the stack and fills in the start command for you — Python (uv / FastAPI / Django / Streamlit / Flask), Node.js, Rust, Go, global npm CLIs, or plain executables. Port numbers are auto-discovered from `.env` files, `pyproject.toml` scripts, and source code. See [Supported Project Types](#project-types).
-
-### Launch & monitor
-
-![Agent1](Images/Agent1.png)
-
-- One-click start / stop of Agent processes
-- Streaming stdout + stderr logs with auto-scroll
-- PID, port status, and uptime at a glance
-- Drag-to-reorder in the sidebar
-- **Auto-detected CLIs**: installed Claude Code / Codex / Qoder / Kimi / Copilot CLIs are detected and can be imported as Agents in one click — on the Agents page and in the first-run wizard
-- **Install from GitHub**: paste a repository URL to clone and prefill the config; an optional GitHub token (Settings) supports private repos and rate limits
-
-### Embedded Web UI
-
-![Agent2](Images/Agent2.png)
-
-Agents with a web interface (Streamlit, Flask, FastAPI, …) open inside the app — no browser switching:
-
-- Multiple Agent UIs in tabbed views with a resizable tab bar
-- One-click fullscreen
-- Per-Agent UI token, appended automatically (`#token=…`) for web UIs that accept one
-
-TUI Agents (Claude Code, Codex CLI, …) open in an embedded interactive terminal.
-
-### First-run onboarding & updates
-
-- A first-run wizard walks through importing detected CLIs and configuring the extraction model; it can be reopened anytime from Settings
-- Built-in update checker (auto-check on launch, manual check from the sidebar)
 
 ---
 
@@ -132,53 +86,6 @@ A single catalog for MCP servers on your machine — manage them once, distribut
 - Keep frequently used MCP servers as catalog entries
 - One-click install into Claude Code, Claude Desktop, Codex CLI, Codex Desktop, Qoder, WorkBuddy, MiniMax Code, Kimi, ZCode, and more
 - Import from Agents' existing configs; per-host install status shown live (installed / config drift)
-
----
-
-<a id="share"></a>
-
-## 🌐 Proxy Publishing — Share an Agent with the World
-
-No fixed IP, no domain, no server needed. Two paths from localhost to the public internet:
-
-<img src="./Images/en/diagram-share.png" alt="Sharing flow" width="100%" />
-
-### 🔗 Temporary sharing (recommended for demos)
-
-One click generates a temporary public link:
-
-```
-your machine localhost:5001
-        ↓ Cloudflare Tunnel
-https://abc-xyz.trycloudflare.com  ← send to a colleague
-```
-
-1. Install cloudflared (see below)
-2. Start the Agent
-3. Open **Proxy Publishing** → pick the Agent → click **Generate Link**
-4. Wait 5–15 s for the `https://xxx.trycloudflare.com` URL
-5. Close the tunnel when the meeting ends — the link dies instantly
-
-```powershell
-# Windows (Scoop recommended)
-scoop install cloudflared
-
-# macOS
-brew install cloudflared
-```
-
-Or download the binary from [cloudflared Releases](https://github.com/cloudflare/cloudflared/releases/latest).
-
-> ⚠️ Temporary links have no access control. Keep them open only as long as needed.
-
-### 🛡️ Caddy reverse proxy (long-term hosting)
-
-For fixed domains and continuous availability:
-
-- Custom domains with automatic HTTPS certificates
-- Username / password access control (bcrypt-hashed)
-- Per-rule user permissions
-- One-click Caddyfile generation, start, and reload
 
 ---
 
@@ -243,7 +150,7 @@ Every coding Agent you use remembers your preferences, decisions, and current wo
 
 ### 📥 Automatic capture (Agents → memory)
 
-- Supports **Codex, Claude Code, Qoder, WorkBuddy, MiniMax Code, Kimi, GitHub Copilot, and ZCode** — via hooks (the first four) or local transcript scanning (all eight)
+- Supports **Codex, Claude Code, Qoder, WorkBuddy, MiniMax Code, Kimi, GitHub Copilot, ZCode, and DeepSeek Harness** — via hooks (the first four) or local transcript scanning (all nine; DeepSeek Harness zstd-compressed sessions are decoded in place). DeepSeek Harness also gets hook-equivalent automatic injection through its cordis pre-step plugin
 - Sessions land in a local SQLite ledger first, extraction runs async — nothing is lost when offline or before a model is configured; failed sessions can be re-run manually
 - **Pending Memories** and **Organized Conversations** panels show full conversations, extraction progress, and failure reasons
 - L1 cleaning & dedup ("dreaming"): local BGE semantic candidates + LLM arbitration, with rollback checkpoints
@@ -273,11 +180,13 @@ The published L2 working memory and L3 Profile no longer depend on clicking butt
 | Hook injection | SessionStart injects L2 once; UserPromptSubmit injects L3 every turn (content-fingerprint gated — unchanged turns cost zero tokens) | Working context at start, durable preferences throughout |
 | Shared-memory MCP | Agents call `recall_memory` for semantic search on demand | Task-specific recall without bloating context |
 
-**One-click setup**: install / uninstall the shared-memory MCP into **Claude Code, Claude Desktop, Codex CLI, Codex Desktop, Qoder, WorkBuddy, MiniMax Code, Kimi, ZCode**, and manage capture/injection hooks for the four hook-capable Agents (Claude Code, Codex, Qoder, WorkBuddy). Per-device data directory overrides are supported.
+**One-click setup**: install / uninstall the shared-memory MCP into **Claude Code, Claude Desktop, Codex CLI, Codex Desktop, Qoder, WorkBuddy, MiniMax Code, Kimi, ZCode, DeepSeek Harness**, and manage capture/injection hooks for the four hook-capable Agents (Claude Code, Codex, Qoder, WorkBuddy). Per-device data directory overrides are supported.
 
 ### ✍️ Custom memories
 
 Hand-written entries under the working-memory or long-term cards — only you can edit or delete them, automatic cleaning never touches them, and they are always injected.
+
+<a id="skills"></a>
 
 ### 📚 Shared Skill library & marketplace
 
@@ -302,14 +211,6 @@ Sync published L2/L3 documents and custom memories across machines — one brain
 - **AES-256-GCM end-to-end encryption**: keys derived from your sync password, never stored; the server only ever sees ciphertext
 - CAS conflict detection, incremental pulls, tombstone deletions; local SQLite stays authoritative, offline sync failures never block injection
 - Single-file self-hostable server, open source in [`vault/`](vault/README.md) — Docker / Railway / Orange Pi + Tailscale
-
----
-
-<a id="mobile"></a>
-
-## 📱 Mobile Read-Only Status
-
-Enable in **Settings → Mobile status**: a token-protected page served on your LAN shows running / needs-attention / completed Agent tasks, refreshing every 5 seconds — check on long-running work from your phone without exposing any mutating action.
 
 ---
 
@@ -349,34 +250,20 @@ npm run build
 
 Bundles land in `src-tauri/target/release/bundle/`.
 
+On Windows, `npm run dev` sets the Cargo build directory to Medium integrity so executables do not inherit a sandbox checkout's Low label and fail to write AppData with a SQLite read-only error. This preflight only adjusts build output, preserving database and checkout permissions.
+
 ---
 
 <a id="quickstart"></a>
 
 ## 🚀 Quick Start
 
-### 1. Add an Agent
+1. Read the Memory, Skill, and MCP introduction on first launch, or reopen it from Settings. Memory Center is the default page.
+2. Add a project detail or preference manually. For automatic extraction, configure and verify a memory model in Settings, then check capture and injection.
+3. Read a local Skill and publish it to selected clients. Review deployment and differences in Published.
+4. Import or add an MCP service, check its command or URL, select clients, and inspect tools and call records.
 
-1. **Agents** in the sidebar → **＋ New Agent** (top right)
-2. Pick the project directory (or switch to **Install from GitHub** and paste a repo URL)
-3. The start command is auto-filled — adjust if needed, set the port for web-UI Agents → **Save**
-4. Press ▶ to launch
-
-### 2. Open the Agent
-
-- Web UI Agents (Streamlit / Flask / …): **Open UI** → embedded tab
-- TUI Agents (Claude Code / Codex): **Open Terminal** → embedded terminal
-
-### 3. Turn on the Memory Center (optional)
-
-1. **Settings → LLM and memory extraction** — confirm the extraction model (Ollama local models supported)
-2. **Memory Center → Memory Injection** — install hooks / the shared-memory MCP for your Agents
-3. Use your Agents normally; memories accumulate automatically, L2/L3 keep themselves fresh on schedule
-
-### 4. Share an Agent (optional)
-
-1. Install cloudflared
-2. **Proxy Publishing** → pick the Agent → **Generate Link** → copy & send
+No CLI import or process launch is required.
 
 ---
 
@@ -401,39 +288,17 @@ Hit **Test Connection** — green means good.
 
 ---
 
-<a id="project-types"></a>
-
-## 🔍 Supported Project Types
-
-| Type | Detection | Generated command |
-|------|-----------|-------------------|
-| Python · uv | `pyproject.toml` + `uv.lock` | `uv run python main.py` |
-| Python · FastAPI | `fastapi` in requirements | `uvicorn main:app --reload --port PORT` |
-| Python · Django | `manage.py` exists | `python manage.py runserver 0.0.0.0:8000` |
-| Python · Streamlit | `streamlit` in requirements | `streamlit run app.py --server.port 8501` |
-| Python · Flask | `flask` in requirements | `python app.py` |
-| Python · generic | `main.py` / `app.py` … | `python main.py` |
-| Node.js | `package.json` | `npm run dev` |
-| Rust | `Cargo.toml` | `cargo run` |
-| Go | `go.mod` | `go run .` |
-| npm global CLIs | `%APPDATA%\npm\*.cmd` | interactive PowerShell with auto-typed command |
-| Executables | `.exe` / `.bat` / `.cmd` / `.sh` | run directly |
-
-Port numbers are auto-detected from `.env` files, `pyproject.toml` scripts, and `port=` assignments in source.
-
----
-
 <a id="data-paths"></a>
 
 ## 📁 Data Storage Paths
 
 | Data | Windows | macOS / Linux |
 |------|---------|---------------|
-| Agent configs | `%APPDATA%\agent-manager\agents.json` | `~/Library/Application Support/agent-manager/` (macOS), `~/.local/share/agent-manager/` (Linux) |
+| Legacy runtime configs (preserved, unused) | `%APPDATA%\agent-manager\agents.json` | `~/Library/Application Support/agent-manager/` (macOS), `~/.local/share/agent-manager/` (Linux) |
 | LLM providers | `%APPDATA%\agent-manager\llm_config.json` | same directory |
 | Memory & telemetry DB | `%APPDATA%\agent-manager\telemetry.sqlite3` | same directory |
 | Agent source overrides | `%APPDATA%\agent-manager\agent_source_paths.json` | same directory |
-| Generated Caddyfile | `%APPDATA%\agent-manager\Caddyfile` | same directory |
+| Historical Caddyfile (unused) | `%APPDATA%\agent-manager\Caddyfile` | same directory |
 | Claude Desktop MCP config | `%APPDATA%\Claude\claude_desktop_config.json` | `~/Library/Application Support/Claude/claude_desktop_config.json` |
 
 The Settings page offers one-click **export / import** of a full config backup for migration and disaster recovery.
@@ -464,31 +329,26 @@ Standard endpoint: `POST http://127.0.0.1:<hook-port>/telemetry/events/{codex|wo
 
 `input_tokens` must be the session's full input total; `cached_tokens` is display-only detail (do not add it into totals). Re-submissions for the same `source + session_id` overwrite instead of accumulate.
 
-### External task dispatch
-
-The same local server can push tasks to any HTTP-capable Agent and collect results — external systems drive your Agents without touching the UI:
-
-| Endpoint | Purpose |
-|----------|---------|
-| `POST /agent/dispatch` | Send a task to an Agent's HTTP URL (async, 202) |
-| `POST /agent/submit` | An Agent reports its result back |
-| `GET /agent/tasks` | List in-flight tasks (dispatched / submitted / failed) |
-| `GET /agent/results` | Collected results |
-
----
-
 <a id="whats-new"></a>
 
 ## 🗺️ What's New
 
-> **Current version `v1.0.2`**
+> **Current version `v1.1.0`**
 
+**v1.1.0**
+
+- ✅ **Cloud vault sync** — WebDAV / S3-compatible storage join the built-in vault server for encrypted memory sync
+- ✅ **88API built-in provider** — sponsor entry bundled, model lists fetched automatically, no manual entry for new models
+- ✅ **Cancellable memory extraction** — pending extractions can be cancelled in the Pending Memories panel; failed sessions can still re-run
+- ✅ **Light theme by default** — fresh installs start in light mode; dark mode remains available in settings
+- ✅ **Feature-focus slimming** — process launcher, embedded terminal / Web UI, collaboration tasks, and agent publishing retired; memory, settings, and historical artifacts are fully preserved
+
+**v1.0.x**
 - ✅ **Project renamed to Vibe Assistant** (智管-Vibe Assistant) — display name, prompts, docs, and window title; protocol identifiers and data paths unchanged, so existing hooks, MCP installs, and local data keep working
 - ✅ **Environment Variables manager** — user/system scopes, PATH edited one entry per line, `REG_EXPAND_SZ` previews, protected critical variables
 - ✅ **Scheduled L2/L3 memory refresh** — configurable intervals (default L2 7 days / L3 30 days), model calls only when new memories exist, L3 auto-publish
 - ✅ **Network Manager** — live per-interface throughput, public-IP (direct + proxy egress) and dual-path bandwidth speed tests
 - ✅ **Skill Marketplace** — install curated skills from official OpenAI / Anthropic repositories into the shared Skill library
-- ✅ **Mobile read-only status page** — LAN-accessible, token-protected task status
 - ✅ **Workflow feature removed** — the visual workflow builder, task board, and run history were retired to keep the app focused (see release notes for history)
 - ✅ **L1 extraction hardening** — truncated-JSON salvage, contract-drift tolerance, and model-output excerpts in error messages for diagnosable failures
 
@@ -538,75 +398,9 @@ Local SQLite is always authoritative; a unreachable vault never blocks injection
 
 </details>
 
-<details>
-<summary><b>📦 Agent Management</b></summary>
 
-<details>
-<summary><b>The Agent status shows an error after launch?</b></summary>
 
-Check the Agent detail logs — usually one of:
 
-- Port occupied: find and kill the holder in Port Manager
-- Dependencies missing: run the start command once in a terminal to see the real error
-- Wrong working directory: verify the path in the Agent config
-
-</details>
-
-<details>
-<summary><b>The embedded Web UI is blank?</b></summary>
-
-The Agent is probably still booting (port not listening yet). Wait a few seconds and hit refresh in the UI toolbar.
-
-</details>
-
-<details>
-<summary><b>The Claude Code terminal opens blank?</b></summary>
-
-Normal: the app starts PowerShell, waits ~800 ms, then types `claude` into stdin. The TUI renders 1–2 seconds later.
-
-</details>
-
-<details>
-<summary><b>The auto-detected Python command is wrong?</b></summary>
-
-Detection is file-scan heuristics; edit the command in the Agent form. Changes apply on save.
-
-</details>
-
-</details>
-
-<details>
-<summary><b>🌐 Sharing</b></summary>
-
-<details>
-<summary><b>"Generate Link" never produces a URL?</b></summary>
-
-1. cloudflared missing or not on PATH → click re-detect
-2. Network blocked → cloudflared must reach Cloudflare
-3. Agent not running → the tunnel forwards to a local port
-
-</details>
-
-<details>
-<summary><b>Colleagues see "This site can't be reached"?</b></summary>
-
-Confirm the Agent is actually running, the tunnel is still open (green URL in the app), and the link is the full `https://xxx.trycloudflare.com`.
-
-</details>
-
-<details>
-<summary><b>Caddy not found / apply fails?</b></summary>
-
-```powershell
-scoop install caddy   # Windows
-brew install caddy    # macOS
-```
-
-Then hit refresh on the Proxy Publishing page.
-
-</details>
-
-</details>
 
 <details>
 <summary><b>⚙️ Install & Runtime</b></summary>
@@ -680,6 +474,6 @@ Bugs and ideas: [Issues](https://github.com/Zafer-Liu/Vibe_Assistant/issues). Fo
 
 ## ⭐ The Goal
 
-**Let the assistant run the Agents — keep your time for what matters.**
+**Keep useful context, reusable skills, and connected tools in one workspace.**
 
 </div>

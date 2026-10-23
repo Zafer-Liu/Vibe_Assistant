@@ -1,0 +1,37 @@
+import { invoke } from '@tauri-apps/api/core'
+import type { McpAgentStatus, McpCallRefresh, McpCallStats, McpDashboardStats, McpCatalogEntry, McpObservationStatus, DshObservationStatus, McpProfile, MemoryMcpRuntimeStatus, MemoryMcpStatus, MemoryMcpTarget } from '../types/mcp'
+import type { McpScanResult, ClaudeDesktopMcpConfig, McpFailedCallPage, McpToolDiscovery, McpImportScan, McpConfigurationComparison, McpArbitrationResult } from '../types/mcp'
+
+export const mcpApi = {
+  memoryMcpStatus: (args: { agentType: MemoryMcpTarget }) => invoke<MemoryMcpStatus>('memory_mcp_status', args),
+  memoryMcpRuntimeStatus: () => invoke<MemoryMcpRuntimeStatus[]>('memory_mcp_runtime_status'),
+  memoryMcpInstall: (args: { agentType: MemoryMcpTarget }) => invoke<MemoryMcpStatus>('memory_mcp_install', args),
+  memoryMcpUninstall: (args: { agentType: MemoryMcpTarget }) => invoke<void>('memory_mcp_uninstall', args),
+  telemetryMcpStats: (args: { startAt: string | null; endAt: string | null; source: string | null; server: string | null; tool: string | null; recentLimit: number }) => invoke<McpCallStats>('telemetry_mcp_stats', args),
+  telemetryMcpDashboard: () => invoke<McpDashboardStats>('telemetry_mcp_dashboard'),
+  telemetryRefreshMcpCalls: () => invoke<McpCallRefresh>('telemetry_refresh_mcp_calls'),
+  mcpCatalogList: () => invoke<McpCatalogEntry[]>('mcp_catalog_list'),
+  mcpProfileList: () => invoke<McpProfile[]>('mcp_profile_list'),
+  mcpProfileSave: (args: { profile: McpProfile }) => invoke<McpProfile>('mcp_profile_save', args),
+  mcpProfileDelete: (args: { name: string }) => invoke<void>('mcp_profile_delete', args),
+  mcpCatalogUpsert: (args: { entry: McpCatalogEntry }) => invoke<McpCatalogEntry>('mcp_catalog_upsert', args),
+  mcpCatalogImport: (args: { name: string; agent: string }) => invoke<McpCatalogEntry>('mcp_catalog_import', args),
+  mcpCatalogDelete: (args: { name: string }) => invoke<void>('mcp_catalog_delete', args),
+  mcpEquip: (args: { name: string; agent: string }) => invoke<McpCatalogEntry>('mcp_equip', args),
+  mcpUnequip: (args: { name: string; agent: string }) => invoke<McpCatalogEntry>('mcp_unequip', args),
+  mcpSyncAgent: (args: { agent: string }) => invoke<void>('mcp_sync_agent', args),
+  mcpStatusAll: () => invoke<McpAgentStatus[]>('mcp_status_all'),
+  mcpObservationStatusAll: () => invoke<McpObservationStatus[]>('mcp_observation_status_all'),
+  mcpObservationSet: (args: { name: string; agent: string; enabled: boolean }) => invoke<McpObservationStatus>('mcp_observation_set', args),
+  dshObservationStatus: () => invoke<DshObservationStatus>('dsh_observation_status'),
+  dshObservationSet: (args: { enabled: boolean }) => invoke<DshObservationStatus>('dsh_observation_set', args),
+  mcpImportFromAgents: () => invoke<McpImportScan>('mcp_import_from_agents'),
+  mcpConfigurationCompare: (args: { name: string }) => invoke<McpConfigurationComparison>('mcp_configuration_compare', args),
+  mcpConfigurationResolve: (args: { name: string; revision: string; source: string | null; targets: string[] }) => invoke<McpArbitrationResult>('mcp_configuration_resolve', args),
+  scanMcpLocal: (args: { dir: string; provider: string | null }) => invoke<McpScanResult>('scan_mcp_local', args),
+  claudeDesktopMcpConfigGet: () => invoke<ClaudeDesktopMcpConfig>('claude_desktop_mcp_config_get'),
+  claudeDesktopMcpConfigSet: (args: { path: string | null }) => invoke<ClaudeDesktopMcpConfig>('claude_desktop_mcp_config_set', args),
+  telemetryMcpFailedCalls: (args: { offset: number; limit: number; server: string | null; origin: string | null; tool?: string | null; startAt?: string | null; endAt?: string | null; snapshotId?: number | null; beforeAt?: string | null; beforeId?: number | null }) => invoke<McpFailedCallPage>('telemetry_mcp_failed_calls', args),
+  mcpCatalogMigrationReport: () => invoke<string[]>('mcp_catalog_migration_report'),
+  mcpDiscoverTools: (args: { name: string }) => invoke<McpToolDiscovery>('mcp_discover_tools', args),
+}

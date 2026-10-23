@@ -5,7 +5,7 @@ import type { MemoryConversationDetail } from '../types/memory'
 import { intlLocale } from '../i18n'
 
 export function sourceLabel(source: string) {
-  return ({ codex: 'Codex', claude: 'Claude Code', qoder: 'Qoder', workbuddy: 'WorkBuddy', minimax: 'MiniMax Code', kimi: 'Kimi', copilot: 'GitHub Copilot' } as Record<string, string>)[source] ?? source
+  return ({ codex: 'Codex', claude: 'Claude Code', qoder: 'Qoder', workbuddy: 'WorkBuddy', minimax: 'MiniMax Code', kimi: 'Kimi', copilot: 'GitHub Copilot', zcode: 'ZCode', dsh: 'DeepSeek Harness' } as Record<string, string>)[source] ?? source
 }
 
 export function displayTime(value: string) {
@@ -73,19 +73,19 @@ export function ConversationDialog({ detail, error, onClose }: {
         {detail ? <>
           {meta && <span className={`inline-flex shrink-0 items-center rounded px-1.5 py-0.5 text-xs ${meta.badge}`}>{t(meta.labelKey)}</span>}
           <span className="shrink-0 text-sm font-semibold">{sourceLabel(detail.source)}</span>
-          <span className="min-w-0 flex-1 truncate font-mono text-xs text-slate-400" title={detail.session_id}>{detail.session_id}</span>
-          <span className="shrink-0 font-mono text-xs text-slate-400">{displayTime(detail.occurred_at)}</span>
-          <span className="shrink-0 text-xs text-slate-400">{detail.message_count} {t('memory.dialog.messages')}</span>
+          <span className="min-w-0 flex-1 truncate font-mono text-xs text-slate-500" title={detail.session_id}>{detail.session_id}</span>
+          <span className="shrink-0 font-mono text-xs text-slate-500">{displayTime(detail.occurred_at)}</span>
+          <span className="shrink-0 text-xs text-slate-500">{detail.message_count} {t('memory.dialog.messages')}</span>
         </> : <span className="text-sm text-slate-500 dark:text-slate-400">{t('memory.dialog.title')}</span>}
-        <button type="button" onClick={onClose} aria-label={t('common.close')} className="ml-auto inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-slate-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:hover:bg-slate-800 dark:hover:text-slate-200"><X size={17} /></button>
+        <button type="button" onClick={onClose} aria-label={t('common.close')} className="ml-auto inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:hover:bg-slate-800 dark:hover:text-slate-200"><X size={17} /></button>
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
         {error ? (
           <p className="rounded-lg bg-red-500/10 px-3 py-2.5 text-sm text-red-700 dark:text-red-300">{error}</p>
         ) : !detail ? (
-          <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-slate-400"><Loader2 size={16} className="animate-spin motion-reduce:animate-none" />{t('memory.dialog.loading')}</div>
+          <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-slate-500"><Loader2 size={16} className="animate-spin motion-reduce:animate-none" />{t('memory.dialog.loading')}</div>
         ) : messages.length === 0 ? (
-          <p className="py-10 text-center text-sm text-slate-400">{t('memory.dialog.empty')}</p>
+          <p className="py-10 text-center text-sm text-slate-500">{t('memory.dialog.empty')}</p>
         ) : (
           <ol className="space-y-3">
             {messages.map((message, index) => (

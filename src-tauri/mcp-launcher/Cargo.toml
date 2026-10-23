@@ -1,0 +1,22 @@
+[package]
+name = "mcp-launcher"
+version = "1.1.0"
+edition = "2021"
+description = "Small MCP observation fallback launcher for Vibe Assistant"
+
+[dependencies]
+dirs-next = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+toml = "0.8"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

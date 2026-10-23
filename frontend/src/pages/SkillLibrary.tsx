@@ -1,28 +1,20 @@
+import { EquipmentProfiles, EquipmentProfilesButton } from '../features/equipment/EquipmentProfiles'
+import { SOURCES, sourceColor, type SourceFilter } from '../features/skills/sources'
+import { PublishDialog } from '../features/skills/components/PublishDialog'
+import { DeployDialog } from '../features/skills/components/DeployDialog'
 import { memo, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import {
-  BookOpenText, Check, ChevronRight, FileCode2, FolderSync, RefreshCw,
-  Search, Sparkles, Copy, CheckCheck, Hash, Globe, Rocket,
-  ShieldCheck, Layers, RotateCcw, ArrowRightLeft,
-  Loader2, Trash2, X,
-} from 'lucide-react'
-import { useMemoryStore } from '../store/memoryStore'
-import type { SkillDocument, SkillDriftFile, SkillItem, SkillSyncPreview } from '../types/memory'
+import { listen } from '@tauri-apps/api/event'
+import { BookOpenText, Check, ChevronRight, FileCode2, FolderSync, RefreshCw, Search, Sparkles, Copy, CheckCheck, Hash, Globe, Rocket, ShieldCheck, Layers, RotateCcw, Loader2, Trash2, X } from 'lucide-react'
+import { useSkillFields } from '../store/skillStore'
+import type { SkillDocument, SkillItem } from '../types/skill'
 
-type SourceFilter = 'all' | 'published' | 'codex' | 'claude' | 'qoder' | 'workbuddy' | 'minimax' | 'kimi' | 'copilot' | 'zcode'
 
-export const SOURCES: { id: Exclude<SourceFilter, 'all'>; label: string; color: string }[] = [
-  { id: 'codex',    label: 'Codex',       color: 'bg-emerald-500' },
-  { id: 'claude',   label: 'Claude Code', color: 'bg-amber-500' },
-  { id: 'qoder',    label: 'Qoder',       color: 'bg-sky-500' },
-  { id: 'workbuddy', label: 'WorkBuddy',  color: 'bg-rose-500' },
-  { id: 'minimax',  label: 'MiniMax Code', color: 'bg-indigo-500' },
-  { id: 'kimi',     label: 'Kimi',        color: 'bg-cyan-500' },
-  { id: 'copilot',  label: 'GitHub Copilot', color: 'bg-slate-500' },
-  { id: 'zcode',    label: 'ZCode',       color: 'bg-fuchsia-500' },
-]
+type ScanProgress = { source: string; sourceIndex: number; sourceCount: number; imported: number; currentSkill?: string; phase: 'scanning' | 'source_complete' }
 
-const sourceColor = (source: string) => SOURCES.find(s => s.id === source)?.color ?? 'bg-gray-400'
+
+
+
 
 // ── 技能性质（origin）：区分厂商内置、插件市场安装、本地自建与市场导入 ──
 
@@ -55,12 +47,15 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
   onSyncOpened?: () => void
 }) {
   const { t } = useTranslation()
- const { skills, skillCacheReady, loadSkills, scanSkills, readSkill, applySkillSync, setSkillStatus, setSkillStatusBulk, setSkillAssignment, setSkillAssignmentBulk, publishSkill, rollbackSkillLatest, deleteSkill } = useMemoryStore()
+  const [equipmentOpen, setEquipmentOpen] = useState(false)
+ const { skills, skillCacheReady, loadSkills, scanSkills, readSkill, applySkillSync, setSkillStatus, setSkillStatusBulk, setSkillAssignment, setSkillAssignmentBulk, publishSkill, rollbackSkillLatest, deleteSkill } = useSkillFields('skills', 'skillCacheReady', 'loadSkills', 'scanSkills', 'readSkill', 'applySkillSync', 'setSkillStatus', 'setSkillStatusBulk', 'setSkillAssignment', 'setSkillAssignmentBulk', 'publishSkill', 'rollbackSkillLatest', 'deleteSkill')
   const [filter, setFilter] = useState<SourceFilter>('all')
   const [originFilter, setOriginFilter] = useState<OriginFilter>('all')
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<SkillDocument | null>(null)
   const [loading, setLoading] = useState(false)
+  const [scanning, setScanning] = useState(false)
+  const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
   const [syncOpen, setSyncOpen] = useState(false)
@@ -100,6 +95,13 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
 
   // ── Derived data ──
 
+  // Accept a pasted Skill directory or SKILL.md path as a search query.
+  const searchTerm = useMemo(() => {
+    const text = query.trim().toLowerCase().replace(/[\\/]+$/, '')
+    const parts = text.split(/[\\/]/)
+    return parts.at(-1) === 'skill.md' ? (parts.at(-2) ?? text) : (parts.at(-1) ?? text)
+  }, [query])
+
  const visibleSkills = useMemo(() => skills.filter((skill) => {
    const filterMatches = filter === 'all'
      ? true
@@ -107,21 +109,19 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
        ? skill.status === 'published'
        : skill.source === filter
    const originMatches = originFilter === 'all' || originOf(skill) === originFilter
-   const q = query.trim().toLowerCase()
-   return filterMatches && originMatches && (!q || `${skill.name} ${skill.description} ${skill.source}`.toLowerCase().includes(q))
+   return filterMatches && originMatches && (!searchTerm || `${skill.name} ${skill.description} ${skill.source}`.toLowerCase().includes(searchTerm))
  }).sort((a, b) => {
    // 分组排序：本地/市场在前，插件与内置在后；同组内按名称排序。
    const byOrigin = ORIGIN_ORDER[originOf(a)] - ORIGIN_ORDER[originOf(b)]
    return byOrigin !== 0 ? byOrigin : a.name.localeCompare(b.name)
- }), [skills, filter, originFilter, query])
+ }), [skills, filter, originFilter, searchTerm])
 
  // 筛选胶囊的「分面计数」：只应用其他维度（性质 + 搜索），排除胶囊自身维度，
  // 这样切换性质下拉时「全部 / 已发布 / 各 Agent」的数字会同步收窄。
  const facetedSkills = useMemo(() => skills.filter((skill) => {
    const originMatches = originFilter === 'all' || originOf(skill) === originFilter
-   const q = query.trim().toLowerCase()
-   return originMatches && (!q || `${skill.name} ${skill.description} ${skill.source}`.toLowerCase().includes(q))
- }), [skills, originFilter, query])
+   return originMatches && (!searchTerm || `${skill.name} ${skill.description} ${skill.source}`.toLowerCase().includes(searchTerm))
+ }), [skills, originFilter, searchTerm])
 
   const countsBySource = useMemo(() => {
     const map: Record<string, number> = {}
@@ -152,14 +152,32 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
 
   async function importSkills() {
     setLoading(true)
+    setScanning(true)
+    setScanProgress(null)
+    let unlisten: (() => void) | undefined
+    try {
+      unlisten = await listen<ScanProgress>('skill-scan-progress', (event) => {
+        setScanProgress(event.payload)
+        if (event.payload.phase === 'source_complete') {
+          void loadSkills(true).catch(() => {})
+        }
+      })
+    } catch {
+      // Scanning still works when the progress event is unavailable.
+    }
     try {
       const imported = await scanSkills()
       setNotice(t('skills.scanDone', { count: imported.length }))
       if (selected && !imported.some((skill) => skill.source === selected.item.source && skill.name === selected.item.name)) setSelected(null)
     } catch (error) {
+      // A prior source may have been imported before a later source failed.
+      void loadSkills(true).catch(() => {})
       setNotice(t('skills.scanFailed', { error: String(error) }))
     } finally {
+      unlisten?.()
       setLoading(false)
+      setScanning(false)
+      setScanProgress(null)
     }
   }
 
@@ -345,10 +363,12 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
     </div>
   }
 
+  if (equipmentOpen) return <EquipmentProfiles onBack={() => { setEquipmentOpen(false); void loadSkills() }} />
+
   return (
     <div className="flex h-full min-h-0 flex-col bg-gray-50 dark:bg-gray-950">
       {/* ── Header: title + primary actions only ── */}
-      <header className="flex items-center gap-4 border-b border-gray-200 bg-white px-6 py-4 dark:border-gray-800 dark:bg-gray-900">
+      <header className="fluent-page-header fluent-command-header flex flex-wrap items-center gap-4 border-b border-gray-200 bg-white px-6 py-4 dark:border-gray-800 dark:bg-gray-900">
         <div className="flex min-w-0 items-center gap-3">
           <div className="rounded-xl bg-violet-500/10 p-2.5 text-violet-600 dark:text-violet-400">
             <BookOpenText size={22} />
@@ -359,7 +379,8 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
           </div>
         </div>
 
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          <EquipmentProfilesButton onClick={() => setEquipmentOpen(true)} />
           {onOpenPublished && (
             <button
               onClick={onOpenPublished}
@@ -388,10 +409,26 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
         </div>
       </header>
 
+      {scanning && (
+        <div role="status" className="border-b border-violet-200 bg-violet-50 px-6 py-2 text-xs text-violet-800 dark:border-violet-900 dark:bg-violet-950/30 dark:text-violet-200">
+          {scanProgress ? (
+            <>
+              {t('skills.scanProgress', {
+                source: SOURCES.find(s => s.id === scanProgress.source)?.label ?? scanProgress.source,
+                current: scanProgress.sourceIndex,
+                total: scanProgress.sourceCount,
+                count: scanProgress.imported,
+              })}
+              {scanProgress.currentSkill && scanProgress.phase === 'scanning' && ` · ${scanProgress.currentSkill}`}
+            </>
+          ) : t('skills.scanStarting')}
+        </div>
+      )}
+
       {/* ── Toolbar: search + source filters in one dedicated row ── */}
       <div className="flex flex-wrap items-center gap-3 border-b border-gray-200 bg-white px-6 py-3 dark:border-gray-800 dark:bg-gray-900">
         <label className="relative block w-full sm:w-64">
-          <Search size={14} className="pointer-events-none absolute left-2.5 top-2.5 text-gray-400" />
+          <Search size={14} className="pointer-events-none absolute left-2.5 top-2.5 text-gray-500" />
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -439,7 +476,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
               <input type="checkbox" checked={allVisibleChecked} onChange={toggleSelectAll} className="h-3.5 w-3.5 accent-violet-600" />
               {t('skills.selectAll')}
             </label>
-            <span className="text-xs text-gray-400 dark:text-gray-500">{t('skills.totalCount', { count: visibleSkills.length })}</span>
+            <span className="text-xs text-gray-500 dark:text-gray-400">{t('skills.totalCount', { count: visibleSkills.length })}</span>
           </div>
 
           <div className="min-h-0 flex-1 overflow-y-auto p-2">
@@ -471,14 +508,14 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
                  >
                    <div className="flex items-center gap-2">
                      <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${sourceColor(skill.source)}`} />
-                     <FileCode2 size={14} className={isSelected ? 'text-violet-600 dark:text-violet-400' : 'text-gray-400'} />
+                     <FileCode2 size={14} className={isSelected ? 'text-violet-600 dark:text-violet-400' : 'text-gray-500'} />
                      <span className="min-w-0 flex-1 truncate text-sm font-medium">{skill.name}</span>
                      {originOf(skill) !== 'local' && (
                        <span className={`shrink-0 rounded px-1 py-px text-[10px] font-medium ${ORIGIN_BADGE[originOf(skill) as Exclude<SkillOrigin, 'local'>]}`}>
                          {t(ORIGIN_LABEL_KEY[originOf(skill)])}
                        </span>
                      )}
-                     <ChevronRight size={14} className="shrink-0 text-gray-400 opacity-0 transition group-hover:opacity-100" />
+                     <ChevronRight size={14} className="shrink-0 text-gray-500 opacity-0 transition group-hover:opacity-100" />
                    </div>
                    <p className="mt-1 truncate pl-8 text-xs text-gray-500 dark:text-gray-400">
                      {skill.description || skill.source}
@@ -498,7 +535,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
                            className={`inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium transition ${
                              equipped
                                ? 'border-violet-500/60 bg-violet-50 text-violet-700 dark:border-violet-500/40 dark:bg-violet-500/15 dark:text-violet-200'
-                               : 'border-gray-200 text-gray-400 hover:border-gray-300 hover:text-gray-600 dark:border-gray-700 dark:hover:border-gray-600'
+                               : 'border-gray-200 text-gray-500 hover:border-gray-300 hover:text-gray-600 dark:border-gray-700 dark:hover:border-gray-600'
                            }`}
                          >
                            <span className={`h-1.5 w-1.5 rounded-full ${agent.color}`} />
@@ -529,10 +566,10 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
                 <span className="text-xs font-semibold text-violet-700 dark:text-violet-300">{t('skills.bulkSelected', { count: selectedIds.size })}</span>
                 <button disabled={loading} onClick={() => { void bulkSetStatus('published') }} className="inline-flex items-center gap-1 rounded-md bg-violet-600 px-2 py-1 text-xs font-medium text-white transition hover:bg-violet-500 disabled:opacity-50"><Check size={12} />{t('skills.bulkPublish')}</button>
                 <button disabled={loading} onClick={() => { void bulkSetStatus('draft') }} className="inline-flex items-center gap-1 rounded-md border border-gray-300 bg-white px-2 py-1 text-xs font-medium text-gray-700 transition hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700">{t('skills.bulkToDraft')}</button>
-                <button onClick={() => setSelectedIds(new Set())} className="ml-auto inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-gray-400 transition hover:text-gray-600 dark:hover:text-gray-300" aria-label={t('skills.clearSelectionAria')}><X size={12} />{t('skills.clearSelection')}</button>
+                <button onClick={() => setSelectedIds(new Set())} className="ml-auto inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-gray-500 transition hover:text-gray-600 dark:hover:text-gray-300" aria-label={t('skills.clearSelectionAria')}><X size={12} />{t('skills.clearSelection')}</button>
               </div>
               <div className="flex items-center gap-2">
-                <ShieldCheck size={12} className="shrink-0 text-gray-400" />
+                <ShieldCheck size={12} className="shrink-0 text-gray-500" />
                 <select value={bulkTarget} onChange={(e) => setBulkTarget(e.target.value)} className="min-w-0 flex-1 rounded-md border border-gray-300 bg-white px-1.5 py-1 text-xs text-gray-700 outline-none focus:border-violet-400 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200">
                   {SOURCES.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
                 </select>
@@ -596,7 +633,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
                       )
                     })
                   ) : (
-                    <span className="text-xs text-gray-400 dark:text-gray-500">{t('skills.notEquippedAny')}</span>
+                    <span className="text-xs text-gray-500 dark:text-gray-400">{t('skills.notEquippedAny')}</span>
                   )}
                   <button onClick={openPublishDialog} className="ml-auto text-xs font-medium text-violet-600 transition hover:text-violet-500 dark:text-violet-400">
                     {t('skills.adjustArrow')}
@@ -610,7 +647,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
                   <button disabled={loading} onClick={() => { void deleteSelected() }} className="inline-flex items-center gap-1.5 rounded-md border border-red-200 px-2.5 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-50 dark:border-red-900/60 dark:text-red-400 dark:hover:bg-red-900/20"><Trash2 size={13} />{t('skills.delete')}</button>
                 </div>
 
-                <p className="mt-3 text-xs leading-5 text-gray-400 dark:text-gray-500">
+                <p className="mt-3 text-xs leading-5 text-gray-500 dark:text-gray-400">
                   {t('skills.detailFlowHint')}
                 </p>
               </div>
@@ -618,7 +655,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
               {/* content card */}
               <div className="rounded-2xl border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-900">
                 <div className="flex items-center gap-2 border-b border-gray-100 px-5 py-3 dark:border-gray-800">
-                  <Layers size={14} className="text-gray-400" />
+                  <Layers size={14} className="text-gray-500" />
                   <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">SKILL.md</span>
                 </div>
                 <pre className="overflow-x-auto whitespace-pre-wrap p-5 text-xs leading-6 text-gray-700 dark:text-gray-200 font-mono">
@@ -630,11 +667,11 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
               {selected.item.files && selected.item.files.length > 0 && (
                 <div className="rounded-2xl border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-900">
                   <div className="flex items-center gap-2 border-b border-gray-100 px-5 py-3 dark:border-gray-800">
-                    <FolderSync size={14} className="text-gray-400" />
+                    <FolderSync size={14} className="text-gray-500" />
                     <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">
                       {t('skills.bundledFiles', { count: selected.item.files.length })}
                     </span>
-                    <span className="ml-auto text-[10px] text-gray-400 dark:text-gray-500">{t('skills.bundledFilesHint')}</span>
+                    <span className="ml-auto text-[10px] text-gray-500 dark:text-gray-400">{t('skills.bundledFilesHint')}</span>
                   </div>
                   <div className="flex flex-wrap gap-1.5 p-5">
                     {selected.item.files.map((file) => (
@@ -651,7 +688,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
               <div className="relative mb-4">
                 <div className="absolute -inset-1 rounded-full bg-violet-100 opacity-50 blur dark:bg-violet-900/30" />
                 <div className="relative flex h-16 w-16 items-center justify-center rounded-2xl bg-gray-100 dark:bg-gray-800">
-                  <BookOpenText size={28} className="text-gray-400 dark:text-gray-500" />
+                  <BookOpenText size={28} className="text-gray-500 dark:text-gray-400" />
                 </div>
               </div>
               <h2 className="text-sm font-medium text-gray-700 dark:text-gray-200">{t('skills.selectTitle')}</h2>
@@ -686,7 +723,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
         <div className="pointer-events-none fixed bottom-5 left-1/2 z-50 -translate-x-1/2" role="status">
           <div className="pointer-events-auto flex max-w-md items-center gap-2 rounded-xl border border-gray-200 bg-white px-4 py-2.5 text-xs text-gray-700 shadow-lg dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200">
             <span className="min-w-0 flex-1">{notice}</span>
-            <button onClick={() => setNotice(null)} aria-label={t('skills.closeNoticeAria')} className="shrink-0 rounded-md p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300">
+            <button onClick={() => setNotice(null)} aria-label={t('skills.closeNoticeAria')} className="shrink-0 rounded-md p-1 text-gray-500 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300">
               <X size={13} />
             </button>
           </div>
@@ -710,450 +747,5 @@ function FilterPill({ active, onClick, children }: { active: boolean; onClick: (
     >
       {children}
     </button>
-  )
-}
-
-export function PublishDialog({
-  skill, targets, setTargets, loading, onConfirm, onClose,
-}: {
-  skill: SkillDocument
-  targets: Set<string>
-  setTargets: (v: Set<string> | ((prev: Set<string>) => Set<string>)) => void
-  loading: boolean
-  onConfirm: () => void
-  onClose: () => void
-}) {
-  const { t } = useTranslation()
-  const toggleTarget = (id: string) => {
-    setTargets((prev) => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
-  }
-
-  return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-label={t('skills.publishDialogAria')}>
-      <button aria-label={t('skills.dialogCancel')} onClick={onClose} className="absolute inset-0 cursor-default bg-gray-950/40 backdrop-blur-[2px]" />
-      <div className="relative max-h-[85vh] w-full max-w-md overflow-y-auto rounded-2xl border border-gray-200 bg-white p-5 shadow-2xl dark:border-gray-700 dark:bg-gray-900">
-        <div className="flex items-center gap-2">
-          <div className="rounded-lg bg-violet-500/10 p-1.5 text-violet-600 dark:text-violet-400">
-            <ShieldCheck size={16} />
-          </div>
-          <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('skills.publishDialogTitle')}</h2>
-          <button onClick={onClose} aria-label={t('skills.dialogCancel')} className="ml-auto rounded-md p-1.5 text-gray-400 transition hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300">
-            <X size={15} />
-          </button>
-        </div>
-
-        <div className="mt-3 rounded-lg border border-gray-200 p-3 dark:border-gray-700">
-          <div className="flex items-center gap-2">
-            <span className={`inline-block h-2 w-2 rounded-full ${sourceColor(skill.item.source)}`} />
-            <span className="truncate text-sm font-medium text-gray-800 dark:text-gray-100">{skill.item.name}</span>
-            <span className="ml-auto shrink-0 text-xs text-gray-400">{skill.item.source}</span>
-          </div>
-          {skill.item.description && <p className="mt-1.5 line-clamp-2 text-xs text-gray-500 dark:text-gray-400">{skill.item.description}</p>}
-        </div>
-
-        <p className="mb-2 mt-4 text-xs font-medium text-gray-600 dark:text-gray-400">{t('skills.publishDialogTargets')}</p>
-        <div className="grid grid-cols-2 gap-2">
-          {SOURCES.map((agent) => {
-            const checked = targets.has(agent.id)
-            return (
-              <label key={agent.id} className={`flex cursor-pointer items-center gap-2 rounded-lg border px-2.5 py-2 text-xs font-medium transition ${checked ? 'border-violet-500 bg-violet-50 text-violet-700 dark:bg-violet-500/20 dark:text-violet-200' : 'border-gray-300 text-gray-600 hover:bg-gray-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800'}`}>
-                <input type="checkbox" checked={checked} onChange={() => toggleTarget(agent.id)} className="h-3.5 w-3.5 accent-violet-600" />
-                <span className={`h-1.5 w-1.5 rounded-full ${agent.color}`} />
-                {agent.label}
-              </label>
-            )
-          })}
-        </div>
-
-        <p className="mt-3 text-xs leading-5 text-gray-400 dark:text-gray-500">{t('skills.publishDialogHint')}</p>
-
-        <div className="mt-4 flex items-center justify-end gap-2">
-          <button onClick={onClose} disabled={loading} className="rounded-lg border border-gray-300 px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-800">{t('skills.dialogCancel')}</button>
-          <button onClick={onConfirm} disabled={loading} className="inline-flex items-center gap-1.5 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-violet-500 disabled:opacity-50">
-            {loading ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
-            {t('skills.publishAssign')}
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-/** 部署体检对话框：一屏展示每个 Agent 收到的 Skill 副本状态，支持按 Agent 一键修复。
- *  发布/调整装备已改为即时同步，这里定位为手动核对与补救入口。 */
-function DeployDialog({ onClose, onNotice }: {
-  onClose: () => void
-  onNotice: (message: string) => void
-}) {
-  const { t } = useTranslation()
-  const { skills, previewSkillSync, applySkillSync } = useMemoryStore()
-  const [previews, setPreviews] = useState<Record<string, SkillSyncPreview | 'error'>>({})
-  const [busyAgent, setBusyAgent] = useState<string | null>(null)
-  const [checking, setChecking] = useState(true)
-  // 钻取查看某个「待更新」Skill 的本地更改 diff。
-  const [drift, setDrift] = useState<{ target: string, skill: SkillItem } | null>(null)
-
-  const refreshAgent = async (agent: string) => {
-    try {
-      const result = await previewSkillSync(agent)
-      setPreviews((prev) => ({ ...prev, [agent]: result }))
-    } catch {
-      setPreviews((prev) => ({ ...prev, [agent]: 'error' }))
-    }
-  }
-
-  useEffect(() => {
-    let mounted = true
-    setChecking(true)
-    Promise.all(SOURCES.map(({ id }) => previewSkillSync(id).then(
-      (result) => [id, result] as const,
-      () => [id, 'error'] as const,
-    ))).then((entries) => {
-      if (mounted) {
-        setPreviews(Object.fromEntries(entries))
-        setChecking(false)
-      }
-    })
-    return () => { mounted = false }
-  }, [previewSkillSync, skills])
-
-  async function redeploy(agent: string, label: string) {
-    setBusyAgent(agent)
-    try {
-      const result = await applySkillSync(agent, true)
-      const created = result.create.length + result.missing.length
-      const updated = result.update.length + result.conflict.length
-      const deployed = created + updated
-      onNotice(t('skills.deployDone', { label, created, updated }))
-      if (deployed > 0) await refreshAgent(agent)
-    } catch (error) {
-      onNotice(t('skills.deployFailed', { label, error: String(error) }))
-    } finally {
-      setBusyAgent(null)
-    }
-  }
-
-  return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-label={t('skills.deployDialogAria')}>
-      <button aria-label={t('skills.dialogCancel')} onClick={onClose} className="absolute inset-0 cursor-default bg-gray-950/40 backdrop-blur-[2px]" />
-      <div className="relative flex max-h-[85vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-2xl dark:border-gray-700 dark:bg-gray-900">
-        {/* header */}
-        <div className="flex items-center gap-2 border-b border-gray-100 px-5 py-4 dark:border-gray-800">
-          <div className="rounded-lg bg-violet-500/10 p-1.5 text-violet-600 dark:text-violet-400">
-            <Rocket size={16} />
-          </div>
-          <div className="min-w-0">
-            <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('skills.deployDialogTitle')}</h2>
-            <p className="text-[11px] text-gray-400 dark:text-gray-500">{t('skills.deployDialogHint')}</p>
-          </div>
-          <button onClick={onClose} aria-label={t('skills.dialogCancel')} className="ml-auto shrink-0 rounded-md p-1.5 text-gray-400 transition hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300">
-            <X size={15} />
-          </button>
-        </div>
-
-        {/* agent cards */}
-        <div className="min-h-0 flex-1 space-y-2.5 overflow-y-auto p-5">
-          {checking && (
-            <div className="flex items-center justify-center gap-2 py-8 text-xs text-gray-400">
-              <Loader2 size={14} className="animate-spin motion-reduce:animate-none" />
-              {t('skills.deployChecking')}
-            </div>
-          )}
-          {!checking && SOURCES.map((agent) => {
-            const preview = previews[agent.id]
-            const equipped = skills.filter((s) => s.status === 'published' && s.assigned_agents.includes(agent.id) && s.source !== agent.id).length
-            if (preview === undefined) return null
-            if (preview === 'error') {
-              return (
-                <div key={agent.id} className="flex items-center gap-3 rounded-xl border border-gray-200 p-3 dark:border-gray-700">
-                  <span className={`h-2 w-2 shrink-0 rounded-full ${agent.color}`} />
-                  <span className="text-xs font-medium text-gray-700 dark:text-gray-200">{agent.label}</span>
-                  <span className="ml-auto text-xs text-rose-500">{t('skills.deployReadFailed')}</span>
-                </div>
-              )
-            }
-            const pending = preview.create.length + preview.update.length + preview.conflict.length + preview.missing.length
-            const clean = pending === 0
-            return (
-              <div key={agent.id} className="rounded-xl border border-gray-200 p-3 dark:border-gray-700">
-                <div className="flex items-center gap-2">
-                  <span className={`h-2 w-2 shrink-0 rounded-full ${agent.color}`} />
-                  <span className="text-xs font-semibold text-gray-800 dark:text-gray-100">{agent.label}</span>
-                  <span className="text-[11px] text-gray-400 dark:text-gray-500">{t('skills.deployEquipped', { count: equipped })}</span>
-                  {clean && (
-                    <span className="ml-auto inline-flex items-center gap-1 text-[11px] font-medium text-emerald-600 dark:text-emerald-400">
-                      <ShieldCheck size={11} /> {t('skills.deployUpToDate')}
-                    </span>
-                  )}
-                </div>
-                <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                  {preview.create.length > 0 && <DeployBadge label={t('skills.badgeToCreate')} count={preview.create.length} tone="emerald" />}
-                  {preview.update.length > 0 && <DeployBadge label={t('skills.badgeToUpdate')} count={preview.update.length} tone="amber" />}
-                  {preview.conflict.length > 0 && <DeployBadge label={t('skills.badgeConflict')} count={preview.conflict.length} tone="rose" />}
-                  {preview.missing.length > 0 && <DeployBadge label={t('skills.badgeMissing')} count={preview.missing.length} tone="rose" />}
-                  {preview.unchanged.length > 0 && <DeployBadge label={t('skills.badgeUnchanged')} count={preview.unchanged.length} tone="gray" />}
-                  <button
-                    onClick={() => { void redeploy(agent.id, agent.label) }}
-                    disabled={busyAgent === agent.id || clean}
-                    className="ml-auto inline-flex items-center gap-1.5 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-violet-500 active:scale-[0.98] disabled:opacity-40"
-                  >
-                    {busyAgent === agent.id ? <Loader2 size={12} className="animate-spin motion-reduce:animate-none" /> : <Rocket size={12} />}
-                    {t('skills.deployAction')}
-                  </button>
-                </div>
-                {preview.update.length > 0 && (
-                  <div className="mt-1.5 space-y-0.5 border-t border-gray-100 pt-1.5 dark:border-gray-800">
-                    {preview.update.map(skill => (
-                      <button
-                        key={`${skill.source}:${skill.name}`}
-                        onClick={() => setDrift({ target: agent.id, skill })}
-                        className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-xs text-gray-600 transition hover:bg-gray-50 dark:text-gray-300 dark:hover:bg-gray-800"
-                      >
-                        <FileCode2 size={11} className="shrink-0 text-amber-500" />
-                        <span className="truncate">{skill.name}</span>
-                        <span className="ml-auto shrink-0 text-[10px] font-medium text-violet-600 dark:text-violet-400">{t('skills.driftView')} →</span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )
-          })}
-        </div>
-      </div>
-      {drift && (
-        <DriftDialog
-          target={drift.target}
-          skill={drift.skill}
-          onClose={() => setDrift(null)}
-          onDone={() => { setDrift(null); void refreshAgent(drift.target) }}
-          onNotice={onNotice}
-        />
-      )}
-    </div>
-  )
-}
-
-function DeployBadge({ label, count, tone }: { label: string; count: number; tone: 'emerald' | 'amber' | 'rose' | 'gray' }) {
-  const tones: Record<string, string> = {
-    emerald: 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400',
-    amber:   'bg-amber-500/10 text-amber-700 dark:text-amber-400',
-    rose:    'bg-rose-500/10 text-rose-700 dark:text-rose-400',
-    gray:    'bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400',
-  }
-  return (
-    <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium ${tones[tone]}`}>
-      {label} <span className="font-mono font-semibold tabular-nums">{count}</span>
-    </span>
-  )
-}
-
-type DiffLine = { kind: 'same' | 'del' | 'add', text: string }
-
-/** 简单 LCS 行级 diff：del 行取旧文本（共享库），add 行取新文本（Agent 本地）。 */
-function lineDiff(oldText: string, newText: string): DiffLine[] {
-  const a = oldText.split('\n')
-  const b = newText.split('\n')
-  const n = a.length
-  const m = b.length
-  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0))
-  for (let i = n - 1; i >= 0; i--) {
-    for (let j = m - 1; j >= 0; j--) {
-      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1])
-    }
-  }
-  const out: DiffLine[] = []
-  let i = 0
-  let j = 0
-  while (i < n && j < m) {
-    if (a[i] === b[j]) { out.push({ kind: 'same', text: a[i] }); i++; j++ }
-    else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push({ kind: 'del', text: a[i] }); i++ }
-    else { out.push({ kind: 'add', text: b[j] }); j++ }
-  }
-  while (i < n) { out.push({ kind: 'del', text: a[i] }); i++ }
-  while (j < m) { out.push({ kind: 'add', text: b[j] }); j++ }
-  return out
-}
-
-/** 文件级 tab + 红绿行级 diff 渲染：DriftDialog 与已发布页仲裁对话框共用。 */
-export function SkillDiffPane({ files, selected, onSelect }: {
-  files: SkillDriftFile[]
-  selected: number
-  onSelect: (index: number) => void
-}) {
-  const { t } = useTranslation()
-  const file = files.length > 0 ? files[Math.min(selected, files.length - 1)] : null
-  let diffLines: DiffLine[] = []
-  let diffNote: string | null = null
-  if (file) {
-    if (file.shared_text === null && file.local_text === null) {
-      diffNote = t('skills.driftBinary')
-    } else if (file.shared_text === null) {
-      diffNote = t('skills.driftOnlyLocal')
-      diffLines = (file.local_text ?? '').split('\n').map(text => ({ kind: 'add' as const, text }))
-    } else if (file.local_text === null) {
-      diffNote = t('skills.driftOnlyShared')
-      diffLines = (file.shared_text ?? '').split('\n').map(text => ({ kind: 'del' as const, text }))
-    } else {
-      diffLines = lineDiff(file.shared_text, file.local_text)
-    }
-  }
-  return (
-    <div className="space-y-3">
-      <div className="flex flex-wrap gap-1.5">
-        {files.map((f, index) => (
-          <button
-            key={f.path}
-            onClick={() => onSelect(index)}
-            className={`rounded-full px-2.5 py-1 font-mono text-[11px] font-medium transition ${
-              index === selected
-                ? 'bg-violet-600 text-white'
-                : 'bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700'
-            }`}
-          >
-            {f.path}
-          </button>
-        ))}
-      </div>
-      <div className="flex items-center gap-3 text-[10px] text-gray-400 dark:text-gray-500">
-        <span className="inline-flex items-center gap-1"><span className="inline-block h-2 w-2 rounded-sm bg-rose-400" />{t('skills.driftLegendShared')}</span>
-        <span className="inline-flex items-center gap-1"><span className="inline-block h-2 w-2 rounded-sm bg-emerald-400" />{t('skills.driftLegendLocal')}</span>
-      </div>
-      {diffNote && <p className="text-xs text-amber-600 dark:text-amber-400">{diffNote}</p>}
-      <pre className="max-h-72 overflow-auto rounded-xl bg-gray-50 p-3 font-mono text-[11px] leading-5 dark:bg-gray-800/60">
-        {diffLines.map((line, index) => (
-          <div
-            key={index}
-            className={
-              line.kind === 'del'
-                ? 'bg-rose-500/10 text-rose-700 dark:text-rose-300'
-                : line.kind === 'add'
-                  ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
-                  : 'text-gray-600 dark:text-gray-300'
-            }
-          >
-            <span className="mr-1.5 inline-block w-3 select-none text-center opacity-50">{line.kind === 'del' ? '-' : line.kind === 'add' ? '+' : ' '}</span>
-            {line.text || ' '}
-          </div>
-        ))}
-      </pre>
-    </div>
-  )
-}
-
-/** 单个「待更新」Skill 的本地更改对比：文件级列表 + 行级 diff，
- *  操作为「用共享库覆盖」（丢弃本地改动）或「采纳本地版本」（回写共享库
- *  并同步到其他已装备 Agent）。 */
-function DriftDialog({ target, skill, onClose, onDone, onNotice }: {
-  target: string
-  skill: SkillItem
-  onClose: () => void
-  onDone: () => void
-  onNotice: (message: string) => void
-}) {
-  const { t } = useTranslation()
-  const { skillDriftDetail, adoptLocalSkill, applySkillSyncOne } = useMemoryStore()
-  const [files, setFiles] = useState<SkillDriftFile[] | null>(null)
-  const [selected, setSelected] = useState(0)
-  const [error, setError] = useState<string | null>(null)
-  const [busy, setBusy] = useState(false)
-
-  useEffect(() => {
-    let mounted = true
-    skillDriftDetail(target, skill.source, skill.name)
-      .then((result) => { if (mounted) { setFiles(result); setSelected(0) } })
-      .catch((e) => { if (mounted) setError(String(e)) })
-    return () => { mounted = false }
-  }, [target, skill.source, skill.name, skillDriftDetail])
-
-  const agentLabel = SOURCES.find(s => s.id === target)?.label ?? target
-
-  async function overwriteWithShared() {
-    setBusy(true)
-    try {
-      await applySkillSyncOne(target, skill.source, skill.name)
-      onDone()
-    } catch (e) {
-      setError(String(e))
-      setBusy(false)
-    }
-  }
-
-  async function adoptLocal() {
-    if (!window.confirm(t('skills.driftAdoptConfirm', { name: skill.name }))) return
-    setBusy(true)
-    try {
-      const result = await adoptLocalSkill(target, skill.source, skill.name)
-      onNotice(t('skills.driftAdoptDone', {
-        name: skill.name,
-        synced: result.synced.length,
-        skipped: result.skipped.length,
-      }))
-      onDone()
-    } catch (e) {
-      setError(String(e))
-      setBusy(false)
-    }
-  }
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-label={t('skills.driftTitle')}>
-      <button aria-label={t('skills.dialogCancel')} onClick={onClose} className="absolute inset-0 cursor-default bg-gray-950/50 backdrop-blur-[2px]" />
-      <div className="relative flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-2xl dark:border-gray-700 dark:bg-gray-900">
-        <div className="flex items-center gap-2 border-b border-gray-100 px-5 py-4 dark:border-gray-800">
-          <div className="rounded-lg bg-amber-500/10 p-1.5 text-amber-600 dark:text-amber-400">
-            <FileCode2 size={16} />
-          </div>
-          <div className="min-w-0">
-            <h2 className="truncate text-sm font-semibold text-gray-800 dark:text-gray-100">{skill.name}</h2>
-            <p className="text-[11px] text-gray-400 dark:text-gray-500">{t('skills.driftSubtitle', { agent: agentLabel })}</p>
-          </div>
-          <button onClick={onClose} aria-label={t('skills.dialogCancel')} className="ml-auto shrink-0 rounded-md p-1.5 text-gray-400 transition hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300">
-            <X size={15} />
-          </button>
-        </div>
-
-        <div className="min-h-0 flex-1 overflow-y-auto p-5">
-          {error && <p className="text-xs text-rose-500">{t('skills.driftLoadFailed', { error })}</p>}
-          {!files && !error && (
-            <div className="flex items-center justify-center gap-2 py-8 text-xs text-gray-400">
-              <Loader2 size={14} className="animate-spin motion-reduce:animate-none" />
-              {t('skills.deployChecking')}
-            </div>
-          )}
-          {files && files.length === 0 && (
-            <p className="py-8 text-center text-xs text-gray-400">{t('skills.driftEmpty')}</p>
-          )}
-          {files && files.length > 0 && (
-            <SkillDiffPane files={files} selected={selected} onSelect={setSelected} />
-          )}
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2 border-t border-gray-100 px-5 py-3 dark:border-gray-800">
-          <button
-            onClick={() => { void overwriteWithShared() }}
-            disabled={busy || !files}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-gray-300 px-3 py-1.5 text-xs font-medium text-gray-700 transition hover:bg-gray-50 disabled:opacity-40 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-800"
-          >
-            <RotateCcw size={13} />
-            {t('skills.driftOverwrite')}
-          </button>
-          <button
-            onClick={() => { void adoptLocal() }}
-            disabled={busy || !files}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-violet-500 disabled:opacity-40"
-          >
-            {busy ? <Loader2 size={12} className="animate-spin motion-reduce:animate-none" /> : <ArrowRightLeft size={12} />}
-            {t('skills.driftAdopt')}
-          </button>
-          <p className="ml-auto max-w-[45%] text-[10px] leading-4 text-gray-400 dark:text-gray-500">{t('skills.driftHint')}</p>
-        </div>
-      </div>
-    </div>
   )
 }

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use tauri::Emitter;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -78,6 +79,8 @@ pub struct SkillDriftFile {
     pub shared_text: Option<String>,
     pub local_text: Option<String>,
 }
+
+include!("equipment_skill_support.rs");
 
 fn shared_root() -> PathBuf {
     dirs_next::config_dir()
@@ -627,11 +630,35 @@ fn cache_upsert_skill(item: &SkillItem) {
 /// Import existing skills into the Vibe Assistant shared directory.  Each
 /// source retains its own namespace so equal names never silently overwrite.
 #[tauri::command]
-pub async fn skill_scan() -> Result<Vec<SkillItem>, String> {
+pub async fn skill_scan(app: tauri::AppHandle) -> Result<Vec<SkillItem>, String> {
+    let result = skill_scan_impl(&app);
+    if result.is_err() {
+        // Keep successfully imported entries visible even if a later source fails.
+        let _ = refresh_skill_cache();
+    }
+    result
+}
+
+fn skill_scan_impl(app: &tauri::AppHandle) -> Result<Vec<SkillItem>, String> {
     let root = shared_root();
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let mut imported = Vec::new();
-    for (source, roots) in scan_roots() {
+    let cached_catalog = crate::telemetry_store::shared_store()
+        .and_then(|store| store.app_setting_get::<Vec<SkillItem>>(SKILL_CATALOG_SETTING_KEY));
+    let mut catalog = match cached_catalog {
+        Some(skills) => skills,
+        None => shared_skills()?,
+    };
+    let sources = scan_roots();
+    let source_count = sources.len();
+    for (index, (source, roots)) in sources.into_iter().enumerate() {
+        let _ = app.emit("skill-scan-progress", serde_json::json!({
+            "source": source,
+            "sourceIndex": index + 1,
+            "sourceCount": source_count,
+            "imported": imported.len(),
+            "phase": "scanning",
+        }));
         let mut files = Vec::new();
         for scan_root in &roots {
             collect_skill_files(scan_root, &mut files)?;
@@ -666,6 +693,14 @@ pub async fn skill_scan() -> Result<Vec<SkillItem>, String> {
         // 首次出现的（最新）版本之后的同名副本全部跳过。
         let mut seen_names = std::collections::HashSet::new();
         for path in files {
+            let _ = app.emit("skill-scan-progress", serde_json::json!({
+                "source": source,
+                "sourceIndex": index + 1,
+                "sourceCount": source_count,
+                "imported": imported.len(),
+                "currentSkill": path.parent().and_then(|dir| dir.file_name()).and_then(|name| name.to_str()),
+                "phase": "scanning",
+            }));
             let skill = match parse_skill(&path, source) {
                 Ok(skill) => skill,
                 Err(error) => {
@@ -683,11 +718,13 @@ pub async fn skill_scan() -> Result<Vec<SkillItem>, String> {
             let target_dir = root.join(source).join(&skill.name);
             let target = target_dir.join("SKILL.md");
             std::fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
-            let next_hash = dir_hash(&skill_dir)?;
+            let next_hash = skill.hash.clone();
             let mut manifest = read_manifest(&target, &next_hash);
+            let mut changed = true;
             if target.exists() {
                 let previous_hash = dir_hash(&target_dir)?;
-                if previous_hash != next_hash {
+                changed = previous_hash != next_hash;
+                if changed {
                     let previous_manifest = read_manifest(&target, &previous_hash);
                     // 整目录快照（含附属脚本/资源），旧版单文件快照不受影响。
                     let snapshot = version_root(&target).join(format!(
@@ -703,21 +740,41 @@ pub async fn skill_scan() -> Result<Vec<SkillItem>, String> {
                     manifest.updated_at = chrono::Utc::now().to_rfc3339();
                 }
             }
-            replace_contents_within(&skill_dir, &target_dir)?;
+            if changed {
+                replace_contents_within(&skill_dir, &target_dir)?;
+            }
             // 重新扫描时以最新路径判定回填性质，分类规则升级后无需迁移。
             manifest.origin = skill.origin.clone();
             write_manifest(&target, &manifest)?;
-            imported.push(with_manifest(
+            let item = with_manifest(
                 SkillItem {
                     path: target.display().to_string(),
                     ..skill
                 },
                 &target,
-            ));
+            );
+            if let Some(existing) = catalog
+                .iter_mut()
+                .find(|entry| entry.source == item.source && entry.name == item.name)
+            {
+                *existing = item.clone();
+            } else {
+                catalog.push(item.clone());
+            }
+            imported.push(item);
         }
+        // Make completed sources visible while later Agents are still scanning.
+        cache_skills(&catalog);
+        let _ = app.emit("skill-scan-progress", serde_json::json!({
+            "source": source,
+            "sourceIndex": index + 1,
+            "sourceCount": source_count,
+            "imported": imported.len(),
+            "phase": "source_complete",
+        }));
     }
-    // File copies remain necessary for external Agents, but the database
-    // catalog makes reopening the Skill view an O(1) SQLite read.
+    // Reconcile entries that were already in the shared library but absent
+    // from the current Agent scan (for example marketplace installs).
     let _ = refresh_skill_cache()?;
     Ok(imported)
 }

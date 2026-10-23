@@ -1,8 +1,7 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { invoke } from '@tauri-apps/api/core'
 import { RefreshCw, Zap, Search, AlertTriangle } from 'lucide-react'
-import type { AgentState } from '../types/agent'
 
 interface PortInfo {
   port: number
@@ -12,11 +11,7 @@ interface PortInfo {
   state: string
 }
 
-interface PortManagerProps {
-  agents: AgentState[]
-}
-
-export function PortManager({ agents }: PortManagerProps) {
+export function PortManager() {
   const { t } = useTranslation()
   const [ports, setPorts] = useState<PortInfo[]>([])
   const [loading, setLoading] = useState(false)
@@ -24,16 +19,6 @@ export function PortManager({ agents }: PortManagerProps) {
   const [killing, setKilling] = useState<number | null>(null)
   const [killResult, setKillResult] = useState<{ port: number; msg: string; ok: boolean } | null>(null)
   const [confirmKill, setConfirmKill] = useState<PortInfo | null>(null)
-
-  const managedPorts = useMemo(() => {
-    const map = new Map<number, string>()
-    for (const a of agents) {
-      if (a.config.port) {
-        map.set(a.config.port, a.config.name)
-      }
-    }
-    return map
-  }, [agents])
 
   async function load() {
     setLoading(true)
@@ -76,7 +61,7 @@ export function PortManager({ agents }: PortManagerProps) {
       <div className="border-b border-gray-200 bg-white px-6 py-4 dark:border-gray-700 dark:bg-gray-900">
         <div className="flex items-center justify-between">
           <div>
-            <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">{t('ports.title')}</h2>
+            <h1 className="text-base font-semibold text-gray-900 dark:text-gray-100">{t('ports.title')}</h1>
             <p className="text-xs text-gray-500 dark:text-gray-400">{t('ports.subtitle', { count: ports.length })}</p>
           </div>
           <button
@@ -91,7 +76,7 @@ export function PortManager({ agents }: PortManagerProps) {
 
         {/* Search */}
         <div className="relative mt-3">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
           <input
             value={search}
             onChange={e => setSearch(e.target.value)}
@@ -123,14 +108,13 @@ export function PortManager({ agents }: PortManagerProps) {
                 <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500">{t('ports.process')}</th>
                 <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500">{t('ports.pid')}</th>
                 <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500">{t('ports.state')}</th>
-                <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500">{t('ports.agent')}</th>
                 <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-wide text-gray-500">{t('ports.action')}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-50 dark:divide-gray-800">
               {filtered.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="py-12 text-center text-gray-400">
+                  <td colSpan={6} className="py-12 text-center text-gray-500">
                     {loading ? t('ports.loading') : t('ports.noPorts')}
                   </td>
                 </tr>
@@ -156,16 +140,6 @@ export function PortManager({ agents }: PortManagerProps) {
                       <span className="h-1.5 w-1.5 rounded-full bg-green-500" />
                       {p.state}
                     </span>
-                  </td>
-                  <td className="px-4 py-3">
-                    {managedPorts.has(p.port) ? (
-                      <span className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-900/20 dark:text-blue-400">
-                        <span className="h-1.5 w-1.5 rounded-full bg-blue-500" />
-                        {managedPorts.get(p.port)}
-                      </span>
-                    ) : (
-                      <span className="text-xs text-gray-300 dark:text-gray-700">—</span>
-                    )}
                   </td>
                   <td className="px-4 py-3 text-right">
                     <button

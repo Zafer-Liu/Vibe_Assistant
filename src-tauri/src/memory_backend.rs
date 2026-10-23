@@ -25,6 +25,8 @@ const DEFAULT_API_KEY: &str = "dev-api-key-001";
 use crate::llm;
 use crate::telemetry_store::{MemoryImportance, MemoryImportanceCandidate};
 
+mod local_semantic;
+
 const SEMANTIC_MEMORY_OWNER: &str = "agent-manager";
 const SEMANTIC_INDEX_BATCH_SIZE: usize = 24;
 
@@ -32,7 +34,7 @@ fn semantic_api_key() -> String {
     std::env::var("MINDMEMOS_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_string())
 }
 
-/// A result returned by the optional MindMemOS vector index.  The native L1
+/// A result returned by the configured local embedding or MindMemOS index.  The native L1
 /// ledger remains authoritative; this is only the semantic retrieval layer
 /// used to find an otherwise differently-worded L1 item.
 #[derive(Clone, Serialize)]
@@ -517,10 +519,270 @@ pub fn queue_semantic_l1_reindex() -> Result<usize, String> {
     Ok(count)
 }
 
+/// Unlike app_setting_get, propagate SQLite and JSON errors instead of
+/// silently presenting a broken stored configuration as disabled.
+///
+/// Returns the raw stored value (including any API key). Callers that expose
+/// the config to the frontend must pass it through
+/// `local_semantic::public_config` first; internal consumers (search, embed)
+/// need the key.
+fn semantic_config_read_raw(telemetry: &crate::telemetry_store::TelemetryStore) -> Result<Option<Value>, String> {
+    use rusqlite::OptionalExtension;
+    let conn = telemetry.conn.lock().map_err(|_| "telemetry store lock poisoned".to_string())?;
+    let raw: Option<String> = conn.query_row(
+        "SELECT value_json FROM app_settings WHERE setting_key = ?1",
+        ["memory_semantic_embedding"],
+        |row| row.get(0),
+    ).optional().map_err(|error| error.to_string())?;
+    let Some(raw) = raw else { return Ok(None) };
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|_| "invalid stored memory_semantic_embedding JSON".to_string())?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    local_semantic::validate_config(value).map(Some)
+}
+
+#[tauri::command]
+pub fn memory_semantic_config_get(
+    telemetry: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
+) -> Result<Option<Value>, String> {
+    // The API key never leaves the native process; the UI only learns whether
+    // one is stored so it can render the correct placeholder state.
+    semantic_config_read_raw(&telemetry)?
+        .map(local_semantic::public_config)
+        .transpose()
+}
+
+#[tauri::command]
+pub fn memory_semantic_config_set(
+    telemetry: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
+    config: Option<Value>,
+) -> Result<Option<Value>, String> {
+    let config = config.filter(|value| !value.is_null());
+    // api_key semantics: omitted keeps the stored key, "" clears it, any
+    // other value replaces it. Merge against the raw stored config before
+    // validation so the key is never required on every save.
+    let stored = semantic_config_read_raw(&telemetry)?;
+    let merged = config
+        .map(|value| local_semantic::merge_api_key(value, stored.as_ref()))
+        .map(local_semantic::validate_config)
+        .transpose()?;
+    // JSON null explicitly disables this route. No HTTP or process side effects.
+    telemetry.app_setting_set("memory_semantic_embedding", &merged)?;
+    merged.map(local_semantic::public_config).transpose()
+}
+
+#[tauri::command]
+pub async fn memory_semantic_test(
+    telemetry: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
+    config: Value,
+) -> Result<Value, String> {
+    // The UI draft never contains the stored API key; merge it (same rules as
+    // config_set) so testing an authenticated remote service does not require
+    // re-entering the key.
+    let stored = semantic_config_read_raw(&telemetry)?;
+    let config = local_semantic::merge_api_key(config, stored.as_ref());
+    tokio::task::spawn_blocking(move || local_semantic::test_config(config))
+        .await.map_err(|_| "embedding connection test task failed".to_string())?
+}
+
+/// Embed texts with the saved embedding configuration for the memory center's
+/// consolidation candidate selection and semantic search. Reads the stored
+/// config (never a caller-supplied one) so the API key stays native-side;
+/// writes nothing to the vector cache.
+#[tauri::command]
+pub async fn memory_semantic_embed_texts(
+    telemetry: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
+    texts: Vec<String>,
+) -> Result<Value, String> {
+    let config = semantic_config_read_raw(&telemetry)?
+        .ok_or_else(|| "语义检索未配置：请先在设置中启用并保存 embedding 服务".to_string())?;
+    tokio::task::spawn_blocking(move || local_semantic::embed_texts(config, texts))
+        .await.map_err(|_| "embedding task failed".to_string())?
+}
+
+// ---------------------------------------------------------------------------
+// Vector index: progress status, manual build, and scheduled auto-build.
+//
+// The vector cache is otherwise lazy — `local_semantic::search` only embeds
+// documents that are still uncached when a query arrives. These commands and
+// the scheduler below make indexing proactive and observable so newly
+// consolidated memories are searchable without waiting for the next query.
+// ---------------------------------------------------------------------------
+
+/// Cheap cached/total/pending count for the settings page progress bar. Never
+/// embeds, never starts the runtime; safe to poll while a build runs.
+#[tauri::command]
+pub async fn memory_semantic_index_status(
+    telemetry: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
+) -> Result<Value, String> {
+    let config = semantic_config_read_raw(&telemetry)?
+        .ok_or_else(|| "语义检索未配置：请先在设置中启用并保存 embedding 服务".to_string())?;
+    let store = telemetry.inner().clone();
+    tokio::task::spawn_blocking(move || local_semantic::index_status(&store, config))
+        .await.map_err(|_| "index status task failed".to_string())?
+}
+
+/// Manual incremental build from the settings page. Embeds only the missing
+/// signatures and reports the resulting status plus how many were embedded.
+#[tauri::command]
+pub async fn memory_semantic_index_build(
+    telemetry: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
+    app: tauri::AppHandle,
+) -> Result<Value, String> {
+    let config = semantic_config_read_raw(&telemetry)?
+        .ok_or_else(|| "语义检索未配置：请先在设置中启用并保存 embedding 服务".to_string())?;
+    if !try_begin_embed_build() {
+        return Err("已有索引构建任务在进行中，请稍后再试".to_string());
+    }
+    let store = telemetry.inner().clone();
+    let result = tokio::task::spawn_blocking(move || local_semantic::build_index(&store, config))
+        .await.map_err(|_| "index build task failed".to_string())?;
+    end_embed_build();
+    match result {
+        Ok(value) => {
+            let embedded = value.get("embedded").and_then(Value::as_u64).unwrap_or(0);
+            if embedded > 0 {
+                let _ = app.emit("memory-embedding-index-updated", ());
+            }
+            Ok(value)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// 定时自动构建设置：开关 + 构建间隔（小时）。默认开、6 小时——比 L2/L3 的
+/// 7/30 天频繁，因为新记忆需要尽快可被语义检索命中。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct EmbeddingAutoBuildConfig {
+    pub enabled: bool,
+    pub interval_hours: u32,
+}
+
+impl Default for EmbeddingAutoBuildConfig {
+    fn default() -> Self {
+        EmbeddingAutoBuildConfig { enabled: true, interval_hours: 6 }
+    }
+}
+
+const EMBEDDING_AUTO_BUILD_SETTING_KEY: &str = "memory_semantic_embedding_auto_build";
+/// 上次尝试构建的 RFC3339 时间戳：无论成败都盖，失败端点按间隔重试而非每 tick。
+const EMBED_BUILD_LAST_KEY: &str = "memory_semantic_embedding_auto_build_last";
+/// 检查周期：半小时醒一次看是否到期。
+const EMBED_BUILD_TICK: Duration = Duration::from_secs(1800);
+/// 启动延迟：让 L1 整理队列与遥测回补先跑完，避免与启动高峰抢资源。
+const EMBED_BUILD_STARTUP_DELAY: Duration = Duration::from_secs(900);
+
+/// 纯函数：兼容布尔旧值 / 部分字段 / 越界值，越界一律收敛到允许区间。
+fn parse_embedding_auto_build_config(raw: Option<Value>) -> EmbeddingAutoBuildConfig {
+    let mut config = EmbeddingAutoBuildConfig::default();
+    match raw {
+        Some(Value::Bool(enabled)) => config.enabled = enabled,
+        Some(value) => {
+            if let Ok(parsed) = serde_json::from_value::<EmbeddingAutoBuildConfig>(value) {
+                config = parsed;
+            }
+        }
+        None => {}
+    }
+    config.interval_hours = config.interval_hours.clamp(1, 168);
+    config
+}
+
+#[tauri::command]
+pub fn memory_embedding_auto_build_get(
+    telemetry: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
+) -> Result<EmbeddingAutoBuildConfig, String> {
+    Ok(parse_embedding_auto_build_config(
+        telemetry.app_setting_get::<Value>(EMBEDDING_AUTO_BUILD_SETTING_KEY),
+    ))
+}
+
+#[tauri::command]
+pub fn memory_embedding_auto_build_set(
+    telemetry: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
+    enabled: bool,
+    interval_hours: u32,
+) -> Result<EmbeddingAutoBuildConfig, String> {
+    let config = EmbeddingAutoBuildConfig { enabled, interval_hours: interval_hours.clamp(1, 168) };
+    telemetry.app_setting_set(EMBEDDING_AUTO_BUILD_SETTING_KEY, &config)?;
+    Ok(config)
+}
+
+/// 手动构建与后台调度共用一把互斥闸，与 L2/L3 的 `LAYER_REFRESH_RUNNING` 独立，
+/// 两类后台任务互不阻塞。
+static EMBED_BUILD_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn try_begin_embed_build() -> bool {
+    EMBED_BUILD_RUNNING
+        .compare_exchange(false, true, std::sync::atomic::Ordering::Acquire, std::sync::atomic::Ordering::Relaxed)
+        .is_ok()
+}
+
+fn end_embed_build() {
+    EMBED_BUILD_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+}
+
+/// 后台按间隔增量构建向量索引：只算未缓存的新记忆，没有新内容时不产生任何
+/// 请求。每轮 tick 现读现用配置，改完无需重启。跨进程安全由 `ensure_indexed`
+/// 内的 BuildLease 保证；未配置语义检索时静默跳过。
+pub fn start_embedding_auto_build_scheduler(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(EMBED_BUILD_STARTUP_DELAY).await;
+        loop {
+            if let Some(store) = crate::telemetry_store::shared_store() {
+                let config = parse_embedding_auto_build_config(
+                    store.app_setting_get::<Value>(EMBEDDING_AUTO_BUILD_SETTING_KEY),
+                );
+                let due = store
+                    .app_setting_get::<Value>(EMBED_BUILD_LAST_KEY)
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .and_then(|raw| chrono::DateTime::parse_from_rfc3339(&raw).ok())
+                    .map(|last| {
+                        chrono::Utc::now() - last.with_timezone(&chrono::Utc)
+                            >= chrono::Duration::hours(config.interval_hours as i64)
+                    })
+                    .unwrap_or(true);
+                if config.enabled && due && try_begin_embed_build() {
+                    // 未配置语义检索时静默跳过，不打扰用户。
+                    if let Ok(Some(embedding_config)) = semantic_config_read_raw(&store) {
+                        let store_for_build = store.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            local_semantic::build_index(&store_for_build, embedding_config)
+                        })
+                        .await;
+                        // 无论成败都盖时间戳：失败端点按间隔重试，而非每 30 分钟。
+                        let _ = store.app_setting_set(EMBED_BUILD_LAST_KEY, &chrono::Utc::now().to_rfc3339());
+                        match result {
+                            Ok(Ok(value)) => {
+                                let embedded = value.get("embedded").and_then(Value::as_u64).unwrap_or(0);
+                                if embedded > 0 {
+                                    let _ = app.emit("memory-embedding-index-updated", ());
+                                }
+                            }
+                            Ok(Err(error)) => eprintln!("[memory-semantic] auto build failed: {error}"),
+                            Err(_) => eprintln!("[memory-semantic] auto build task failed"),
+                        }
+                    }
+                    end_embed_build();
+                }
+            }
+            tokio::time::sleep(EMBED_BUILD_TICK).await;
+        }
+    });
+}
+
 /// Query the local vector index from an MCP subprocess.  MCP runs in a
 /// separate executable and therefore cannot use the desktop process's Tauri
-/// state; it only ever talks to the loopback-only memory sidecar.
+/// state; configured embeddings use the native L1 ledger and a derived cache.
+/// Without that setting, retain the optional loopback MindMemOS route.
 pub fn search_semantic_l1_memories(query: &str, limit: u32) -> Result<Vec<SemanticMemory>, String> {
+    let telemetry = crate::telemetry_store::TelemetryStore::new()?;
+    if let Some(config) = semantic_config_read_raw(&telemetry)? {
+        return local_semantic::search(&telemetry, config, query, limit);
+    }
     if !MemoryBackend::probe(API_PORT) {
         return Err("本地语义记忆服务未运行".into());
     }
@@ -936,7 +1198,7 @@ async fn create_candidate_batch_plan(
         serde_json::json!({"role": "system", "content": "你是 Vibe Assistant 的记忆去重裁决器。输入已经是本地筛出的疑似重复候选；只在两条或多条记忆表达同一事实、明显重复或彼此冲突且能安全合并时生成动作。不要合并不同时间的经历、不同任务、不同文件修改、不同偏好或仅主题相近的内容。每个动作保留一个 keep_id，把其余重复 ID 放入 remove_ids，并用 content 给出保留后的完整、准确、简洁记忆。content 必须继承被合并记忆的主要语言；禁止编造信息。若无安全合并项，返回空 actions。直接输出严格 JSON，不要解释：{\"actions\":[{\"keep_id\":\"已有 ID\",\"remove_ids\":[\"已有 ID\"],\"content\":\"合并后记忆\",\"reason\":\"简短理由\"}]}。"}),
         serde_json::json!({"role": "user", "content": format!("请裁决以下 {} 条由本地 BGE-small 语义检索选出的疑似重复候选（来自全库 {} 条记忆）：\n\n{}", candidates.len(), library_size, library)}),
     ];
-    let response = llm::complete_text_with_limit(&provider, &messages, Some(2048)).await?;
+    let response = llm::complete_text_for(&provider, &messages, Some(2048), crate::llm_trace::ModelPurpose::MemoryReview).await?;
     match parse_consolidation_plan(&response) {
         Ok(plan) => Ok(plan),
         Err(_) => {
@@ -945,7 +1207,7 @@ async fn create_candidate_batch_plan(
                 serde_json::json!({"role": "user", "content": format!("将下面的整理模型回复转换为严格 JSON。不要改变任何 ID 或补充事实：\n\n{}", response)}),
             ];
             parse_consolidation_plan(
-                &llm::complete_text_with_limit(&provider, &repair, Some(2048)).await?,
+                &llm::complete_text_for(&provider, &repair, Some(2048), crate::llm_trace::ModelPurpose::MemoryReview).await?,
             )
         }
     }
@@ -970,7 +1232,7 @@ async fn create_compact_pair_plan(
         serde_json::json!({"role": "system", "content": "判断两条记忆是否完全重复或直接冲突且能安全合并。仅输出 JSON：重复/冲突时 {\"actions\":[{\"keep_id\":\"ID\",\"remove_ids\":[\"ID\"],\"content\":\"合并记忆\",\"reason\":\"重复\"}]}；否则 {\"actions\":[]}。不要解释。"}),
         serde_json::json!({"role": "user", "content": format!("全库共 {library_size} 条。\n[{}]\n{}\n\n[{}]\n{}", left.id, left.memory, right.id, right.memory)}),
     ];
-    let response = llm::complete_text_with_limit(&provider, &messages, Some(2048)).await?;
+    let response = llm::complete_text_for(&provider, &messages, Some(2048), crate::llm_trace::ModelPurpose::MemoryReview).await?;
     parse_consolidation_plan(&response)
 }
 
@@ -1432,5 +1694,39 @@ mod tests {
             memory_type: Some("conversation".into()),
         };
         assert!(importance_score(&memory, 1, 1, 0, 0, false) > 0);
+    }
+
+    #[test]
+    fn embedding_auto_build_config_tolerates_legacy_partial_and_out_of_range() {
+        use super::{parse_embedding_auto_build_config, EmbeddingAutoBuildConfig};
+        // 缺省：默认开、6 小时。
+        assert_eq!(
+            parse_embedding_auto_build_config(None),
+            EmbeddingAutoBuildConfig { enabled: true, interval_hours: 6 }
+        );
+        // 旧版只存布尔开关：保留开关语义，间隔取默认。
+        assert_eq!(
+            parse_embedding_auto_build_config(Some(serde_json::json!(false))),
+            EmbeddingAutoBuildConfig { enabled: false, interval_hours: 6 }
+        );
+        // 部分字段：缺省字段回落默认。
+        assert_eq!(
+            parse_embedding_auto_build_config(Some(serde_json::json!({ "enabled": false }))),
+            EmbeddingAutoBuildConfig { enabled: false, interval_hours: 6 }
+        );
+        // 越界值收敛到 1..=168。
+        assert_eq!(
+            parse_embedding_auto_build_config(Some(serde_json::json!({ "enabled": true, "interval_hours": 0 }))),
+            EmbeddingAutoBuildConfig { enabled: true, interval_hours: 1 }
+        );
+        assert_eq!(
+            parse_embedding_auto_build_config(Some(serde_json::json!({ "enabled": true, "interval_hours": 999 }))),
+            EmbeddingAutoBuildConfig { enabled: true, interval_hours: 168 }
+        );
+        // 非法 JSON 形状：整体回落默认。
+        assert_eq!(
+            parse_embedding_auto_build_config(Some(serde_json::json!("garbage"))),
+            EmbeddingAutoBuildConfig { enabled: true, interval_hours: 6 }
+        );
     }
 }

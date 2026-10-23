@@ -139,10 +139,10 @@ function VarDialog({
               />
             )}
             {lineMode && (
-              <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">{t('envVars.lineModeHint')}</p>
+              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">{t('envVars.lineModeHint')}</p>
             )}
             {!lineMode && value.includes('%') && (
-              <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">{t('envVars.expandHint')}</p>
+              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">{t('envVars.expandHint')}</p>
             )}
           </label>
           {error && (
@@ -294,7 +294,7 @@ export function EnvManager() {
       <div className="border-b border-gray-200 bg-white px-6 py-4 dark:border-gray-700 dark:bg-gray-900">
         <div className="flex items-center justify-between">
           <div>
-            <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">{t('envVars.title')}</h2>
+            <h1 className="text-base font-semibold text-gray-900 dark:text-gray-100">{t('envVars.title')}</h1>
             <p className="text-xs text-gray-500 dark:text-gray-400">{t('envVars.subtitle', { count: vars.length })}</p>
           </div>
           <div className="flex items-center gap-2">
@@ -356,7 +356,7 @@ export function EnvManager() {
             ))}
           </div>
           <div className="relative min-w-0 flex-1 sm:max-w-xs">
-            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-400" />
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-500" />
             <input
               value={query}
               onChange={e => { setQuery(e.target.value) }}
@@ -366,7 +366,7 @@ export function EnvManager() {
             />
           </div>
           {scope === 'system' && (
-            <p className="text-xs text-gray-400 dark:text-gray-500">{t('envVars.systemAdminHint')}</p>
+            <p className="text-xs text-gray-500 dark:text-gray-400">{t('envVars.systemAdminHint')}</p>
           )}
         </div>
 
@@ -397,7 +397,7 @@ export function EnvManager() {
                       <ul className="mt-0.5 space-y-0.5">
                         {v.value.split(';').filter(entry => entry !== '').map((entry, index) => (
                           <li key={index} className="break-all font-mono text-xs leading-relaxed text-gray-600 dark:text-gray-300">
-                            <span className="mr-1 select-none text-gray-300 dark:text-gray-600">·</span>{entry}
+                            <span className="mr-1 select-none text-gray-300 dark:text-gray-400">·</span>{entry}
                           </li>
                         ))}
                       </ul>
@@ -405,7 +405,7 @@ export function EnvManager() {
                       <>
                         <p className="mt-0.5 break-all font-mono text-xs leading-relaxed text-gray-600 dark:text-gray-300">{v.value}</p>
                         {v.expanded && (
-                          <p className="mt-0.5 break-all font-mono text-[11px] leading-relaxed text-gray-400 dark:text-gray-500">
+                          <p className="mt-0.5 break-all font-mono text-[11px] leading-relaxed text-gray-500 dark:text-gray-400">
                             <span className="mr-1 font-sans">→</span>{v.expanded}
                           </p>
                         )}
@@ -418,7 +418,7 @@ export function EnvManager() {
                       onClick={() => { setEditing(v); setDialogOpen(true) }}
                       title={t('envVars.edit')}
                       aria-label={`${t('envVars.edit')} ${v.name}`}
-                      className="rounded p-1.5 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:hover:bg-gray-800 dark:hover:text-gray-300"
+                      className="rounded p-1.5 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:hover:bg-gray-800 dark:hover:text-gray-300"
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
@@ -427,7 +427,7 @@ export function EnvManager() {
                       onClick={() => { setDeleting(v) }}
                       title={t('envVars.delete')}
                       aria-label={`${t('envVars.delete')} ${v.name}`}
-                      className="rounded p-1.5 text-gray-400 transition-colors hover:bg-red-50 hover:text-red-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 dark:hover:bg-red-950/40 dark:hover:text-red-400"
+                      className="rounded p-1.5 text-gray-500 transition-colors hover:bg-red-50 hover:text-red-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 dark:hover:bg-red-950/40 dark:hover:text-red-400"
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>
@@ -438,7 +438,7 @@ export function EnvManager() {
           )}
         </div>
 
-        <p className="mt-3 text-xs text-gray-400 dark:text-gray-500">{t('envVars.footerHint')}</p>
+        <p className="mt-3 text-xs text-gray-500 dark:text-gray-400">{t('envVars.footerHint')}</p>
       </div>
 
       {dialogOpen && (

@@ -12,6 +12,10 @@ export interface LlmProvider {
   base_url: string
   model: string
   api_key: string
+  has_api_key: boolean
+  key_mask?: string | null
+  clear_key?: boolean
+  identity?: { provider_id: string; deployment_id: string | null; credential_id: string | null; config_revision: number }
   is_custom: boolean
   enabled: boolean
   context_window?: number
@@ -40,7 +44,7 @@ interface OllamaTestResult {
 
 const EMPTY_CUSTOM: LlmProvider = {
   id: '', name: '', base_url: '', model: '',
-  api_key: '', is_custom: true, enabled: true,
+  api_key: '', has_api_key: false, clear_key: false, is_custom: true, enabled: true,
   context_window: 128000, max_output_tokens: 16384,
 }
 
@@ -123,6 +127,7 @@ export function LlmSettings({ embedded = false, onBusyChange, onReadinessChange 
       await invoke('save_llm_provider', { provider: p })
       await load()
       setError(`provider:${p.id}`, '')
+      setTestResult(previous => { const next = { ...previous }; delete next[p.id]; return next })
       return true
     } catch (e) {
       setError(`provider:${p.id}`, String(e))
@@ -148,14 +153,14 @@ export function LlmSettings({ embedded = false, onBusyChange, onReadinessChange 
     if (!form.name.trim()) { setError('custom', t('llm.nameRequired')); return }
     if (!form.base_url.trim()) { setError('custom', t('llm.baseUrlRequired')); return }
     if (!form.model.trim()) { setError('custom', t('llm.modelRequired')); return }
-    if (!form.api_key.trim()) { setError('custom', t('llm.apiKeyRequired')); return }
+    if (!form.api_key.trim() && !form.has_api_key && !form.clear_key) { setError('custom', t('llm.apiKeyRequired')); return }
 
     const id = editingCustom?.id || form.id || `custom_${form.name.toLowerCase().replace(/\s+/g, '_')}_${Date.now()}`
     // Retain the id if the write succeeds but the following reload fails.
     setForm(f => ({ ...f, id }))
     setSaving(true)
     try {
-      await invoke('save_llm_provider', { provider: { ...form, id, is_custom: true } })
+      await invoke('save_llm_provider', { provider: { ...form, id, is_custom: true, enabled: form.clear_key ? false : form.enabled } })
       await load()
       setError('custom', '')
       setShowCustomForm(false)
@@ -214,7 +219,7 @@ export function LlmSettings({ embedded = false, onBusyChange, onReadinessChange 
         <div className="flex flex-wrap items-center gap-2">
           <select aria-label={t('llm.memoryModelTitle')} value={memoryConfig.provider_id ?? ''} onChange={(event) => { void saveMemoryConfig(event.target.value) }} disabled={savingMemoryConfig} className="min-w-60 rounded-md border border-gray-300 bg-white px-2.5 py-1.5 text-sm text-gray-800 outline-none focus:border-violet-500 disabled:opacity-50 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100">
             <option value="">{t('llm.memoryModelNone')}</option>
-            {providers.filter((provider) => provider.enabled && provider.api_key.trim() && provider.model.trim()).map((provider) => <option key={provider.id} value={provider.id}>{provider.name} · {provider.model}</option>)}
+            {providers.filter((provider) => provider.enabled && provider.has_api_key && provider.model.trim()).map((provider) => <option key={provider.id} value={provider.id}>{provider.name} · {provider.model}</option>)}
           </select>
           {savingMemoryConfig && <Loader2 size={14} className="animate-spin text-violet-600" />}
           {memoryConfig.provider_id && <span className="text-xs text-green-700 dark:text-green-400">{t('llm.memoryModelReady')}</span>}
@@ -272,7 +277,7 @@ export function LlmSettings({ embedded = false, onBusyChange, onReadinessChange 
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-sm font-medium text-gray-900 dark:text-gray-100">{p.name}</p>
-                <p className="text-xs font-mono text-gray-400">{p.model} · {p.base_url}</p>
+                <p className="text-xs font-mono text-gray-500">{p.model} · {p.base_url}</p>
               </div>
               <div className="flex items-center gap-2">
                 <button
@@ -288,7 +293,7 @@ export function LlmSettings({ embedded = false, onBusyChange, onReadinessChange 
                   className="text-xs text-gray-500 hover:text-gray-700 disabled:opacity-50"
                 >{t('llm.edit')}</button>
                 <button onClick={() => deleteCustom(p.id)} disabled={showCustomForm && (editingCustom?.id ?? form.id) === p.id}
-                  aria-label={`${t('common.delete')} ${p.name}`} className="text-gray-400 hover:text-red-500 disabled:opacity-50">
+                  aria-label={`${t('common.delete')} ${p.name}`} className="text-gray-500 hover:text-red-500 disabled:opacity-50">
                   <Trash2 className="h-3.5 w-3.5" />
                 </button>
                 <EnableToggle
@@ -303,7 +308,7 @@ export function LlmSettings({ embedded = false, onBusyChange, onReadinessChange 
         ))}
 
         {customs.length === 0 && !showCustomForm && (
-          <p className="text-xs text-gray-400 text-center py-4">{t('llm.noModels')}</p>
+          <p className="text-xs text-gray-500 text-center py-4">{t('llm.noModels')}</p>
         )}
       </div>
 
@@ -328,9 +333,10 @@ export function LlmSettings({ embedded = false, onBusyChange, onReadinessChange 
               placeholder="https://api.deepseek.com" className="field-input font-mono" />}
           </Field>
           <Field label={t('llm.apiKey')}>
-            {id => <input id={id} type="password" value={form.api_key} onChange={e => setForm(f => ({ ...f, api_key: e.target.value }))}
-              placeholder="sk-..." className="field-input font-mono" />}
+            {id => <input id={id} type="password" value={form.api_key} onChange={e => setForm(f => ({ ...f, api_key: e.target.value, clear_key: false }))}
+              placeholder={t(form.has_api_key ? 'llm.keySaved' : 'llm.keyPlaceholder')} autoComplete="off" className="field-input font-mono" />}
           </Field>
+          {form.has_api_key && <label className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-300"><input type="checkbox" checked={form.clear_key ?? false} onChange={event => setForm(previous => ({ ...previous, clear_key: event.target.checked, api_key: '' }))} />{t('llm.clearKey')}</label>}
           <div className="grid grid-cols-2 gap-3">
             <Field label={t('llm.contextWindow')}>
               {id => <input id={id} type="number" min={1024} step={1024} value={form.context_window ?? ''}
@@ -381,6 +387,7 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
   // Only this card's successful save or explicit cancel drops its draft.
   // Reloading another provider must not replace these inputs.
   const [draft, setDraft] = useState<Pick<LlmProvider, 'api_key' | 'model'> | null>(null)
+  const [clearKey, setClearKey] = useState(false)
   const [modelOptions, setModelOptions] = useState<string[]>([])
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const [modelQuery, setModelQuery] = useState('')
@@ -389,7 +396,8 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
   const isSponsor = provider.id === SPONSOR_PROVIDER_ID
   const key = draft?.api_key ?? provider.api_key
   const model = draft?.model ?? provider.model
-  const dirty = key !== provider.api_key || model !== provider.model
+  const hasKey = !!key.trim() || (provider.has_api_key && !clearKey)
+  const dirty = key !== provider.api_key || model !== provider.model || clearKey
   const filteredModels = modelOptions.filter(option => option.toLowerCase().includes(modelQuery.trim().toLowerCase()))
 
   useEffect(() => {
@@ -397,7 +405,7 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
   }, [provider.id, dirty, onReadinessChange])
 
   async function save() {
-    if (await onSave({ ...provider, api_key: key, model, enabled: !!key && !!model.trim() })) setDraft(null)
+    if (await onSave({ ...provider, api_key: key, clear_key: clearKey, model, enabled: hasKey && !!model.trim() })) { setDraft(null); setClearKey(false) }
   }
 
   async function fetchModels() {
@@ -407,6 +415,7 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
       const models = await invoke<string[]>('list_llm_models', {
         baseUrl: provider.base_url,
         apiKey: key,
+        providerId: provider.id,
       })
       setModelOptions(models)
       setModelPickerOpen(models.length > 0)
@@ -429,7 +438,7 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
         <div className="flex items-center gap-2">
           {isSponsor && <img src="/88api.png" alt="88API" className="h-8 w-8 rounded-lg object-cover" />}
           <span className="text-sm font-semibold text-gray-900 dark:text-gray-100">{provider.name}</span>
-          {provider.enabled && provider.api_key && model && (
+          {provider.enabled && provider.has_api_key && model && (
             <span className="rounded-full bg-green-100 px-2 py-0.5 text-xs text-green-700 dark:bg-green-900/30 dark:text-green-400">{t('llm.active')}</span>
           )}
         </div>
@@ -447,7 +456,7 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
         </div>
       )}
 
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <Field label={t('llm.model')}>
           {id => <div className="min-w-0">
             <div className="flex gap-1.5">
@@ -461,7 +470,7 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
                 </button>
               )}
               {isSponsor && (
-                <button type="button" onClick={() => { void fetchModels() }} disabled={loadingModels || !key.trim()}
+                <button type="button" onClick={() => { void fetchModels() }} disabled={loadingModels || !hasKey}
                   title={t('llm.fetchModels')}
                   className="shrink-0 rounded-md border border-violet-200 px-2 text-xs font-medium text-violet-700 hover:bg-violet-50 disabled:cursor-not-allowed disabled:opacity-40 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950/50">
                   {loadingModels ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : t('llm.fetchModels')}
@@ -492,17 +501,20 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
               id={id}
               type={showKey ? 'text' : 'password'}
               value={key}
-              onChange={e => setDraft({ api_key: e.target.value, model })}
-              placeholder="sk-..."
+              onChange={e => { setDraft({ api_key: e.target.value, model }); setClearKey(false) }}
+              placeholder={t(provider.has_api_key ? 'llm.keySaved' : 'llm.keyPlaceholder')}
+              autoComplete="off"
               className="field-input font-mono text-xs pr-8"
             />
             <button onClick={onToggleKey} aria-label={`${t(showKey ? 'agentForm.hide' : 'agentForm.show')} ${t('llm.apiKey')} · ${provider.name}`}
-              className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-600">
               {showKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
             </button>
           </div>}
         </Field>
       </div>
+
+      {provider.has_api_key && <label className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-300"><input type="checkbox" checked={clearKey} onChange={event => { setClearKey(event.target.checked); setDraft({ api_key: '', model }) }} />{t('llm.clearKey')}</label>}
 
       {isSponsor && (modelListError || modelOptions.length > 0) && (
         <p className={`text-[11px] leading-4 ${modelListError ? 'text-red-600 dark:text-red-400' : 'text-gray-500 dark:text-gray-400'}`}>
@@ -517,11 +529,11 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
           className="rounded-lg bg-gray-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-gray-700 dark:bg-gray-100 dark:text-gray-900">
           {t('llm.save')}
         </button>
-        <button onClick={() => onTest({ ...provider, api_key: key, model })} disabled={testing || !key || !model.trim()}
+        <button onClick={() => onTest({ ...provider, api_key: key, model })} disabled={testing || !hasKey || !model.trim()}
           className="flex items-center gap-1 rounded-lg border border-gray-200 px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-50 disabled:opacity-40 dark:border-gray-700 dark:text-gray-400">
           {testing ? <Loader2 className="h-3 w-3 animate-spin" /> : null} {t('llm.test')}
         </button>
-        {(dirty || saveFailed) && <button onClick={() => { setDraft(null); onDiscard(provider.id) }}
+        {(dirty || saveFailed) && <button onClick={() => { setDraft(null); setClearKey(false); onDiscard(provider.id) }}
           className="rounded-lg px-3 py-1.5 text-xs text-gray-500 hover:bg-gray-100">{t('llm.cancel')}</button>}
       </div>
     </div>
@@ -645,6 +657,7 @@ function OllamaPanel({ providers, onChanged, onBusyChange, onReadinessChange }: 
           base_url: `${normalizedBase}/v1`,
           model: model.name,
           api_key: 'ollama',
+        has_api_key: false,
           is_custom: true,
           enabled: true,
           context_window: 32768,
@@ -699,7 +712,7 @@ function OllamaPanel({ providers, onChanged, onBusyChange, onReadinessChange }: 
               <li key={m.name} className="flex items-center justify-between gap-3 py-2">
                 <div className="min-w-0">
                   <p className="truncate text-xs font-mono text-gray-800 dark:text-gray-200">{m.name}</p>
-                  <p className="text-[11px] text-gray-400">
+                  <p className="text-[11px] text-gray-500">
                     {[m.parameter_size, m.quantization_level, formatOllamaSize(m.size)].filter(Boolean).join(' · ')}
                   </p>
                 </div>
@@ -716,7 +729,7 @@ function OllamaPanel({ providers, onChanged, onBusyChange, onReadinessChange }: 
           </ul>
         )}
         {report && report.models.length === 0 && (
-          <p className="text-xs text-gray-400">{t('llm.ollamaNoModels')}</p>
+          <p className="text-xs text-gray-500">{t('llm.ollamaNoModels')}</p>
         )}
       </div>
     </div>

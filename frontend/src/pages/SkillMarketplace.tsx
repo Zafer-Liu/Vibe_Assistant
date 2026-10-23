@@ -5,16 +5,14 @@ import {
   BadgeCheck, BookOpenText, Check, Download, ExternalLink, FileCode2,
   Loader2, PackageCheck, RefreshCw, Search, ShieldAlert,
 } from 'lucide-react'
-import { useMemoryStore } from '../store/memoryStore'
-import type {
-  MarketplaceCatalog, MarketplaceSkill, MarketplaceSkillPreview, SkillItem,
-} from '../types/memory'
+import { useSkillFields } from '../store/skillStore'
+import type { MarketplaceCatalog, MarketplaceSkill, MarketplaceSkillPreview, SkillItem } from '../types/skill'
 
 type SourceFilter = 'all' | MarketplaceSkill['source']
 
 export const SkillMarketplace = memo(function SkillMarketplace() {
   const { t, i18n } = useTranslation()
-  const { skills, loadSkills } = useMemoryStore()
+  const { skills, loadSkills } = useSkillFields('skills', 'loadSkills')
   const [catalog, setCatalog] = useState<MarketplaceCatalog | null>(null)
   const [query, setQuery] = useState('')
   const [source, setSource] = useState<SourceFilter>('all')
@@ -121,10 +119,10 @@ export const SkillMarketplace = memo(function SkillMarketplace() {
 
   return (
     <div className="flex h-full min-w-0 flex-col bg-gray-50 dark:bg-gray-950">
-      <header className="border-b border-gray-200 bg-white px-6 py-4 dark:border-gray-800 dark:bg-gray-900">
+      <header className="fluent-page-header border-b border-gray-200 bg-white px-6 py-4 dark:border-gray-800 dark:bg-gray-900">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <div className="mb-1 flex items-center gap-1.5 text-xs text-gray-400 dark:text-gray-500">
+            <div className="mb-1 flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400">
               <BookOpenText className="h-3.5 w-3.5" />
               <span>{t('nav.skills')}</span><span>/</span><span>{t('nav.skillsMarketplace')}</span>
             </div>
@@ -161,7 +159,7 @@ export const SkillMarketplace = memo(function SkillMarketplace() {
         <aside className="flex w-[360px] shrink-0 flex-col overflow-hidden rounded-xl border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
           <div className="space-y-3 border-b border-gray-200 p-4 dark:border-gray-800">
             <label className="relative block">
-              <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-gray-400" />
+              <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-gray-500" />
               <input
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
@@ -183,7 +181,7 @@ export const SkillMarketplace = memo(function SkillMarketplace() {
                 </button>
               ))}
             </div>
-            <div className="flex items-center justify-between text-xs text-gray-400 dark:text-gray-500">
+            <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
               <span>{t('marketplace.count', { count: visibleItems.length })}</span>
               {fetchedAt && <span>{catalog?.from_cache ? t('marketplace.cached') : t('marketplace.updatedAt', { time: fetchedAt })}</span>}
             </div>
@@ -191,11 +189,11 @@ export const SkillMarketplace = memo(function SkillMarketplace() {
 
           <div className="min-h-0 flex-1 overflow-y-auto p-2">
             {loading && !catalog ? (
-              <div className="flex h-full items-center justify-center text-sm text-gray-400">
+              <div className="flex h-full items-center justify-center text-sm text-gray-500">
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />{t('marketplace.loading')}
               </div>
             ) : visibleItems.length === 0 ? (
-              <div className="px-4 py-12 text-center text-sm text-gray-400">{t('marketplace.empty')}</div>
+              <div className="px-4 py-12 text-center text-sm text-gray-500">{t('marketplace.empty')}</div>
             ) : visibleItems.map((item) => {
               const installed = installedIds.has(item.id)
               return (
@@ -214,7 +212,7 @@ export const SkillMarketplace = memo(function SkillMarketplace() {
                   <p className="mt-1 line-clamp-2 text-xs leading-5 text-gray-500 dark:text-gray-400">
                     {item.description || t('skills.noDescription')}
                   </p>
-                  <div className="mt-2 flex items-center gap-1 text-[11px] font-medium text-gray-400">
+                  <div className="mt-2 flex items-center gap-1 text-[11px] font-medium text-gray-500">
                     <BadgeCheck className="h-3.5 w-3.5 text-blue-500" />{item.source_label}
                     <span className="mx-1">·</span>{t('marketplace.fileCount', { count: item.files.length })}
                   </div>
@@ -226,7 +224,7 @@ export const SkillMarketplace = memo(function SkillMarketplace() {
 
         <main className="min-w-0 flex-1 overflow-y-auto rounded-xl border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
           {!selectedItem ? (
-            <div className="flex h-full flex-col items-center justify-center px-8 text-center text-gray-400">
+            <div className="flex h-full flex-col items-center justify-center px-8 text-center text-gray-500">
               <BookOpenText className="mb-3 h-9 w-9 opacity-50" />
               <p className="text-sm">{t('marketplace.selectHint')}</p>
             </div>
@@ -274,7 +272,7 @@ export const SkillMarketplace = memo(function SkillMarketplace() {
                 <section>
                   <div className="mb-2 flex items-center justify-between">
                     <h3 className="text-sm font-semibold text-gray-900 dark:text-white">SKILL.md</h3>
-                    {previewing && <Loader2 className="h-4 w-4 animate-spin text-gray-400" />}
+                    {previewing && <Loader2 className="h-4 w-4 animate-spin text-gray-500" />}
                   </div>
                   <pre className="max-h-[520px] overflow-auto whitespace-pre-wrap rounded-lg border border-gray-200 bg-gray-50 p-4 font-mono text-xs leading-6 text-gray-700 dark:border-gray-800 dark:bg-gray-950 dark:text-gray-200">
                     {preview?.item.id === selectedItem.id ? preview.content : t('marketplace.loadingPreview')}

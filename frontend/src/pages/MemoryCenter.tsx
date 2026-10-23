@@ -1,21 +1,24 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import {
   Brain, Search, Trash2, Pencil, MoonStar, CheckCircle2, XCircle, Loader2, X,
-  PowerOff, Webhook, History, RefreshCw, ChevronDown, ChevronUp, FileText, Star, PlugZap, Database, FolderOpen,
+  PowerOff, Webhook, History, RefreshCw, ChevronDown, ChevronUp, FileText, Star, Database, FolderOpen,
   ChevronRight, Plus,
 } from 'lucide-react'
-import { useMemoryStore } from '../store/memoryStore'
+import { useMemoryFields } from '../store/memoryStore'
+import { useTelemetryFields } from '../store/telemetryStore'
 import { useVisiblePolling } from '../hooks/useVisiblePolling'
 import { ErrorRecovery } from '../components/ErrorRecovery'
-import type { ConsolidationResult, MemoryImportance, MemoryImportResult, MemoryItem, MemoryLayerDocument } from '../types/memory'
+import type { ConsolidationResult, HookStatus, MemoryImportance, MemoryImportResult, MemoryItem, MemoryLayerDocument } from '../types/memory'
 import { normalizeL2Document } from '../lib/thinking'
 import { MemoryMarkdown } from '../components/MemoryMarkdown'
 import { CloudVaultCard } from '../components/CloudVaultCard'
 import { sourceLabel } from '../components/ConversationDialog'
 import { intlLocale } from '../i18n'
+import { compactTokenCount } from '../lib/compactNumber'
+import { isInjectionReady } from '../lib/memoryAgentStatus'
 
 function localTime(value: string) {
   // Rust serializes UTC timestamps with nanosecond precision. Normalise to
@@ -78,46 +81,11 @@ function InlineActionSuccess({ text }: { text: string }) {
 function LayerWindow({ document }: { document: MemoryLayerDocument }) {
   const { t } = useTranslation()
   if (!document.window_start || !document.window_end) return null
-  return <span className="text-gray-400">{t('memory.layerWindowRange', { start: localTime(document.window_start), end: localTime(document.window_end) })}</span>
+  return <span className="text-gray-500">{t('memory.layerWindowRange', { start: localTime(document.window_start), end: localTime(document.window_end) })}</span>
 }
 
-/** 文档内容限高：不超过限高时完整展示、不渲染按钮；超出时折叠到限高并显示
-    「查看完整内容」，由用户手动展开。与 Tailwind `max-h-80` 保持同源。 */
-const DOCUMENT_COLLAPSED_MAX_HEIGHT_PX = 320
-
-// memo 包装：props（content/contentId/accent）在页面级重渲染（App 5s Agent
-// 轮询、store 10s 遥测轮询）中保持不变，跳过文档子树的重复 diff 与
-// Markdown 重解析，消除滑动到 L2/L3 卡片时的卡顿。
-const CollapsibleDocumentContent = memo(function CollapsibleDocumentContent({ content, contentId, accent }: { content: string; contentId: string; accent: 'sky' | 'violet' }) {
-  const { t } = useTranslation()
-  const ref = useRef<HTMLDivElement | null>(null)
-  const [open, setOpen] = useState(false)
-  const [overflows, setOverflows] = useState(false)
-  useLayoutEffect(() => {
-    const el = ref.current
-    if (!el) return
-    // scrollHeight 是内容自然高度（不受 max-h 裁切影响）；展开/收起两种
-    // 状态下判定结果一致，按钮只随内容本身变化。
-    const measure = () => setOverflows(el.scrollHeight > DOCUMENT_COLLAPSED_MAX_HEIGHT_PX + 2)
-    measure()
-    const observer = new ResizeObserver(measure)
-    observer.observe(el)
-    return () => observer.disconnect()
-  }, [content])
-  const buttonClass = accent === 'sky'
-    ? 'border-sky-300 text-sky-700 hover:bg-sky-100 dark:border-sky-800 dark:text-sky-200 dark:hover:bg-sky-950/50'
-    : 'border-violet-300 text-violet-700 hover:bg-violet-100 dark:border-violet-700 dark:text-violet-200 dark:hover:bg-violet-950/50'
-  return (<>
-    <div ref={ref} id={contentId} className={`mt-2 min-w-0 max-w-full overscroll-contain pr-1 ${open ? '' : 'max-h-80 overflow-hidden'}`}>
-      <MemoryMarkdown content={content} unwrapDocumentFence />
-    </div>
-    {overflows && (
-      <button type="button" onClick={() => setOpen((value) => !value)} aria-expanded={open} aria-controls={contentId} className={`mt-2 inline-flex items-center gap-1 rounded-md border px-2.5 py-1 text-xs font-medium transition ${buttonClass}`}>
-        {open ? t('memory.collapseFull') : t('memory.viewFull')}{open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-      </button>
-    )}
-  </>)
-})
+// L2 正文与 L3 文档列表使用同一套内部滚动，标题和顶部操作不参与滚动。
+const MEMORY_CONTENT_SCROLL_CLASS = 'max-h-80 min-w-0 max-w-full overflow-y-auto overscroll-contain pr-1'
 
 /** L1 列表行。memo + 稳定回调隔离：无关 store 更新（agent 轮询等）不再
  *  重渲染最多 200 张卡片；content-visibility 让滚出视口的行跳过布局绘制。 */
@@ -135,13 +103,13 @@ const MemoryCard = memo(function MemoryCard({ memory: m, ranking, onPin, onEdit,
       <div className="flex items-start gap-2">
         <MemoryMarkdown content={m.memory} className="flex-1 break-words" />
         <div className="flex shrink-0 gap-1">
-          <button onClick={() => { void onPin(m.id, !ranking?.pinned) }} className={`p-1 rounded hover:bg-amber-100 dark:hover:bg-amber-900/40 ${ranking?.pinned ? 'text-amber-500' : 'text-gray-500 dark:text-gray-400'}`} title={ranking?.pinned ? t('memory.importanceUnpin') : t('memory.importancePin')}>
+          <button onClick={() => { void onPin(m.id, !ranking?.pinned) }} className={`p-1 rounded hover:bg-amber-100 hover:text-amber-800 dark:hover:bg-amber-900/40 dark:hover:text-amber-200 ${ranking?.pinned ? 'text-amber-500' : 'text-gray-500 dark:text-gray-400'}`} title={ranking?.pinned ? t('memory.importanceUnpin') : t('memory.importancePin')}>
             <Star size={13} className={ranking?.pinned ? 'fill-current' : ''} />
           </button>
           <button onClick={() => onEdit(m)} className="p-1 rounded hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-500 dark:text-gray-400" title={t('common.edit')}>
             <Pencil size={13} />
           </button>
-          <button onClick={() => onDelete(m)} className="p-1 rounded hover:bg-red-100 dark:hover:bg-red-900/40 text-gray-500 dark:text-gray-400 hover:text-red-500" title={t('common.delete')}>
+          <button onClick={() => onDelete(m)} className="p-1 rounded hover:bg-red-100 dark:hover:bg-red-900/40 text-gray-500 dark:text-gray-400 hover:text-red-800 dark:hover:text-red-200" title={t('common.delete')}>
             <Trash2 size={13} />
           </button>
         </div>
@@ -151,20 +119,17 @@ const MemoryCard = memo(function MemoryCard({ memory: m, ranking, onPin, onEdit,
         {m.memory_type && <span className="text-xs px-1.5 rounded bg-violet-500/10 text-violet-600 dark:text-violet-400">{m.memory_type}</span>}
         {m.durability && <span className={`text-xs px-1.5 rounded ${m.durability === 'long_term' ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300' : m.durability === 'short_term' ? 'bg-sky-500/10 text-sky-700 dark:text-sky-300' : 'bg-gray-200 text-gray-600 dark:bg-gray-600 dark:text-gray-200'}`}>{t(`memory.durability${m.durability === 'long_term' ? 'LongTerm' : m.durability === 'short_term' ? 'ShortTerm' : 'Session'}`)}</span>}
         {level && <span className={`text-xs px-1.5 rounded ${level === 'high' ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300' : level === 'medium' ? 'bg-sky-500/10 text-sky-700 dark:text-sky-300' : 'bg-gray-200 text-gray-600 dark:bg-gray-600 dark:text-gray-200'}`}>{t(`memory.importance${level[0].toUpperCase()}${level.slice(1)}`, { score: ranking.score })}</span>}
-        {ranking && <span className="text-xs text-gray-400">{t('memory.importanceEvidence', { sessions: ranking.supporting_sessions, agents: ranking.supporting_agents, recalls: ranking.recall_count })}</span>}
-        {(m.event_time || m.last_update_at) && <span className="text-xs text-gray-400" title={m.event_time ? t('memory.eventTimeTitle') : t('memory.memoryOrganizeTime')}>{localTime(m.event_time || m.last_update_at || '')}</span>}
+        {ranking && <span className="text-xs text-gray-500">{t('memory.importanceEvidence', { sessions: ranking.supporting_sessions, agents: ranking.supporting_agents, recalls: ranking.recall_count })}</span>}
+        {(m.event_time || m.last_update_at) && <span className="text-xs text-gray-500" title={m.event_time ? t('memory.eventTimeTitle') : t('memory.memoryOrganizeTime')}>{localTime(m.event_time || m.last_update_at || '')}</span>}
       </div>
     </div>
   )
 })
 
-export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPending, onOpenOrganized, onOpenInjection, active = true }: { onOpenUsage?: () => void; onOpenPending?: () => void; onOpenOrganized?: () => void; onOpenInjection?: () => void; active?: boolean }) {
+export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPending, onOpenOrganized, onOpenCapture, onOpenInjection, active = true }: { onOpenUsage?: () => void; onOpenPending?: () => void; onOpenOrganized?: () => void; onOpenCapture?: () => void; onOpenInjection?: () => void; active?: boolean }) {
   const { t } = useTranslation()
-  const {
-    engineOnline, memories, importance, loading, lastSearchResults, lastSearchQuery, memoryCacheReady, localMemoryStats,
-    memoryMcp, ingestStatus, telemetrySummary, telemetryLiveStatus, telemetryEvents, l2Documents, l3Documents, checkIngest, checkTelemetry, checkMemoryMcp, loadMemoryLayers, consolidateShortTermMemory, draftLongTermProfile, publishLongTermProfile, updatePublishedMemoryDocument, deleteLongTermProfileDraft, setIngestEnabled, organizeConversations, cancelOrganize, importMemoryFolder,
-    checkEngine, stopEngine, search, listMemories, resetL1ForReextraction, updateMemory, deleteMemory, addUserMemory, dreaming, restoreConsolidation, refreshImportance, setMemoryPinned,
-  } = useMemoryStore()
+  const { engineOnline, memories, importance, loading, lastSearchResults, lastSearchQuery, memoryCacheReady, localMemoryStats, ingestStatus, l2Documents, l3Documents, checkIngest, loadMemoryLayers, consolidateShortTermMemory, draftLongTermProfile, publishLongTermProfile, updatePublishedMemoryDocument, deleteLongTermProfileDraft, organizeConversations, cancelOrganize, importMemoryFolder, checkEngine, stopEngine, search, listMemories, resetL1ForReextraction, updateMemory, deleteMemory, addUserMemory, dreaming, restoreConsolidation, refreshImportance, setMemoryPinned, hookStatus, qoderHookStatus, codexHookStatus, workbuddyHookStatus, agentSources, loadAgentSources } = useMemoryFields('engineOnline', 'memories', 'importance', 'loading', 'lastSearchResults', 'lastSearchQuery', 'memoryCacheReady', 'localMemoryStats', 'ingestStatus', 'l2Documents', 'l3Documents', 'checkIngest', 'loadMemoryLayers', 'consolidateShortTermMemory', 'draftLongTermProfile', 'publishLongTermProfile', 'updatePublishedMemoryDocument', 'deleteLongTermProfileDraft', 'organizeConversations', 'cancelOrganize', 'importMemoryFolder', 'checkEngine', 'stopEngine', 'search', 'listMemories', 'resetL1ForReextraction', 'updateMemory', 'deleteMemory', 'addUserMemory', 'dreaming', 'restoreConsolidation', 'refreshImportance', 'setMemoryPinned', 'hookStatus', 'qoderHookStatus', 'codexHookStatus', 'workbuddyHookStatus', 'agentSources', 'loadAgentSources')
+  const { telemetrySummary, telemetryLiveStatus, checkTelemetry } = useTelemetryFields('telemetrySummary', 'telemetryLiveStatus', 'checkTelemetry')
 
   const [query, setQuery] = useState('')
   const [topK, setTopK] = useState(10)
@@ -172,7 +137,6 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
   const [editing, setEditing] = useState<MemoryItem | null>(null)
   const [editContent, setEditContent] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<MemoryItem | null>(null)
-  const [expandedReceiptId, setExpandedReceiptId] = useState<number | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [organizingConversations, setOrganizingConversations] = useState(false)
   const [importingMemories, setImportingMemories] = useState(false)
@@ -182,7 +146,6 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
   const [restoringConsolidation, setRestoringConsolidation] = useState(false)
   const [refreshingImportance, setRefreshingImportance] = useState(false)
   const [ingestOpen, setIngestOpen] = useState(false)
-  const [recordsOpen, setRecordsOpen] = useState(false)
   const [consolidationOpen, setConsolidationOpen] = useState(false)
   const [consolidationProgress, setConsolidationProgress] = useState<string | null>(null)
   const [consolidatingL2, setConsolidatingL2] = useState(false)
@@ -228,8 +191,6 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
     void checkEngine().then((online) => { if (online) void listMemories(true) })
     // Token reconciliation runs once as an application-start background job.
     // This page only reads the durable SQLite result so navigation is instant.
-    // MCP 连接状态只用于顶部「记忆注入」卡片计数；连接管理在独立面板完成。
-    void checkMemoryMcp()
     return () => { mounted = false }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -255,8 +216,8 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
   }, [])
 
   const refreshSummary = useCallback(() => Promise.allSettled([
-    checkIngest(), checkTelemetry(),
-  ]), [checkIngest, checkTelemetry])
+    checkIngest(), checkTelemetry(), loadAgentSources(),
+  ]), [checkIngest, checkTelemetry, loadAgentSources])
   useVisiblePolling(refreshSummary, organizingConversations || ingestStatus?.manual_extraction_running ? 2_000 : 10_000, active)
 
   const flash = useCallback((kind: 'ok' | 'err', text: string) => {
@@ -567,9 +528,20 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
   const factCount = memories.filter((memory) => !isPreference(memory)).length
   const prefCount = memories.filter(isPreference).length
   const engineState = engineOnline === null ? 'unknown' : engineOnline ? 'online' : 'offline'
-  const mcpStatusList = Object.values(memoryMcp)
-  const mcpStatusLoaded = mcpStatusList.some(Boolean)
-  const connectedMcpCount = mcpStatusList.filter((status) => status?.installed).length
+
+  // 记忆注入入口卡只显示已开启/已关闭：任一座椅注入 Hook 事件齐备即视为已开启，
+  // 判定与「记忆注入」页共用（见 memoryAgentStatus）。
+  const hookStatusByAgent: Record<string, HookStatus | null> = {
+    codex: codexHookStatus, claude: hookStatus, qoder: qoderHookStatus, workbuddy: workbuddyHookStatus,
+  }
+  const injectionReadyCount = agentSources
+    .filter((source) => source.supports_hooks && isInjectionReady(hookStatusByAgent[source.id] ?? null))
+    .length
+  // 概览卡的公共样式：主数字 text-xl，四周留白 px-4 / py-3，标题与主数字之间
+  // 再用 mt-2 撑开（原本紧贴为 0px）。悬停色统一为 violet，与「待提取记忆」一致。
+  const overviewCardClass = 'group rounded-lg border border-gray-200 bg-white px-4 py-3 text-left transition hover:border-violet-300 hover:bg-violet-50/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:border-gray-700 dark:bg-gray-800 dark:hover:border-violet-500/60 dark:hover:bg-violet-500/10'
+  const overviewLabelClass = 'text-xs text-gray-500'
+  const overviewValueClass = 'mt-2 text-xl font-semibold leading-tight text-gray-800 dark:text-gray-100'
 
   // 实时运行状态：优先展示活跃会话所属的 Agent / 来源；无法识别时回退为纯会话数。
   const activeSourceNames = (telemetryLiveStatus?.active_sources ?? []).map(sourceLabel)
@@ -584,7 +556,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
   return (
     <div className="flex flex-col gap-4 overflow-y-auto p-4">
       {/* 本地记忆与智能检索始终可用；旧语义侧车仅作为可选高级能力。 */}
-      <div className="flex flex-wrap items-center gap-3">
+      <div className="fluent-page-header flex flex-wrap items-center gap-3 rounded-xl">
         <div className="p-2 rounded-lg bg-violet-500/10 text-violet-600 dark:text-violet-400">
           <Brain size={20} />
         </div>
@@ -601,7 +573,6 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
           <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs ${telemetryLiveStatus?.active_sessions ? 'bg-sky-500/10 text-sky-700 dark:text-sky-300' : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300'}`} title={t('memory.memoryStatusTitle')}><span className={`h-1.5 w-1.5 rounded-full ${telemetryLiveStatus?.active_sessions ? 'animate-pulse bg-sky-500 motion-reduce:animate-none' : 'bg-gray-400'}`} />{t('memory.liveRunLabel')}{liveRunText}</span>
           <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/35 px-2.5 py-1 text-xs text-emerald-700 dark:text-emerald-300" title={t('memory.memoryStatusTitle')}><Database size={13} />{t('memory.memoryStatusLocal')}</span>
           <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs ${telemetryLiveStatus?.pending_memory_sessions ? 'bg-violet-500/10 text-violet-700 dark:text-violet-300' : telemetryLiveStatus?.retrying_memory_sessions || telemetryLiveStatus?.failed_memory_sessions || telemetryLiveStatus?.failed_transcript_scans ? 'bg-amber-500/10 text-amber-700 dark:text-amber-300' : 'bg-gray-100 text-gray-600 dark:text-gray-300'}`} title={t('memory.syncStatusTitle')}><Brain size={13} />{t('memory.syncLabel')}{telemetryLiveStatus?.pending_memory_sessions ? t('memory.syncPending', { count: telemetryLiveStatus.pending_memory_sessions }) : telemetryLiveStatus?.failed_memory_sessions ? t('memory.syncFailed', { count: telemetryLiveStatus.failed_memory_sessions }) : telemetryLiveStatus?.retrying_memory_sessions ? t('memory.syncRetrying', { count: telemetryLiveStatus.retrying_memory_sessions }) : telemetryLiveStatus?.failed_transcript_scans ? t('memory.syncScanFailed', { count: telemetryLiveStatus.failed_transcript_scans }) : t('memory.syncDone')}</span>
-          <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs ${connectedMcpCount > 0 ? 'bg-violet-500/10 text-violet-700 dark:text-violet-300' : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300'}`} title={t('memory.injectStatusTitle')}><PlugZap size={13} />{t('memory.injectLabel')}{mcpStatusLoaded ? (connectedMcpCount ? t('memory.injectConnected', { count: connectedMcpCount }) : t('memory.injectDisconnected')) : t('memory.injectChecking')}</span>
           {engineState === 'online' && (
               <button
                 onClick={handleStop}
@@ -614,29 +585,29 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
       </div>
 
       {telemetrySummary && (
-        <section className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-          <button type="button" onClick={onOpenUsage} className="group rounded-lg border border-gray-200 bg-white px-3 py-2 text-left transition hover:border-violet-300 hover:bg-violet-50/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:border-gray-700 dark:bg-gray-800 dark:hover:border-violet-500/60 dark:hover:bg-violet-500/10">
-            <div className="flex items-center justify-between gap-2"><p className="text-xs text-gray-400">{t('memory.overviewTokenUsage')}</p><ChevronRight size={14} className="text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-violet-500 dark:text-gray-600 dark:group-hover:text-violet-300" /></div><p className="text-sm font-semibold text-gray-800 dark:text-gray-100">{telemetrySummary.total_tokens.toLocaleString()}</p><p className="mt-0.5 text-[11px] text-gray-400">{t('memory.overviewTokenSub', { input: telemetrySummary.input_tokens.toLocaleString(), output: telemetrySummary.output_tokens.toLocaleString() })}</p>
+        <section className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+          <button type="button" onClick={onOpenUsage} className={overviewCardClass}>
+            <div className="flex items-center justify-between gap-2"><p className={overviewLabelClass}>{t('memory.overviewTokenUsage')}</p><ChevronRight size={14} className="text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-violet-500 dark:text-gray-400 dark:group-hover:text-violet-300" /></div><p className={`${overviewValueClass} tabular-nums`} title={telemetrySummary.total_tokens.toLocaleString()}>{compactTokenCount(telemetrySummary.total_tokens)}</p>
           </button>
-          <button type="button" onClick={onOpenOrganized} className="group rounded-lg border border-gray-200 bg-white px-3 py-2 text-left transition hover:border-violet-300 hover:bg-violet-50/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:border-gray-700 dark:bg-gray-800 dark:hover:border-violet-500/60 dark:hover:bg-violet-500/10">
-            <div className="flex items-center justify-between gap-2"><p className="text-xs text-gray-400">{t('memory.overviewOrganized')}</p><ChevronRight size={14} className="text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-violet-500 dark:text-gray-600 dark:group-hover:text-violet-300" /></div><p className="text-sm font-semibold text-gray-800 dark:text-gray-100">{telemetryLiveStatus?.organized_memory_conversations ?? 0}</p><p className="mt-0.5 text-[11px] text-gray-400">{t('memory.overviewOrganizedSub', { count: telemetryLiveStatus?.completed_conversations ?? 0 })}</p>
+          <button type="button" onClick={onOpenOrganized} className={overviewCardClass}>
+            <div className="flex items-center justify-between gap-2"><p className={overviewLabelClass}>{t('memory.overviewOrganized')}</p><ChevronRight size={14} className="text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-violet-500 dark:text-gray-400 dark:group-hover:text-violet-300" /></div><p className={`${overviewValueClass} tabular-nums`}>{telemetryLiveStatus?.organized_memory_conversations ?? 0}</p>
           </button>
-          <button type="button" onClick={onOpenPending} className="group rounded-lg border border-gray-200 bg-white px-3 py-2 text-left transition hover:border-violet-300 hover:bg-violet-50/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:border-gray-700 dark:bg-gray-800 dark:hover:border-violet-500/60 dark:hover:bg-violet-500/10">
-            <div className="flex items-center justify-between gap-2"><p className="text-xs text-gray-400">{t('memory.overviewPending')}</p><ChevronRight size={14} className="text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-violet-500 dark:text-gray-600 dark:group-hover:text-violet-300" /></div><p className="text-sm font-semibold text-gray-800 dark:text-gray-100">{(telemetryLiveStatus?.pending_memory_sessions ?? 0) + (telemetryLiveStatus?.retrying_memory_sessions ?? 0)}</p><p className="mt-0.5 text-[11px] text-gray-400">{telemetryLiveStatus?.retrying_memory_sessions ? t('memory.overviewPendingRetry', { count: telemetryLiveStatus.retrying_memory_sessions }) : t('memory.overviewPendingClick')}</p>
+          <button type="button" onClick={onOpenPending} className={overviewCardClass}>
+            <div className="flex items-center justify-between gap-2"><p className={overviewLabelClass}>{t('memory.overviewPending')}</p><ChevronRight size={14} className="text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-violet-500 dark:text-gray-400 dark:group-hover:text-violet-300" /></div><p className={`${overviewValueClass} tabular-nums`}>{(telemetryLiveStatus?.pending_memory_sessions ?? 0) + (telemetryLiveStatus?.retrying_memory_sessions ?? 0) + (telemetryLiveStatus?.failed_memory_sessions ?? 0)}</p>
           </button>
-          <button type="button" onClick={onOpenInjection} className="group rounded-lg border border-gray-200 bg-white px-3 py-2 text-left transition hover:border-violet-300 hover:bg-violet-50/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:border-gray-700 dark:bg-gray-800 dark:hover:border-violet-500/60 dark:hover:bg-violet-500/10">
-            <div className="flex items-center justify-between gap-2"><p className="text-xs text-gray-400">{t('memory.overviewInjection')}</p><ChevronRight size={14} className="text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-violet-500 dark:text-gray-600 dark:group-hover:text-violet-300" /></div><p className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('memory.overviewAgentCount', { count: connectedMcpCount })}</p><p className="mt-0.5 text-[11px] text-gray-400">{mcpStatusLoaded ? (connectedMcpCount ? t('memory.overviewInjectionConnected') : t('memory.overviewInjectionDisconnected')) : t('memory.overviewInjectionChecking')}</p>
+          <button type="button" onClick={onOpenCapture} className={overviewCardClass}>
+            <div className="flex items-center justify-between gap-2"><p className={overviewLabelClass}>{t('memory.overviewCapture')}</p><ChevronRight size={14} className="text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-violet-500" /></div><p className={overviewValueClass}>{ingestStatus ? (ingestStatus.enabled ? t('memory.ingestOn') : t('memory.ingestOff')) : t('memory.overviewLoading')}</p>
+          </button>
+          <button type="button" onClick={onOpenInjection} className={overviewCardClass}>
+            <div className="flex items-center justify-between gap-2"><p className={overviewLabelClass}>{t('memory.overviewInjection')}</p><ChevronRight size={14} className="text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-violet-500 dark:text-gray-400 dark:group-hover:text-violet-300" /></div><p className={overviewValueClass}>{injectionReadyCount > 0 ? t('memory.ingestOn') : t('memory.ingestOff')}</p>
           </button>
         </section>
       )}
       {!telemetrySummary && (
-        <section className="grid grid-cols-2 sm:grid-cols-4 gap-2" aria-live="polite">
-          {[t('memory.overviewTokenUsage'), t('memory.overviewOrganized'), t('memory.overviewPending'), t('memory.overviewInjection')].map((label) => {
-            const handler = label === t('memory.overviewTokenUsage') ? onOpenUsage : label === t('memory.overviewPending') ? onOpenPending : label === t('memory.overviewOrganized') ? onOpenOrganized : onOpenInjection
-            // 四个入口悬停色统一为待提取记忆的 violet。
-            const tone = 'hover:border-violet-300 hover:bg-violet-50/40 focus-visible:ring-violet-500 dark:hover:border-violet-500/60 dark:hover:bg-violet-500/10'
-            const arrowTone = 'group-hover:text-violet-500 dark:group-hover:text-violet-300'
-            return <button key={label} type="button" onClick={handler} className={`group rounded-lg border border-gray-200 bg-white px-3 py-2 text-left transition focus:outline-none focus-visible:ring-2 dark:border-gray-700 dark:bg-gray-800 ${tone}`}><div className="flex items-center justify-between gap-2"><p className="text-xs text-gray-400">{label}</p><ChevronRight size={14} className={`text-gray-300 transition group-hover:translate-x-0.5 dark:text-gray-600 ${arrowTone}`} /></div><p className="mt-1 inline-flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400"><Loader2 className="animate-spin motion-reduce:animate-none" size={13} />{t('memory.overviewLoading')}</p></button>
+        <section className="grid grid-cols-2 lg:grid-cols-5 gap-3" aria-live="polite">
+          {[t('memory.overviewTokenUsage'), t('memory.overviewOrganized'), t('memory.overviewPending'), t('memory.overviewCapture'), t('memory.overviewInjection')].map((label) => {
+            const handler = label === t('memory.overviewTokenUsage') ? onOpenUsage : label === t('memory.overviewPending') ? onOpenPending : label === t('memory.overviewOrganized') ? onOpenOrganized : label === t('memory.overviewCapture') ? onOpenCapture : onOpenInjection
+            return <button key={label} type="button" onClick={handler} className={overviewCardClass}><div className="flex items-center justify-between gap-2"><p className={overviewLabelClass}>{label}</p><ChevronRight size={14} className="text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-violet-500 dark:text-gray-400 dark:group-hover:text-violet-300" /></div><p className="mt-2 inline-flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400"><Loader2 className="animate-spin motion-reduce:animate-none" size={13} />{t('memory.overviewLoading')}</p></button>
           })}
         </section>
       )}
@@ -649,22 +620,17 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
         </div>
       )}
 
-      {/* 自动沉淀：Hook 安装、会话启动注入与数据目录已统一到「记忆注入」面板。 */}
+      {/* 采集设置在记忆采集页集中管理。 */}
       <section className="order-10 rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-4 space-y-3">
         <div className="flex items-center gap-2">
           <Webhook size={15} className="text-violet-600 dark:text-violet-400" />
-          <div className="min-w-0 flex-1"><h2 className="text-sm font-semibold text-gray-700 dark:text-gray-200">{t('memory.ingestTitle')}</h2><p className="mt-0.5 text-xs text-gray-400">{t('memory.ingestHint')}{t('memory.ingestPanelLinkBefore')}<button type="button" onClick={onOpenInjection} className="mx-0.5 inline-flex items-center gap-0.5 font-medium text-violet-600 hover:underline dark:text-violet-300">{t('memory.ingestPanelLinkText')}<ChevronRight size={12} /></button>。</p></div>
+          <div className="min-w-0 flex-1"><h2 className="text-sm font-semibold text-gray-700 dark:text-gray-200">{t('memory.ingestTitle')}</h2><p className="mt-0.5 text-xs text-gray-500">{t('memory.ingestHint')}{t('memory.ingestPanelLinkBefore')}<button type="button" onClick={onOpenCapture} className="mx-0.5 inline-flex items-center gap-0.5 font-medium text-violet-600 hover:underline dark:text-violet-300">{t('memory.ingestPanelLinkText')}<ChevronRight size={12} /></button>{t('memory.ingestPanelLinkAfter')}</p></div>
           <div className="flex shrink-0 items-center gap-2">
-            {ingestStatus?.enabled
+            {!ingestStatus
+              ? <span className="text-xs text-gray-500">{t('memory.overviewLoading')}</span>
+              : ingestStatus.enabled
               ? <span className="inline-flex items-center gap-1 text-xs text-green-600 dark:text-green-400"><CheckCircle2 size={12} />{t('memory.ingestOn')}</span>
-              : <span className="inline-flex items-center gap-1 text-xs text-gray-400"><XCircle size={12} />{t('memory.ingestOff')}</span>}
-            <button
-              onClick={() => setIngestEnabled(!ingestStatus?.enabled)}
-              className={`relative w-9 h-5 rounded-full transition-colors ${ingestStatus?.enabled ? 'bg-violet-600' : 'bg-gray-300 dark:bg-gray-600'}`}
-              title={ingestStatus?.enabled ? t('memory.ingestDisable') : t('memory.ingestEnable')}
-            >
-              <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${ingestStatus?.enabled ? 'left-4.5' : 'left-0.5'}`} style={{ left: ingestStatus?.enabled ? '18px' : '2px' }} />
-            </button>
+              : <span className="inline-flex items-center gap-1 text-xs text-gray-500"><XCircle size={12} />{t('memory.ingestOff')}</span>}
             <button type="button" onClick={() => setIngestOpen((open) => !open)} aria-expanded={ingestOpen} className="inline-flex items-center rounded-md p-1 text-gray-500 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-700" title={ingestOpen ? t('memory.ingestCollapse') : t('memory.ingestExpand')}>{ingestOpen ? <ChevronUp size={15} /> : <ChevronDown size={15} />}</button>
           </div>
         </div>
@@ -697,75 +663,13 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
           </p>
         )}
 
-        {ingestStatus && ingestStatus.recent.length > 0 && (
-          <div className="min-w-0">
-            <p className="text-xs text-gray-500 dark:text-gray-400">{t('memory.ingestRecent')}</p>
-            <div className="mt-1 max-h-44 space-y-1 overflow-y-auto rounded-md border border-gray-200 bg-gray-50 p-2 pr-1.5 dark:border-gray-700 dark:bg-gray-900/40">
-              {ingestStatus.recent.map((log, i) => (
-                <div key={`${log.at}-${log.state}-${log.detail}-${i}`} className="flex min-w-0 items-center gap-2 text-xs text-gray-600 dark:text-gray-300">
-                  <span className="shrink-0 text-gray-400 font-mono">{log.at}</span>
-                  <span className={`shrink-0 px-1.5 rounded ${log.state === 'retrying' ? 'bg-amber-500/10 text-amber-700 dark:text-amber-300' : log.state === 'working' ? 'bg-sky-500/10 text-sky-700 dark:text-sky-300' : 'bg-violet-500/10 text-violet-600 dark:text-violet-400'}`}>
-                    {log.state === 'cancelled' ? t('memory.pending.interrupt') : log.state === 'retrying' ? t('memory.recordRetrying') : log.state === 'working' ? t('memory.organizeConversationsWorking') : t('memory.recordStored')}
-                  </span>
-                  <span className="min-w-0 flex-1 truncate" title={log.detail}>{log.detail}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
         </div>}
 
-        {/* Hook 接收记录：自动沉淀的原始回执，作为本区块子项。 */}
-        <div className="border-t border-gray-100 pt-3 dark:border-gray-700">
-          <div className="flex flex-wrap items-center gap-2">
-            <History size={14} className="text-violet-600 dark:text-violet-400" />
-            <h3 className="text-xs font-semibold text-gray-700 dark:text-gray-200">{t('memory.recordsTitle')}</h3>
-            <span className="text-xs text-gray-500 dark:text-gray-400">{t('memory.recordsHint')}</span>
-            <button type="button" onClick={() => setRecordsOpen((open) => !open)} aria-expanded={recordsOpen} className="ml-auto inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-700">
-              {recordsOpen ? t('memory.ingestCollapse') : t('memory.recordsView')}{recordsOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-            </button>
-            <button onClick={() => { void handleRefresh() }} disabled={refreshing} className="inline-flex items-center gap-1 rounded-md border border-gray-300 px-2.5 py-1 text-xs text-gray-600 hover:bg-gray-50 disabled:cursor-wait disabled:opacity-60 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700">
-              <RefreshCw size={13} className={refreshing ? 'animate-spin' : ''} />{refreshing ? t('memory.refreshing') : t('common.refresh')}
-            </button>
-          </div>
-          {recordsOpen && <>
-          {telemetryEvents.length === 0 ? (
-            <div className="py-6 text-center">
-              <p className="text-sm text-gray-600 dark:text-gray-300">{t('memory.recordsEmpty')}</p>
-              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">{t('memory.recordsEmptyHint')}</p>
-            </div>
-          ) : (
-            <div className="mt-3 max-h-72 divide-y divide-gray-100 overflow-y-auto rounded-lg border border-gray-200 dark:divide-gray-700 dark:border-gray-700">
-              {telemetryEvents.map((event) => {
-                const tokenTotal = event.input_tokens + event.output_tokens + event.cached_tokens
-                const hasConversation = Boolean(event.conversation_text)
-                const expanded = expandedReceiptId === event.id
-                const conversationState = event.conversation_state === 'full'
-                  ? t('memory.recordConversationFull', { count: event.conversation_message_count })
-                  : event.conversation_state === 'partial'
-                    ? t('memory.recordConversationPartial')
-                    : t('memory.recordConversationUnavailable')
-                return <div key={event.id} className="px-3 py-2.5 text-xs">
-                  <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-1">
-                    <div className="min-w-0"><div className="flex flex-wrap items-center gap-1.5"><span className="rounded bg-violet-500/10 px-1.5 py-0.5 font-medium text-violet-700 dark:text-violet-300">{event.source}</span><span className="text-gray-700 dark:text-gray-200">{event.event_type}</span><span className="font-mono text-gray-400">{event.session_id}</span></div><p className="mt-1 truncate text-gray-500 dark:text-gray-400">{localTime(event.occurred_at)}</p></div>
-                    <span className={event.token_source === 'reported' ? 'self-center font-mono text-gray-700 dark:text-gray-200' : 'self-center text-gray-400'}>{event.token_source === 'reported' ? `${tokenTotal.toLocaleString()} tokens` : t('memory.tokenUnavailable')}</span>
-                  </div>
-                  {event.event_type === 'Stop' && <div className={`mt-2 rounded-md px-2.5 py-2 ${event.conversation_state === 'full' ? 'bg-emerald-500/10 text-emerald-800 dark:text-emerald-200' : 'bg-gray-100 text-gray-600 dark:bg-gray-700/60 dark:text-gray-300'}`}>
-                    <div className="flex items-center gap-1.5"><FileText size={13} aria-hidden="true" /><span className="font-medium">{conversationState}</span>{hasConversation && <button type="button" onClick={() => setExpandedReceiptId(expanded ? null : event.id)} aria-expanded={expanded} className="ml-auto inline-flex items-center gap-1 rounded px-1 py-0.5 font-medium hover:bg-black/5 focus:outline-none focus:ring-1 focus:ring-violet-500 dark:hover:bg-white/10">{expanded ? t('memory.recordConversationCollapse') : t('memory.recordConversationExpand')}{expanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}</button>}</div>
-                    {hasConversation && !expanded && <p className="mt-1.5 max-h-10 overflow-hidden whitespace-pre-wrap text-gray-700 dark:text-gray-200">{event.conversation_text}</p>}
-                    {hasConversation && expanded && <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap rounded border border-black/10 bg-white/70 p-2.5 font-sans text-xs leading-5 text-gray-800 dark:border-white/10 dark:bg-gray-900/40 dark:text-gray-100">{event.conversation_text}</pre>}
-                  </div>}
-                </div>
-              })}
-            </div>
-          )}
-          </>}
-        </div>
       </section>
 
       {/* L2 / L3 层级记忆：明确与 L1 清洗分开，只有已发布 L3 才会注入 Agent。 */}
-      <section className="order-30 grid gap-3 xl:grid-cols-2">
-        <article className="flex flex-col rounded-xl border border-sky-200 bg-sky-50/40 p-4 dark:border-sky-900/70 dark:bg-sky-950/20">
+      <section className="order-30 grid auto-rows-fr items-stretch gap-3 xl:grid-cols-2">
+        <article className="min-w-0 max-h-[36rem] overflow-y-auto overscroll-contain rounded-xl border border-sky-200 bg-sky-50/40 p-4 dark:border-sky-900/70 dark:bg-sky-950/20">
           <div className="flex items-start gap-2">
             <div className="mt-0.5 rounded-md bg-sky-500/10 p-1.5 text-sky-600 dark:text-sky-300"><FileText size={14} /></div>
             <div className="min-w-0 flex-1 min-h-[62px]"><h2 className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('memory.l2Title')}</h2><p className="mt-0.5 text-xs leading-5 text-gray-500 dark:text-gray-400 line-clamp-2" title={t('memory.l2Hint')}>{t('memory.l2Hint')}</p></div>
@@ -848,19 +752,21 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
                   <div className="flex items-center gap-2">
                     <button type="button" onClick={() => { void handleL2Save(document) }} disabled={savingL2 || !editingL2Content.trim()} className="inline-flex items-center gap-1 rounded border border-sky-300 px-2 py-0.5 text-xs font-medium text-sky-700 hover:bg-sky-100 disabled:opacity-50 dark:border-sky-700 dark:text-sky-200">{savingL2 ? <Loader2 size={12} className="animate-spin" /> : null}{savingL2 ? t('memory.l3Saving') : t('memory.l3Save')}</button>
                     <button type="button" onClick={() => { setEditingL2(false); setEditingL2Content('') }} disabled={savingL2} className="rounded border border-gray-300 px-2 py-0.5 text-xs font-medium text-gray-700 hover:bg-gray-100 disabled:opacity-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700">{t('memory.l3Cancel')}</button>
-                    <p className="text-xs text-gray-400 dark:text-gray-500">{t('memory.l2SaveOverwriteHint')}</p>
+                    <p className="text-xs text-gray-500 dark:text-gray-400">{t('memory.l2SaveOverwriteHint')}</p>
                   </div>
                 </div>
               ) : (<>
                 {repairedLegacyContent && <p className="mt-2 rounded-md border border-sky-200 bg-sky-100/60 px-2.5 py-2 text-xs leading-5 text-sky-800 dark:border-sky-900/70 dark:bg-sky-950/30 dark:text-sky-200">{t('memory.l2LegacyHidden')}</p>}
                 {hasAnalysisPreamble && <p className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2.5 py-2 text-xs leading-5 text-amber-800 dark:border-amber-900/70 dark:bg-amber-950/30 dark:text-amber-200">{t('memory.l2PreambleWarn')}</p>}
-                <CollapsibleDocumentContent content={content} contentId="l2-published-content" accent="sky" />
+                <div id="l2-published-content" role="region" aria-label={t('memory.l2Title')} tabIndex={0} className={`mt-2 ${MEMORY_CONTENT_SCROLL_CLASS}`}>
+                  <MemoryMarkdown content={content} unwrapDocumentFence />
+                </div>
               </>)}
               </div>
             </div>
           })() : (<><p className="mt-3 text-xs text-gray-500 dark:text-gray-400">{t('memory.l2Empty')}</p><UserMemoryList accent="sky" scope="l2" /></>)}
         </article>
-        <article className="flex flex-col rounded-xl border border-violet-200 bg-violet-50/40 p-4 dark:border-violet-900/70 dark:bg-violet-950/20">
+        <article className="min-w-0 max-h-[36rem] overflow-y-auto overscroll-contain rounded-xl border border-violet-200 bg-violet-50/40 p-4 dark:border-violet-900/70 dark:bg-violet-950/20">
           <div className="flex items-start gap-2">
             <div className="mt-0.5 rounded-md bg-violet-500/10 p-1.5 text-violet-600 dark:text-violet-300"><Brain size={14} /></div>
             <div className="min-w-0 flex-1 min-h-[62px]"><h2 className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('memory.l3Title')}</h2><p className="mt-0.5 text-xs leading-5 text-gray-500 dark:text-gray-400 line-clamp-2" title={t('memory.l3Hint')}>{t('memory.l3Hint')}</p></div>
@@ -913,7 +819,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
           {userMemoryErrors.l3 && <InlineActionError text={t('memory.longTermMemoryAddFailed', { error: userMemoryErrors.l3 })} />}
           {userMemorySuccesses.l3 && <InlineActionSuccess text={userMemorySuccesses.l3} />}
          {l3DraftError && <div role="alert" className="mt-3 rounded-md border border-red-200 bg-red-50 px-2.5 py-2 text-xs leading-5 text-red-800 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-200"><span className="font-medium">{t('memory.l3DraftFailedTitle')}</span>{l3DraftError}</div>}
-        {visibleL3Documents.length || invalidL3Drafts.length ? <div className="mt-3 min-h-0 flex-1 space-y-2 border-t border-violet-200/70 pt-3 dark:border-violet-900/70"><UserMemoryList accent="violet" scope="l3" />{visibleL3Documents.slice(0, 2).map((document) => {
+        {visibleL3Documents.length || invalidL3Drafts.length ? <div id="l3-documents-content" role="region" aria-label={t('memory.l3Title')} tabIndex={0} className={`mt-3 space-y-2 border-t border-violet-200/70 pt-3 dark:border-violet-900/70 ${MEMORY_CONTENT_SCROLL_CLASS}`}><UserMemoryList accent="violet" scope="l3" />{visibleL3Documents.slice(0, 2).map((document) => {
           return <div key={document.id} className="min-w-0 rounded-md bg-white/70 px-2.5 py-2 dark:bg-gray-900/30 [content-visibility:auto] [contain-intrinsic-size:auto_320px]">
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
                 <span className={document.state === 'published' ? 'text-green-600 dark:text-green-300' : document.state === 'archived' ? 'text-gray-500 dark:text-gray-400' : 'text-amber-700 dark:text-amber-300'}>{document.state === 'published' ? t('memory.l3Published') : document.state === 'archived' ? t('memory.l3Archived') : t('memory.l3Draft')}</span>
@@ -935,13 +841,13 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
                       <button type="button" onClick={() => { void handleL3SavePublished(document) }} disabled={publishingL3 === document.id || !editingL3Content.trim()} className="inline-flex items-center gap-1 rounded border border-violet-300 px-2 py-0.5 text-xs font-medium text-violet-700 hover:bg-violet-100 disabled:opacity-50 dark:border-violet-700 dark:text-violet-200">{publishingL3 === document.id ? <Loader2 size={12} className="animate-spin" /> : null}{publishingL3 === document.id ? t('memory.l3Saving') : t('memory.l3Save')}</button>
                     ) : null}
                     <button type="button" onClick={() => { setEditingL3Id(null); setEditingL3Content('') }} disabled={publishingL3 === document.id} className="rounded border border-gray-300 px-2 py-0.5 text-xs font-medium text-gray-700 hover:bg-gray-100 disabled:opacity-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700">{document.state === 'published' ? t('memory.l3Cancel') : t('memory.l3CancelEdit')}</button>
-                    <p className="text-xs text-gray-400 dark:text-gray-500">{document.state === 'published' ? t('memory.l3PublishedEditHint') : t('memory.l3DraftEditHint')}</p>
+                    <p className="text-xs text-gray-500 dark:text-gray-400">{document.state === 'published' ? t('memory.l3PublishedEditHint') : t('memory.l3DraftEditHint')}</p>
                   </div>
                 </div>
               ) : (
-                /* 草案内容限高展示：不超过限高完整显示；超出时折叠并显示
-                   「查看完整内容」，由用户手动展开。 */
-                <CollapsibleDocumentContent content={document.content} contentId={`l3-document-${document.id}`} accent="violet" />
+                <div id={`l3-document-${document.id}`} className="mt-2 min-w-0">
+                  <MemoryMarkdown content={document.content} unwrapDocumentFence />
+                </div>
               )}
             </div>
           })}{invalidL3Drafts.map((document) => <div key={document.id} className="rounded-md border border-amber-200 bg-amber-50/80 px-2.5 py-2 text-xs dark:border-amber-900/70 dark:bg-amber-950/25"><div className="flex flex-wrap items-center gap-x-2 gap-y-1"><span className="font-medium text-amber-800 dark:text-amber-200">{t('memory.l3InvalidDraftBadge')}</span><span className="text-amber-700/80 dark:text-amber-300/80">{t('memory.l3InvalidDraftSource', { count: document.source_count })}</span><button type="button" onClick={() => setL3DeleteTarget(document)} disabled={deletingL3 === document.id} className="ml-auto inline-flex shrink-0 items-center gap-1 rounded border border-red-200 bg-white/70 px-2 py-0.5 font-medium text-red-700 hover:bg-red-50 disabled:opacity-50 dark:border-red-900/70 dark:bg-gray-900/40 dark:text-red-300 dark:hover:bg-red-950/30"><Trash2 size={12} />{deletingL3 === document.id ? t('memory.l3DraftInvalidDeleting') : t('memory.l3DraftInvalidDelete')}</button></div><p className="mt-1.5 leading-5 text-amber-800 dark:text-amber-200">{t('memory.l3InvalidDraftHint')}</p></div>)}</div> : (<><p className="mt-3 text-xs text-gray-500 dark:text-gray-400">{t('memory.l3Empty')}</p><UserMemoryList accent="violet" scope="l3" /></>)}
@@ -1025,7 +931,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
             {lastSearchResults.map((m, i) => (
               <div key={m.id} className="rounded-md bg-gray-50 dark:bg-gray-700/50 border border-gray-200 dark:border-gray-600 px-3 py-2">
                 <div className="flex flex-wrap items-center gap-2 mb-1">
-                  <span className="text-xs font-mono text-gray-400">#{i + 1}</span>
+                  <span className="text-xs font-mono text-gray-500">#{i + 1}</span>
                   {m.score != null && (
                     <span className="text-xs font-mono text-amber-600 dark:text-amber-400">score {Number(m.score).toFixed(3)}</span>
                   )}
@@ -1033,7 +939,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
                   {m.durability && <span className={`text-xs px-1.5 rounded ${m.durability === 'long_term' ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300' : m.durability === 'short_term' ? 'bg-sky-500/10 text-sky-700 dark:text-sky-300' : 'bg-gray-200 text-gray-600 dark:bg-gray-600 dark:text-gray-200'}`}>{t(`memory.durability${m.durability === 'long_term' ? 'LongTerm' : m.durability === 'short_term' ? 'ShortTerm' : 'Session'}`)}</span>}
                   {m.retrieval_source === 'conversation' && <span className="text-xs px-1.5 rounded bg-emerald-500/10 text-emerald-700 dark:text-emerald-300">{t('memory.searchSourceConversation')}</span>}
                   {m.retrieval_source === 'memory' && <span className="text-xs px-1.5 rounded bg-sky-500/10 text-sky-700 dark:text-sky-300">{t('memory.searchSourceMemory')}</span>}
-                  {(m.last_update_at || m.occurred_at) && <span className="text-xs text-gray-400">{localTime(m.last_update_at || m.occurred_at || '')}</span>}
+                  {(m.last_update_at || m.occurred_at) && <span className="text-xs text-gray-500">{localTime(m.last_update_at || m.occurred_at || '')}</span>}
                 </div>
                 <p className="text-sm text-gray-700 dark:text-gray-200 whitespace-pre-wrap break-all">{m.memory}</p>
               </div>
@@ -1041,11 +947,11 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
           </div>
         )}
         {lastSearchResults.length === 0 && lastSearchQuery && !loading && (
-          <p className="text-sm text-gray-400 text-center py-4">{t('memory.noResults')}</p>
+          <p className="text-sm text-gray-500 text-center py-4">{t('memory.noResults')}</p>
         )}
 
         {memories.length === 0 ? (
-          <p className="text-sm text-gray-400 dark:text-gray-500 text-center py-6">{t('memory.empty')}</p>
+          <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-6">{t('memory.empty')}</p>
         ) : (
           <div className="space-y-1.5 max-h-[420px] overflow-y-auto pr-1">
             {memories.map((m) => (
@@ -1166,7 +1072,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
 // updateMemory/deleteMemory，保存/删除后自动刷新列表。
 function UserMemoryList({ accent, scope }: { accent: 'sky' | 'violet'; scope: 'l2' | 'l3' }) {
   const { t } = useTranslation()
-  const { memories, updateMemory, deleteMemory } = useMemoryStore()
+  const { memories, updateMemory, deleteMemory } = useMemoryFields('memories', 'updateMemory', 'deleteMemory')
   const customMemories = useMemo(() => memories.filter((memory) => {
     if (!memory.user_defined) return false
     return scope === 'l2'

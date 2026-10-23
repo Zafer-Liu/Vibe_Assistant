@@ -1,16 +1,10 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { invoke } from '@tauri-apps/api/core'
-import { useAgentStore } from './store/agentStore'
 import { LanguageSwitcher } from './components/LanguageSwitcher'
-import { AgentList } from './components/AgentList'
-import { AgentDetail } from './components/AgentDetail'
-import { AgentForm } from './components/AgentForm'
-import { TerminalPanel } from './components/TerminalPanel'
 import { PortManager } from './pages/PortManager'
 import { NetworkManager } from './pages/NetworkManager'
 import { EnvManager } from './pages/EnvManager'
-import { ProxyManager } from './pages/ProxyManager'
 import { Settings } from './pages/Settings'
 import { MemoryCenter } from './pages/MemoryCenter'
 import { SkillLibrary } from './pages/SkillLibrary'
@@ -21,85 +15,103 @@ import { UsageAnalytics } from './pages/UsageAnalytics'
 import { PendingMemories } from './pages/PendingMemories'
 import { OrganizedConversations } from './pages/OrganizedConversations'
 import { MemoryInjection } from './pages/MemoryInjection'
+import { MemoryCapture } from './pages/MemoryCapture'
+import { MemoryHelp } from './pages/MemoryHelp'
 import { ErrorBoundary } from './components/ErrorBoundary'
-import { ErrorRecovery, RecoveryNavigationContext, type RecoveryTarget } from './components/ErrorRecovery'
-import { useDocumentVisible, useVisiblePolling } from './hooks/useVisiblePolling'
+import { RecoveryNavigationContext, type RecoveryTarget } from './components/ErrorRecovery'
+import { useDocumentVisible } from './hooks/useVisiblePolling'
 import { UpdateChecker } from './components/UpdateChecker'
 import { Onboarding, needsOnboarding } from './components/Onboarding'
 import { useTheme } from './theme'
+import { NavigationSearch, type NavigationDestination } from './components/NavigationSearch'
+import { usePageMotion } from './hooks/usePageMotion'
 import { setLanguage } from './i18n'
-import type { AgentState } from './types/agent'
 import { useResizable } from './hooks/useResizable'
-import { NativeWebviewPanel, type OpenTab } from './components/NativeWebviewPanel'
-import {
-  Plus, RefreshCw, Bot, X, Globe, Network,
-  Maximize2, Minimize2, TerminalSquare, Sun, Moon,
-  Shield, Eraser, Settings2, Brain, BookOpenText, Plug,
-  ChevronDown, ChevronRight, BarChart3, Gauge, Variable,
-} from 'lucide-react'
+import { Sun, Moon, Settings2, Brain, BookOpenText, Plug, Wrench, ChevronRight, BarChart3, Search, PanelLeftClose, PanelLeftOpen, Home } from 'lucide-react'
 import logoUrl from '/logo.png'
+import { CloseBehaviorDialog } from './features/desktop/CloseBehaviorDialog'
 
-type NavPage = 'agents' | 'ports' | 'network' | 'env-vars' | 'proxy' | 'settings' | 'memory' | 'skills' | 'published-skills' | 'skill-marketplace' | 'mcp-library' | 'usage' | 'pending-memories' | 'organized-conversations' | 'memory-injection'
+type NavPage = 'ports' | 'network' | 'env-vars' | 'settings' | 'settings-general' | 'settings-llm' | 'settings-memory' | 'settings-cloud' | 'memory' | 'skills' | 'published-skills' | 'skill-marketplace' | 'mcp-library' | 'mcp-tools' | 'mcp-calls' | 'mcp-errors' | 'mcp-help' | 'usage' | 'pending-memories' | 'organized-conversations' | 'memory-capture' | 'memory-injection' | 'memory-help'
 
-const MEMORY_PAGES = ['memory', 'pending-memories', 'organized-conversations', 'memory-injection'] as const
+const MEMORY_PAGES = ['memory', 'memory-capture', 'memory-injection', 'memory-help', 'pending-memories', 'organized-conversations'] as const
 // Skill 库两页同样「访问过即保持挂载」：重进保留筛选/勾选状态，也免去整树重挂载。
 const SKILL_PAGES = ['skills', 'published-skills', 'skill-marketplace'] as const
-const MCP_PAGES = ['mcp-library'] as const
-const KEPT_PAGES: readonly string[] = [...MEMORY_PAGES, ...SKILL_PAGES, ...MCP_PAGES, 'usage']
+const MCP_PAGES = ['mcp-library', 'mcp-tools', 'mcp-calls', 'mcp-errors', 'mcp-help'] as const
+const TOOL_PAGES = ['ports', 'network', 'env-vars'] as const
+const SETTINGS_PAGES = ['settings-general', 'settings-llm', 'settings-memory', 'settings-cloud'] as const
+const KEPT_PAGES: readonly string[] = [...MEMORY_PAGES, ...SKILL_PAGES, 'usage']
 
 export default function App() {
-  const {
-    agents, selectedId, logs, loading,
-    fetchAgents, selectAgent, reorderAgents,
-    startAgent, stopAgent, saveAgent, deleteAgent,
-  } = useAgentStore()
-
   const { theme, toggle: toggleTheme } = useTheme()
   const { t } = useTranslation()
 
-  const [page, setPage] = useState<NavPage>('agents')
+  const [page, setPage] = useState<NavPage>('memory')
+  const [navigationOpen, setNavigationOpen] = useState(false)
+  const [compactNavigation, setCompactNavigation] = useState(() => localStorage.getItem('ui.navCompact') === 'true')
+  const pageHost = usePageMotion(page)
+  useEffect(() => { localStorage.setItem('ui.navCompact', String(compactNavigation)) }, [compactNavigation])
+  useEffect(() => {
+    const shortcut = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return
+      const modal = document.querySelector('dialog[open], [role="dialog"][aria-modal="true"]')
+      if (modal && !modal.classList.contains('app-command-dialog')) return
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); setNavigationOpen(value => !value) }
+    }
+    window.addEventListener('keydown', shortcut)
+    return () => window.removeEventListener('keydown', shortcut)
+  }, [])
   const documentVisible = useDocumentVisible()
   const openRecoveryTarget = useCallback((target: RecoveryTarget) => setPage(target), [])
-  const [agentError, setAgentError] = useState<{ agent: AgentState; message: string; retry: () => void } | null>(null)
   // 记忆族页面访问过即保持挂载：返回时不再
   // 重新挂载触发全量数据重查，消除往返卡顿。未激活时仅 CSS 隐藏。
   const [keptPages, setKeptPages] = useState<Set<string>>(new Set())
   useEffect(() => {
-    if (KEPT_PAGES.includes(page)) {
-      setKeptPages((previous) => previous.has(page) ? previous : new Set(previous).add(page))
+    const keepKey = MCP_PAGES.includes(page as typeof MCP_PAGES[number]) ? 'mcp-library' : page
+    if (KEPT_PAGES.includes(keepKey) || keepKey === 'mcp-library') {
+      setKeptPages((previous) => previous.has(keepKey) ? previous : new Set(previous).add(keepKey))
     }
   }, [page])
-  const [showForm, setShowForm] = useState(false)
   const [showOnboarding, setShowOnboarding] = useState(needsOnboarding)
-  const [editingAgent, setEditingAgent] = useState<AgentState | null>(null)
-  const [openTabs, setOpenTabs] = useState<OpenTab[]>([])
-  const [activeTabKey, setActiveTabKey] = useState<string | null>(null)
-  const [terminalClearVersions, setTerminalClearVersions] = useState<Record<string, number>>({})
-  const [panelFullscreen, setPanelFullscreen] = useState(false)
   // 从「已发布」页跳入 Skill 库时自动打开同步对话框
   const [skillsAutoSync, setSkillsAutoSync] = useState(false)
-  // 侧边栏分组展开状态：默认展开记忆中心与 Skill 库，让子页面可发现
-  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set(['memory', 'skills']))
-  // 导航到子页面时自动展开所属分组
+  // Preserve the remaining module navigation preferences.
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => {
+    try { const saved = JSON.parse(localStorage.getItem('ui.navGroups') ?? 'null'); if (Array.isArray(saved)) return new Set(saved.filter((value): value is string => typeof value === 'string' && ['memory', 'skills', 'mcp', 'toolbox', 'settings'].includes(value))) } catch { /* Start with collapsed navigation groups. */ }
+    return new Set()
+  })
+  useEffect(() => { localStorage.setItem('ui.navGroups', JSON.stringify([...expandedGroups])) }, [expandedGroups])
+  const previousNavigationPage = useRef(page)
+  // Expand a family after navigation while allowing manual collapse.
   useEffect(() => {
+    if (previousNavigationPage.current === page) return
+    previousNavigationPage.current = page
     const groupMap: Record<string, string> = {}
     for (const p of MEMORY_PAGES) groupMap[p] = 'memory'
     for (const p of SKILL_PAGES) groupMap[p] = 'skills'
+    for (const p of MCP_PAGES) groupMap[p] = 'mcp'
+    for (const p of TOOL_PAGES) groupMap[p] = 'toolbox'
+    for (const p of SETTINGS_PAGES) groupMap[p] = 'settings'
     const group = groupMap[page]
     if (group) {
       setExpandedGroups(prev => prev.has(group) ? prev : new Set(prev).add(group))
     }
   }, [page])
 
-  // 页面导航回调稳定化：配合 memo 化页面，App 的 5s agent 轮询重渲染不再波及隐藏页面。
+  // Stable callbacks preserve mounted memory and skill page state.
   const openMemory = useCallback(() => setPage('memory'), [])
   const openUsage = useCallback(() => setPage('usage'), [])
   const openPendingMemories = useCallback(() => setPage('pending-memories'), [])
   const openOrganizedConversations = useCallback(() => setPage('organized-conversations'), [])
   const openMemoryInjection = useCallback(() => setPage('memory-injection'), [])
+  const openMemoryCapture = useCallback(() => setPage('memory-capture'), [])
+  const openMemoryHelp = useCallback(() => setPage('memory-help'), [])
   const openSkills = useCallback(() => setPage('skills'), [])
   const openPublishedSkills = useCallback(() => setPage('published-skills'), [])
   const openSkillMarketplace = useCallback(() => setPage('skill-marketplace'), [])
+  const openSettingsGeneral = useCallback(() => setPage('settings-general'), [])
+  const openSettingsLlm = useCallback(() => setPage('settings-llm'), [])
+  const openSettingsMemory = useCallback(() => setPage('settings-memory'), [])
+  const openSettingsCloud = useCallback(() => setPage('settings-cloud'), [])
 
   /** 折叠分组：切换展开；若当前不在该分组内，顺手跳到它的入口页。 */
   const toggleNavGroup = (group: string, pages: readonly string[], entry: NavPage) => {
@@ -113,208 +125,57 @@ export default function App() {
   const clearSkillsAutoSync = useCallback(() => setSkillsAutoSync(false), [])
   const goSkillSync = useCallback(() => { setSkillsAutoSync(true); setPage('skills') }, [])
 
-  const { width: sidebarWidth, height: panelHeight, onColMouseDown, onRowMouseDown } = useResizable({
-    minW: 200, maxW: 480, defaultW: 288,
+  const { width: sidebarWidth, onColMouseDown } = useResizable({
+    minW: 216, maxW: 360, defaultW: 240,
     minH: 120, maxH: 800, defaultH: 380,
   })
 
-  // 启动参数（--page/--lang/--start/--open-ui，用于脚本化截图与自动化）：
-  // 页面校验后才切换；--open-ui 配合 --start 时先等 Agent 端口就绪再打开。
+  // Legacy launch/control flags are no longer consumed; old pages fall back to Memory.
   useEffect(() => {
     let cancelled = false
-    interface StartupOptions { page?: string; lang?: string; select_agent?: string; start_agent?: string; open_ui?: string }
-    invoke<StartupOptions>('get_startup_options').then(async opts => {
+    invoke<{ page?: string; lang?: string }>('get_startup_options').then(options => {
       if (cancelled) return
-      if (opts.lang === 'zh' || opts.lang === 'en') setLanguage(opts.lang)
-      const NAV_PAGES = ['agents', 'ports', 'network', 'env-vars', 'proxy', 'settings', 'memory', 'skills', 'published-skills', 'skill-marketplace', 'mcp-library', 'usage', 'pending-memories', 'organized-conversations', 'memory-injection']
-      if (opts.page && NAV_PAGES.includes(opts.page)) setPage(opts.page as NavPage)
-      const autoId = opts.select_agent ?? opts.start_agent ?? opts.open_ui
-      if (!autoId) return
-      await useAgentStore.getState().fetchAgents().catch(() => {})
-      if (opts.select_agent) selectAgent(autoId)
-      try {
-        if (opts.start_agent) await startAgent(autoId)
-      } catch { /* 启动失败也让截图流程继续 */ }
-      if (opts.open_ui) {
-        // 等 Agent 端口监听后再开内嵌 UI，避免 Webview 落在错误页。
-        await new Promise(resolve => { setTimeout(resolve, opts.start_agent ? 3000 : 500) })
-        const store = useAgentStore.getState()
-        const agent = store.agents.find(a => a.config.id === autoId)
-        if (agent) store.fetchAgents().then(() => { if (!cancelled) openAgentUI(agent) }).catch(() => {})
-      }
+      if (options.lang === 'zh' || options.lang === 'en') setLanguage(options.lang)
+      const pages: readonly string[] = [...MEMORY_PAGES, ...SKILL_PAGES, ...MCP_PAGES, ...TOOL_PAGES, ...SETTINGS_PAGES, 'usage', 'settings']
+      if (options.page && pages.includes(options.page)) setPage(options.page as NavPage)
     }).catch(() => {})
     return () => { cancelled = true }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const selectedAgent = agents.find(a => a.config.id === selectedId) ?? null
-  const agentLogs = selectedId ? (logs[selectedId] ?? []) : []
-  const activeTab = openTabs.find(t => `${t.agentId}:${t.kind}` === activeTabKey)
-    ?? openTabs.find(t => t.agentId === selectedId)
-    ?? openTabs[0]
-    ?? null
-  const resolvedActiveTabKey = activeTab ? `${activeTab.agentId}:${activeTab.kind}` : null
-  const showPanel = activeTab !== null
-  const showSplit = showPanel && !panelFullscreen
+  // Legacy 'settings' page redirects to the first settings sub-page.
+  useEffect(() => { if (page === 'settings') setPage('settings-general') }, [page])
 
-  // Port/proxy pages also consume this list; hidden workspaces do not need logs.
-  useVisiblePolling(fetchAgents, 5000, page === 'agents' || page === 'ports' || page === 'proxy')
-  const refreshLogs = useCallback(async () => {
-    if (selectedId) await useAgentStore.getState().fetchLogs(selectedId)
-  }, [selectedId])
-  useVisiblePolling(refreshLogs, 3000, page === 'agents' && !panelFullscreen && selectedId !== null)
-
-  async function runAgentAction(id: string, action: 'start' | 'stop') {
-    setAgentError(null)
-    try {
-      await (action === 'start' ? startAgent(id) : stopAgent(id))
-    } catch (error) {
-      const agent = agents.find(item => item.config.id === id)
-      if (agent) setAgentError({ agent, message: String(error), retry: () => { void runAgentAction(id, action) } })
-      await fetchAgents()
-      await useAgentStore.getState().fetchLogs(id).catch(() => {})
-    }
-  }
-  const handleStart = (id: string) => { void runAgentAction(id, 'start') }
-  const handleStop = (id: string) => { void runAgentAction(id, 'stop') }
-
-  function openAgentUI(agent: AgentState) {
-    if (!agent.config.port) return
-    const id = agent.config.id
-    const uiTab: OpenTab = {
-      agentId: id,
-      label: agent.config.name,
-      kind: 'ui',
-      port: agent.config.port,
-      token: agent.config.ui_token,
-    }
-    setOpenTabs(tabs => {
-      const exists = tabs.some(tab => tab.agentId === id && tab.kind === 'ui')
-      return exists
-        ? tabs.map(tab => tab.agentId === id && tab.kind === 'ui' ? uiTab : tab)
-        : [...tabs, uiTab]
-    })
-    selectAgent(id)
-    setActiveTabKey(`${id}:ui`)
-    setPage('agents')
-  }
-
-  async function openAgentTerminal(agent: AgentState) {
-    setAgentError(null)
-    const id = agent.config.id
-    const existing = openTabs.find(t => t.agentId === id && t.kind === 'terminal')
-    if (!existing) {
-      // 与 Agent 进程共用同一 cwd 解析：worktree 隔离时返回（惰性创建的）独立工作树。
-      let cwd = agent.config.working_dir
-      try {
-        cwd = await invoke<string>('resolve_agent_cwd', { id })
-      } catch (e) {
-        // Never silently lose isolation by falling back to the shared repository.
-        setAgentError({ agent, message: String(e), retry: () => { void openAgentTerminal(agent) } })
-        return
-      }
-      setOpenTabs(tabs => [
-        ...tabs.filter(t => !(t.agentId === id && t.kind === 'terminal')),
-        {
-          agentId: id,
-          label: agent.config.name,
-          kind: 'terminal',
-          command: agent.config.command,
-          args: agent.config.args,
-          cwd,
-          env: agent.config.env,
-        },
-      ])
-    }
-    selectAgent(id)
-    setActiveTabKey(`${id}:terminal`)
-  }
-
-  function closeTab(tab: OpenTab, e: React.MouseEvent) {
-    e.stopPropagation()
-    if (tab.kind === 'ui') {
-      invoke('close_agent_ui_webview', { agentId: tab.agentId }).catch(() => {})
-    }
-    const key = `${tab.agentId}:${tab.kind}`
-    setOpenTabs(tabs => tabs.filter(t => !(t.agentId === tab.agentId && t.kind === tab.kind)))
-    if (activeTabKey === key) setActiveTabKey(null)
-    setPanelFullscreen(false)
-  }
-
-  function clearActiveTerminal() {
-    if (!activeTab || activeTab.kind !== 'terminal') return
-    setTerminalClearVersions(versions => ({
-      ...versions,
-      [activeTab.agentId]: (versions[activeTab.agentId] ?? 0) + 1,
-    }))
-  }
-
-  function togglePanelFullscreen() {
-    if (!activeTab) return
-    if (activeTab.kind === 'ui') {
-      invoke('fullscreen_agent_ui_webview', {
-        agentId: activeTab.agentId,
-        title: activeTab.label,
-      }).catch(error => console.error('Failed to fullscreen agent UI', error))
-      return
-    }
-    setPanelFullscreen(fullscreen => !fullscreen)
-  }
-
-  function openNew() { setEditingAgent(null); setShowForm(true) }
-  function openEdit(agent: AgentState) { setEditingAgent(agent); setShowForm(true) }
-
-  const uiIsOpen = selectedAgent
-    ? openTabs.some(t => t.agentId === selectedAgent.config.id && t.kind === 'ui')
-    : false
-  const termIsOpen = selectedAgent
-    ? openTabs.some(t => t.agentId === selectedAgent.config.id && t.kind === 'terminal')
-    : false
+  const navigationFamilies: Array<{ group: string; icon: ReactNode; pages: Array<[NavPage, string]> }> = [
+    { group: t('nav.memory'), icon: <Brain size={17} />, pages: [['memory', 'nav.memoryOverview'], ['memory-capture', 'nav.memoryCapture'], ['memory-injection', 'nav.memoryInjection'], ['pending-memories', 'nav.memoryPending'], ['organized-conversations', 'nav.memoryOrganized'], ['memory-help', 'nav.memoryHelp']] },
+    { group: t('nav.skills'), icon: <BookOpenText size={17} />, pages: [['skills', 'nav.skillsLocal'], ['published-skills', 'nav.skillsPublished'], ['skill-marketplace', 'nav.skillsMarketplace']] },
+    { group: t('nav.mcpLibrary'), icon: <Plug size={17} />, pages: [['mcp-library', 'nav.mcpServices'], ['mcp-tools', 'nav.mcpTools'], ['mcp-calls', 'nav.mcpCalls'], ['mcp-errors', 'nav.mcpErrors'], ['mcp-help', 'nav.mcpHelp']] },
+    { group: t('nav.usage'), icon: <BarChart3 size={17} />, pages: [['usage', 'nav.usage']] },
+    { group: t('nav.toolbox'), icon: <Wrench size={17} />, pages: [['ports', 'nav.ports'], ['network', 'nav.network'], ['env-vars', 'nav.envVars']] },
+    { group: t('nav.settings'), icon: <Settings2 size={17} />, pages: [['settings-general', 'nav.settingsGeneral'], ['settings-llm', 'nav.settingsLlm'], ['settings-memory', 'nav.settingsMemory'], ['settings-cloud', 'nav.settingsCloud']] },
+  ]
+  const destinations: NavigationDestination[] = navigationFamilies.flatMap(family => family.pages.map(([id, label]) => ({ id, label: t(label), group: family.group, icon: family.icon })))
+  const currentDestination = destinations.find(destination => destination.id === page)!
 
   return (
     <RecoveryNavigationContext.Provider value={openRecoveryTarget}>
-    <div className="flex h-screen overflow-hidden bg-gray-100 text-gray-800 dark:bg-gray-950 dark:text-gray-100">
+    <div className="fluent-app flex h-screen overflow-hidden">
+      <a className="fluent-skip-link" href="#workspace-main">{t('shell.skipToContent')}</a>
 
       {/* ── Sidebar ─────────────────────────────────────── */}
       <aside
-        style={{ width: sidebarWidth }}
-        className="flex shrink-0 flex-col border-r border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900"
+        style={{ width: compactNavigation ? 64 : sidebarWidth }}
+        data-compact={compactNavigation}
+        className="app-sidebar flex shrink-0 flex-col"
       >
-        {/* App title */}
-        <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3 dark:border-gray-800">
-          <div className="flex items-center gap-2.5">
-            <img src={logoUrl} alt={t('app.title')} className="h-7 w-7 rounded-xl" />
-            <div className="flex flex-col leading-tight">
-              <span className="text-sm font-semibold text-gray-900 dark:text-gray-100">{t('app.title')}</span>
-            </div>
-          </div>
-          <div className="flex items-center gap-0.5">
-            <LanguageSwitcher />
-            <button
-              onClick={toggleTheme}
-              className="rounded-md p-1.5 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300"
-              title={theme === 'dark' ? t('app.switchToLight') : t('app.switchToDark')}
-            >
-              {theme === 'dark' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-            </button>
-          </div>
+        <div className="app-brand">
+          <img src={logoUrl} alt={t('app.title')} className="app-brand-logo" />
+          <div className="app-brand-copy"><p className="app-brand-name">Vibe Assistant</p><p className="app-brand-caption">{t('shell.workspace')}</p></div>
+          <button type="button" onClick={() => setCompactNavigation(value => !value)} className="app-icon-button" title={t(compactNavigation ? 'shell.expandNavigation' : 'shell.collapseNavigation')} aria-label={t(compactNavigation ? 'shell.expandNavigation' : 'shell.collapseNavigation')} aria-expanded={!compactNavigation}>
+            {compactNavigation ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
+          </button>
         </div>
-
-        {/* Nav */}
-        {/* 智能体页要留出下面的列表区，所以给导航限高；其他页让导航撑满，
-            否则导航和页脚之间会空出一整块。 */}
-        <nav className={`flex min-h-0 shrink flex-col gap-0.5 overflow-y-auto p-2 ${
-          page === 'agents'
-            ? 'max-h-[45%] border-b border-gray-200 dark:border-gray-800'
-            : 'flex-1'
-        }`}>
-          <SidebarNavItem
-            icon={<Bot className="h-4 w-4" />}
-            label={t('nav.agents')}
-            active={page === 'agents'}
-            onClick={() => setPage('agents')}
-          />
-
+        <button type="button" className="app-search-button" onClick={() => setNavigationOpen(true)} aria-label={t('shell.searchPages')} title={t('shell.searchPages')}><Search size={15} /><span>{t('shell.searchPages')}</span><kbd>Ctrl K</kbd></button>
+        <nav className="app-navigation" aria-label={t('shell.primaryNavigation')}>
           <SidebarNavGroup
             icon={<Brain className="h-4 w-4" />}
             label={t('nav.memory')}
@@ -324,9 +185,11 @@ export default function App() {
           >
             {([
               { id: 'memory' as NavPage, label: t('nav.memoryOverview'), onClick: openMemory },
+              { id: 'memory-capture' as NavPage, label: t('nav.memoryCapture'), onClick: openMemoryCapture },
+              { id: 'memory-injection' as NavPage, label: t('nav.memoryInjection'), onClick: openMemoryInjection },
               { id: 'pending-memories' as NavPage, label: t('nav.memoryPending'), onClick: openPendingMemories },
               { id: 'organized-conversations' as NavPage, label: t('nav.memoryOrganized'), onClick: openOrganizedConversations },
-              { id: 'memory-injection' as NavPage, label: t('nav.memoryInjection'), onClick: openMemoryInjection },
+              { id: 'memory-help' as NavPage, label: t('nav.memoryHelp'), onClick: openMemoryHelp },
             ]).map(sub => (
               <SidebarNavItem
                 key={sub.id}
@@ -360,12 +223,21 @@ export default function App() {
             ))}
           </SidebarNavGroup>
 
-          <SidebarNavItem
+          <SidebarNavGroup
             icon={<Plug className="h-4 w-4" />}
             label={t('nav.mcpLibrary')}
-            active={page === 'mcp-library'}
-            onClick={() => setPage('mcp-library')}
-          />
+            active={MCP_PAGES.includes(page as typeof MCP_PAGES[number])}
+            expanded={expandedGroups.has('mcp')}
+            onToggle={() => toggleNavGroup('mcp', MCP_PAGES, 'mcp-library')}
+          >
+            {([
+              { id: 'mcp-library' as NavPage, label: t('nav.mcpServices') },
+              { id: 'mcp-tools' as NavPage, label: t('nav.mcpTools') },
+              { id: 'mcp-calls' as NavPage, label: t('nav.mcpCalls') },
+              { id: 'mcp-errors' as NavPage, label: t('nav.mcpErrors') },
+              { id: 'mcp-help' as NavPage, label: t('nav.mcpHelp') },
+            ]).map(sub => <SidebarNavItem key={sub.id} label={sub.label} active={page === sub.id} onClick={() => setPage(sub.id)} indent />)}
+          </SidebarNavGroup>
 
           <SidebarNavItem
             icon={<BarChart3 className="h-4 w-4" />}
@@ -374,92 +246,64 @@ export default function App() {
             onClick={openUsage}
           />
 
+
           {/* 分隔线：以上为主功能，以下为工具 */}
           <div className="my-1 border-t border-gray-200 dark:border-gray-700" />
 
-          {/* 工具区 */}
-          {([
-            { id: 'ports' as NavPage,    icon: <Network className="h-4 w-4" />,   label: t('nav.ports') },
-            { id: 'network' as NavPage,  icon: <Gauge className="h-4 w-4" />,     label: t('nav.network') },
-            { id: 'env-vars' as NavPage, icon: <Variable className="h-4 w-4" />,  label: t('nav.envVars') },
-            { id: 'proxy' as NavPage,    icon: <Shield className="h-4 w-4" />,    label: t('nav.proxy') },
-            { id: 'settings' as NavPage, icon: <Settings2 className="h-4 w-4" />, label: t('nav.settings') },
-          ]).map(nav => (
-            <SidebarNavItem
-              key={nav.id}
-              icon={nav.icon}
-              label={nav.label}
-              active={page === nav.id}
-              onClick={() => setPage(nav.id)}
-            />
-          ))}
+          <SidebarNavGroup
+            icon={<Wrench className="h-4 w-4" />}
+            label={t('nav.toolbox')}
+            active={TOOL_PAGES.includes(page as typeof TOOL_PAGES[number])}
+            expanded={expandedGroups.has('toolbox')}
+            onToggle={() => toggleNavGroup('toolbox', TOOL_PAGES, 'ports')}
+          >
+            {([
+              { id: 'ports' as NavPage, label: t('nav.ports') },
+              { id: 'network' as NavPage, label: t('nav.network') },
+              { id: 'env-vars' as NavPage, label: t('nav.envVars') },
+            ]).map(sub => <SidebarNavItem key={sub.id} label={sub.label} active={page === sub.id} onClick={() => setPage(sub.id)} indent />)}
+          </SidebarNavGroup>
+          <SidebarNavGroup
+            icon={<Settings2 className="h-4 w-4" />}
+            label={t('nav.settings')}
+            active={SETTINGS_PAGES.includes(page as typeof SETTINGS_PAGES[number]) || page === 'settings'}
+            expanded={expandedGroups.has('settings')}
+            onToggle={() => toggleNavGroup('settings', SETTINGS_PAGES, 'settings-general')}
+          >
+            {([
+              { id: 'settings-general' as NavPage, label: t('nav.settingsGeneral'), onClick: openSettingsGeneral },
+              { id: 'settings-llm' as NavPage, label: t('nav.settingsLlm'), onClick: openSettingsLlm },
+              { id: 'settings-memory' as NavPage, label: t('nav.settingsMemory'), onClick: openSettingsMemory },
+              { id: 'settings-cloud' as NavPage, label: t('nav.settingsCloud'), onClick: openSettingsCloud },
+            ]).map(sub => (
+              <SidebarNavItem key={sub.id} label={sub.label} active={page === sub.id} onClick={sub.onClick} indent />
+            ))}
+          </SidebarNavGroup>
         </nav>
 
-        {/* Agent list */}
-        {page === 'agents' && <>
-          <div className="flex items-center justify-between px-4 py-2">
-            <p className="text-[11px] font-medium uppercase tracking-wide text-gray-400">{t('app.configured', { count: agents.length })}</p>
-            <div className="flex gap-1">
-              <button onClick={openNew} className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300" title={t('common.add')}>
-                <Plus className="h-3.5 w-3.5" />
-              </button>
-              <button onClick={fetchAgents} disabled={loading} className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300 disabled:opacity-40">
-                <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
-              </button>
-            </div>
+        <div className="app-sidebar-footer">
+          <div className="app-sidebar-footer-meta"><span>v1.1.0</span><a href="https://www.zaferliu.me" target="_blank" rel="noreferrer">@ZaferLiu</a>
+            <div className="app-sidebar-footer-controls"><LanguageSwitcher /><button type="button" onClick={toggleTheme} className="app-icon-button" title={theme === 'dark' ? t('app.switchToLight') : t('app.switchToDark')} aria-label={theme === 'dark' ? t('app.switchToLight') : t('app.switchToDark')}>{theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}</button></div>
           </div>
-          <div className="flex-1 overflow-y-auto">
-            <AgentList
-              agents={agents}
-              selectedId={selectedId}
-              onSelect={selectAgent}
-              onStart={handleStart}
-              onStop={handleStop}
-              onDelete={deleteAgent}
-              onConfigure={openEdit}
-              onReorder={reorderAgents}
-            />
-          </div>
-          <div className="border-t border-gray-200 p-3 dark:border-gray-800">
-            <button onClick={openNew} className="flex w-full items-center justify-center gap-2 rounded-xl bg-blue-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-500">
-              <Plus className="h-4 w-4" /> {t('app.newAgent')}
-            </button>
-          </div>
-        </>}
-
-        {/* Footer: version + update check */}
-        <div className="space-y-2 border-t border-gray-200 px-4 py-3 dark:border-gray-800">
-          <div className="flex items-center justify-center gap-1 text-xs font-bold text-gray-500 dark:text-gray-400">
-            <span>v1.0.0</span>
-            <span>·</span>
-            <a
-              href="https://www.zaferliu.me"
-              target="_blank"
-              rel="noreferrer"
-              className="hover:text-gray-700 dark:hover:text-gray-200"
-            >
-              @ZaferLiu
-            </a>
-          </div>
-          <div className="flex justify-center">
-            <UpdateChecker sidebar autoCheck />
-          </div>
+          <div className="app-sidebar-footer-update"><UpdateChecker sidebar autoCheck /></div>
         </div>
         </aside>
 
       {/* ── Col-resize handle ──────────────────────────── */}
       <div
         onMouseDown={onColMouseDown}
-        className="drag-col"
+        className={`drag-col ${compactNavigation ? 'hidden' : ''}`}
       />
 
       {/* ── Main panel ─────────────────────────────────── */}
-      <main className="flex flex-1 flex-col overflow-hidden bg-gray-50 dark:bg-gray-950">
+      <main id="workspace-main" tabIndex={-1} className="app-content">
+        <div className="app-contextbar"><Home size={14} aria-hidden="true" /><span>{currentDestination.group}</span>{currentDestination.group !== currentDestination.label && <><ChevronRight size={12} aria-hidden="true" /><span className="app-contextbar-current">{currentDestination.label}</span></>}<button type="button" onClick={() => setNavigationOpen(true)} className="app-contextbar-search" aria-label={t('shell.searchPages')}><Search size={13} /><span>Ctrl K</span></button></div>
+        <div className="app-page-host" data-page={page} ref={pageHost}>
 
         {keptPages.has('memory') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'memory' ? '' : 'hidden'}`}>
             <ErrorBoundary>
-              <MemoryCenter onOpenUsage={openUsage} onOpenPending={openPendingMemories} onOpenOrganized={openOrganizedConversations} onOpenInjection={openMemoryInjection} active={page === 'memory' && documentVisible} />
+              <MemoryCenter onOpenUsage={openUsage} onOpenPending={openPendingMemories} onOpenOrganized={openOrganizedConversations} onOpenCapture={openMemoryCapture} onOpenInjection={openMemoryInjection} active={page === 'memory' && documentVisible} />
             </ErrorBoundary>
           </div>
         )}
@@ -487,7 +331,21 @@ export default function App() {
         {keptPages.has('memory-injection') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'memory-injection' ? '' : 'hidden'}`}>
             <ErrorBoundary>
-              <MemoryInjection onBack={openMemory} active={page === 'memory-injection' && documentVisible} />
+              <MemoryInjection onBack={openMemory} onOpenCapture={openMemoryCapture} active={page === 'memory-injection' && documentVisible} />
+            </ErrorBoundary>
+          </div>
+        )}
+        {keptPages.has('memory-capture') && (
+          <div className={`flex flex-1 flex-col overflow-hidden ${page === 'memory-capture' ? '' : 'hidden'}`}>
+            <ErrorBoundary>
+              <MemoryCapture onBack={openMemory} onOpenInjection={openMemoryInjection} active={page === 'memory-capture' && documentVisible} />
+            </ErrorBoundary>
+          </div>
+        )}
+        {keptPages.has('memory-help') && (
+          <div className={`flex flex-1 flex-col overflow-hidden ${page === 'memory-help' ? '' : 'hidden'}`}>
+            <ErrorBoundary>
+              <MemoryHelp onBack={openMemory} />
             </ErrorBoundary>
           </div>
         )}
@@ -517,13 +375,17 @@ export default function App() {
           </div>
         )}
         {keptPages.has('mcp-library') && (
-          <div className={`flex flex-1 flex-col overflow-hidden ${page === 'mcp-library' ? '' : 'hidden'}`}>
+          <div className={`flex flex-1 flex-col overflow-hidden ${MCP_PAGES.includes(page as typeof MCP_PAGES[number]) ? '' : 'hidden'}`}>
             <ErrorBoundary>
-              <McpLibrary active={page === 'mcp-library' && documentVisible} />
+              <McpLibrary
+                active={MCP_PAGES.includes(page as typeof MCP_PAGES[number]) && documentVisible}
+                section={page === 'mcp-tools' ? 'tools' : page === 'mcp-calls' ? 'calls' : page === 'mcp-errors' ? 'errors' : page === 'mcp-help' ? 'help' : 'services'}
+                onSectionChange={section => setPage({ services: 'mcp-library', tools: 'mcp-tools', calls: 'mcp-calls', errors: 'mcp-errors', help: 'mcp-help' }[section] as NavPage)}
+              />
             </ErrorBoundary>
           </div>
         )}
-        {page === 'ports' && <PortManager agents={agents} />}
+        {page === 'ports' && <PortManager />}
         {page === 'network' && (
           <ErrorBoundary>
             <NetworkManager />
@@ -534,192 +396,21 @@ export default function App() {
             <EnvManager />
           </ErrorBoundary>
         )}
-        {page === 'proxy' && <ProxyManager agents={agents} />}
-        {page === 'settings' && !showOnboarding && (
+        {(SETTINGS_PAGES.includes(page as typeof SETTINGS_PAGES[number]) || page === 'settings') && !showOnboarding && (
           <ErrorBoundary>
-            <Settings onOpenOnboarding={() => setShowOnboarding(true)} />
+            <Settings
+              section={page === 'settings' ? 'general' : page === 'settings-llm' ? 'llm' : page === 'settings-memory' ? 'memory' : page === 'settings-cloud' ? 'cloud' : 'general'}
+              onOpenOnboarding={() => setShowOnboarding(true)}
+            />
           </ErrorBoundary>
         )}
-
-        {/* Keep the workspace mounted so terminals and iframe state survive navigation. */}
-        <div className={`flex flex-1 flex-col overflow-hidden ${page === 'agents' ? '' : 'hidden'}`}>
-
-            {agentError && (
-              <div role="alert" className="shrink-0 border-b border-red-200 bg-red-50 px-5 py-3 text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
-                <div className="flex items-start justify-between gap-3">
-                  <p className="text-sm font-medium">{t('recovery.agentFailed', { name: agentError.agent.config.name })}</p>
-                  <button type="button" onClick={() => setAgentError(null)} aria-label={t('common.close')} className="rounded p-1 focus-visible:ring-2 focus-visible:ring-blue-500"><X size={14} /></button>
-                </div>
-                <p className="mt-1 max-h-24 overflow-auto break-words text-xs">{agentError.message}</p>
-                <ErrorRecovery error={agentError.message} onRetry={agentError.retry} onConfigure={() => openEdit(agentError.agent)} />
-              </div>
-            )}
-
-            {/* ── Tab bar ── */}
-            {openTabs.length > 0 && (
-              <div className="flex items-center gap-0.5 border-b border-gray-200 bg-white px-2 pt-1.5 shrink-0 dark:border-gray-800 dark:bg-gray-900">
-                {openTabs.map(tab => {
-                  const isActive = selectedId === tab.agentId
-                  return (
-                    <button
-                      key={`${tab.agentId}-${tab.kind}`}
-                      onClick={() => { selectAgent(tab.agentId); setActiveTabKey(`${tab.agentId}:${tab.kind}`); }}
-                      className={`group flex items-center gap-1.5 rounded-t-md border border-b-0 px-3 py-1.5 text-xs font-medium transition-colors ${
-                        isActive && activeTab?.kind === tab.kind
-                          ? tab.kind === 'terminal'
-                            ? 'border-gray-200 bg-gray-50 text-green-600 dark:border-gray-700 dark:bg-gray-950 dark:text-green-400'
-                            : 'border-gray-200 bg-gray-50 text-blue-600 dark:border-gray-700 dark:bg-gray-950 dark:text-blue-400'
-                          : 'border-transparent text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:text-gray-500 dark:hover:bg-gray-800 dark:hover:text-gray-300'
-                      }`}
-                    >
-                      {tab.kind === 'terminal'
-                        ? <TerminalSquare className="h-3 w-3 shrink-0" />
-                        : <Globe className="h-3 w-3 shrink-0" />
-                      }
-                      <span className="max-w-[100px] truncate">{tab.label}</span>
-                      <span className="ml-0.5 text-[10px] text-gray-400 dark:text-gray-600">
-                        {tab.kind === 'terminal' ? t('app.term') : `${tab.port}`}
-                      </span>
-                      <span
-                        onClick={e => closeTab(tab, e)}
-                        className="ml-1 rounded p-0.5 opacity-0 hover:bg-gray-200 hover:text-red-500 group-hover:opacity-100 dark:hover:bg-gray-700 dark:hover:text-red-400"
-                      >
-                        <X className="h-3 w-3" />
-                      </span>
-                    </button>
-                  )
-                })}
-              </div>
-            )}
-
-            {/* ── Active terminal or embedded browser panel ── */}
-            {showPanel && activeTab && (
-              <div
-                style={panelFullscreen ? undefined : { height: panelHeight }}
-                className={`shrink-0 flex flex-col ${panelFullscreen ? 'flex-1' : ''}`}
-              >
-                {/* Panel toolbar */}
-                <div className="flex items-center gap-2 border-b border-gray-200 bg-white px-3 py-1 shrink-0 dark:border-gray-800 dark:bg-gray-900">
-                  {activeTab.kind === 'terminal'
-                    ? <TerminalSquare className="h-3.5 w-3.5 shrink-0 text-green-500" />
-                    : <Globe className="h-3.5 w-3.5 shrink-0 text-blue-500 dark:text-blue-400" />
-                  }
-                  <span className="flex-1 font-mono text-xs text-gray-500 dark:text-gray-400">
-                    {activeTab.kind === 'terminal'
-                      ? `${activeTab.command} ${(activeTab.args ?? []).join(' ')}`
-                      : `http://127.0.0.1:${activeTab.port}`
-                    }
-                  </span>
-                  {activeTab.kind === 'terminal' && (
-                    <button
-                      onClick={clearActiveTerminal}
-                      className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-700 dark:hover:text-gray-300"
-                      title={t('common.clear')}
-                    >
-                      <Eraser className="h-3.5 w-3.5" />
-                    </button>
-                  )}
-                  <button
-                    onClick={togglePanelFullscreen}
-                    className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-700 dark:hover:text-gray-300"
-                    title={activeTab.kind === 'terminal' && panelFullscreen ? t('common.restore') : t('common.fullscreen')}
-                  >
-                    {activeTab.kind === 'terminal' && panelFullscreen
-                      ? <Minimize2 className="h-3.5 w-3.5" />
-                      : <Maximize2 className="h-3.5 w-3.5" />
-                    }
-                  </button>
-                  <button
-                    onClick={e => closeTab(activeTab, e)}
-                    className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-red-500 dark:hover:bg-gray-700 dark:hover:text-red-400"
-                    title={t('common.close')}
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-
-                {/* Panel content */}
-                <div className="flex-1 overflow-hidden">
-                  {openTabs.map(tab => {
-                    const tabKey = `${tab.agentId}:${tab.kind}`
-                    const isActive = tabKey === resolvedActiveTabKey
-                    return (
-                      <div
-                        key={tabKey}
-                        className={`h-full w-full ${isActive ? '' : 'hidden'}`}
-                      >
-                        {tab.kind === 'terminal' ? (
-                          <TerminalPanel
-                            id={tab.agentId}
-                            command={tab.command!}
-                            args={tab.args ?? []}
-                            cwd={tab.cwd ?? ''}
-                            env={tab.env ?? {}}
-                            active={isActive && page === 'agents'}
-                            clearVersion={terminalClearVersions[tab.agentId] ?? 0}
-                          />
-                        ) : (
-                          <NativeWebviewPanel
-                            tab={tab}
-                            active={isActive && page === 'agents' && !showForm && !showOnboarding}
-                          />
-                        )}
-                      </div>
-                    )
-                  })}
-                </div>
-              </div>
-            )}
-
-            {/* ── Row-resize handle ── */}
-            {showSplit && (
-              <div
-                onMouseDown={onRowMouseDown}
-                className="drag-row"
-              />
-            )}
-
-            {/* ── Agent detail ── */}
-            {!panelFullscreen && (
-              <div className="flex-1 overflow-hidden">
-                {selectedAgent ? (
-                  <AgentDetail
-                    agent={selectedAgent}
-                    logs={agentLogs}
-                    onConfigure={() => openEdit(selectedAgent)}
-                    onStart={handleStart}
-                    onStop={handleStop}
-                    onOpenUI={openAgentUI}
-                    onOpenTerminal={openAgentTerminal}
-                    uiIsOpen={uiIsOpen}
-                    termIsOpen={termIsOpen}
-                  />
-                ) : (
-                  <div className="flex h-full flex-col items-center justify-center gap-3">
-                    <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-gray-100 dark:bg-gray-800">
-                      <img src={logoUrl} alt="" className="h-10 w-10 opacity-40" />
-                    </div>
-                    <p className="text-sm text-gray-400 dark:text-gray-500">{t('app.selectAgentHint')}</p>
-                    <button onClick={openNew} className="text-sm text-blue-500 hover:text-blue-400 dark:text-blue-400 dark:hover:text-blue-300">
-                      {t('app.createFirstAgent')}
-                    </button>
-                  </div>
-                )}
-              </div>
-            )}
 
         </div>
       </main>
 
-      {showForm && (
-        <AgentForm
-          initial={editingAgent?.config}
-          onSave={saveAgent}
-          onClose={() => setShowForm(false)}
-        />
-      )}
-
-      {showOnboarding && <Onboarding onFinish={() => setShowOnboarding(false)} />}
+      <NavigationSearch destinations={destinations} onNavigate={id => setPage(id as NavPage)} open={navigationOpen} onClose={() => setNavigationOpen(false)} />
+      {showOnboarding && <Onboarding onFinish={() => setShowOnboarding(false)} onNavigate={setPage} />}
+      <CloseBehaviorDialog />
     </div>
     </RecoveryNavigationContext.Provider>
   )
@@ -738,6 +429,8 @@ function SidebarNavItem({
   onClick,
   indent = false,
   trailing,
+  expanded,
+  controls,
 }: {
   icon?: ReactNode
   label: string
@@ -747,31 +440,14 @@ function SidebarNavItem({
   indent?: boolean
   /** 右侧附加内容，如展开箭头。 */
   trailing?: ReactNode
+  expanded?: boolean
+  controls?: string
 }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-current={active ? 'page' : undefined}
-      className={`relative flex w-full items-center gap-2.5 rounded-lg text-left font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
-        indent ? 'py-1.5 pl-3 pr-3 text-[13px]' : 'px-3 py-2 text-sm'
-      } ${
-        active
-          ? 'bg-blue-50 text-blue-600 dark:bg-blue-600/20 dark:text-blue-400'
-          : 'text-gray-500 hover:bg-gray-100 hover:text-gray-800 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200'
-      }`}
-    >
-      {active && (
-        <span
-          className="absolute left-0 top-1/2 h-4 w-[3px] -translate-y-1/2 rounded-r-full bg-blue-500 dark:bg-blue-400"
-          aria-hidden
-        />
-      )}
-      {icon}
-      <span className="truncate">{label}</span>
-      {trailing && <span className="ml-auto flex items-center">{trailing}</span>}
-    </button>
-  )
+  return <button type="button" onClick={onClick} title={label} aria-current={active && expanded === undefined ? 'page' : undefined} aria-expanded={expanded} aria-controls={controls} data-active={active && expanded === undefined} data-current-group={active && expanded !== undefined} data-indent={indent} className="app-nav-item">
+    {active && expanded === undefined && <span className="app-nav-indicator" aria-hidden="true" />}
+    {icon}<span className="app-nav-label truncate">{label}</span>
+    {trailing && <span className="app-nav-trailing">{trailing}</span>}
+  </button>
 }
 
 /** 可折叠的导航分组：展开箭头与子项的缩进竖线由这里统一给出。 */
@@ -790,24 +466,9 @@ function SidebarNavGroup({
   onToggle: () => void
   children: ReactNode
 }) {
-  return (
-    <div className="flex flex-col gap-0.5">
-      <SidebarNavItem
-        icon={icon}
-        label={label}
-        active={active}
-        onClick={onToggle}
-        trailing={
-          expanded
-            ? <ChevronDown className="h-3.5 w-3.5 opacity-50" />
-            : <ChevronRight className="h-3.5 w-3.5 opacity-50" />
-        }
-      />
-      {expanded && (
-        <div className="ml-[22px] flex flex-col gap-0.5 border-l border-gray-200 pl-1 dark:border-gray-800">
-          {children}
-        </div>
-      )}
-    </div>
-  )
+  const groupId = useId()
+  return <div className="app-nav-group">
+    <SidebarNavItem icon={icon} label={label} active={active} expanded={expanded} controls={groupId} onClick={onToggle} trailing={<ChevronRight className={`h-3 w-3 transition-transform motion-reduce:transition-none ${expanded ? 'rotate-90' : ''}`} />} />
+    <div id={groupId} className="app-nav-disclosure" data-expanded={expanded} aria-hidden={!expanded} inert={!expanded}><div>{children}</div></div>
+  </div>
 }

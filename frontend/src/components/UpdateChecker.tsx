@@ -101,7 +101,7 @@ export function UpdateChecker({ autoCheck = false, compact = false, sidebar = fa
           </button>
         )}
         {state === 'done' && info && !info.has_update && (
-          <p className="text-xs font-bold text-gray-400 dark:text-gray-500">{t('updater.alreadyLatest')}</p>
+          <p className="text-xs font-bold text-gray-500 dark:text-gray-400">{t('updater.alreadyLatest')}</p>
         )}
         {state === 'error' && error && (
           <p className="text-xs font-bold text-red-500 dark:text-red-400">{error}</p>
@@ -123,8 +123,8 @@ export function UpdateChecker({ autoCheck = false, compact = false, sidebar = fa
           <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
             {t('updater.title')}
           </p>
-          <p className="text-xs text-gray-400 dark:text-gray-500 font-mono">
-            {t('updater.currentVersion', { version: '1.0.0' })}
+          <p className="text-xs text-gray-500 dark:text-gray-400 font-mono">
+            {t('updater.currentVersion', { version: '1.1.0' })}
           </p>
         </div>
 

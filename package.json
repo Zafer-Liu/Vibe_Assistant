@@ -1,18 +1,20 @@
 {
   "name": "agent-manager",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "private": true,
   "scripts": {
-    "dev": "tauri dev",
-    "build": "tauri build",
+    "dev": "node tools/prepare-dev.mjs && node tools/build-mcp-launcher.mjs && tauri dev",
+    "build": "node tools/build-mcp-launcher.mjs --release && tauri build",
     "tauri": "tauri",
     "frontend:dev": "npm --prefix frontend run dev",
     "frontend:build": "npm --prefix frontend run build",
     "frontend:check": "npm --prefix frontend run check",
-    "rust:check": "cargo check --manifest-path src-tauri/Cargo.toml",
-    "rust:test": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "rust:check": "node tools/build-mcp-launcher.mjs && cargo check --manifest-path src-tauri/Cargo.toml",
+    "rust:test": "node tools/build-mcp-launcher.mjs && cargo test --manifest-path src-tauri/Cargo.toml",
     "lint": "npm --prefix frontend run lint",
-    "test": "npm run frontend:check && npm run rust:test",
+    "test:mcp": "node --test tools/test-mcp-configuration.mjs",
+    "test:dev": "node --test tools/test-prepare-dev.mjs",
+    "test": "npm run test:dev && npm run test:mcp && npm run frontend:check && npm run rust:test",
     "ci": "npm test"
   },
   "devDependencies": {

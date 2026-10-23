@@ -1,119 +1,21 @@
-//! Agent HTTP 双向通信 + 工作流引擎对接
-//!
-//! HTTP server 在 9420 端口暴露：
-//! - POST /agent/dispatch   → 给子 Agent 发任务（支持两种模式：直接转发 / 触发工作流）
-//! - POST /agent/submit     → 接收子 Agent 提交的结果（更新 StepInstance，推进工作流）
-//! - GET  /agent/tasks      → 查看待处理任务
-//! - GET  /agent/results    → 查看已接收结果
-//! - GET  /runs             → 列出工作流 Run 摘要
-//! - GET  /runs/:id         → 获取 Run 详情
-//! - POST /runs/:id/approve → 通过验收
-//! - POST /runs/:id/reject  → 驳回返工
-//! - GET  /health           → 健康检查
+//! Local memory context, capture hooks and usage telemetry API.
+//! The legacy module name is retained for installed hook URLs; task dispatch is removed.
 
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 // ── HTTP server 固定配置 ─────────────────────────────────────────────────────
 
 /// Agent HTTP server 固定监听端口（记忆沉淀、遥测、agent 回调等共用）
 pub const AGENT_HTTP_PORT: u16 = 9420;
 
-// ── 数据模型 ─────────────────────────────────────────────────────────────────
-
-/// 给子 Agent 的任务
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentTask {
-    pub task_id: String,
-    pub agent_id: String,
-    /// 子 Agent 的 HTTP 端点 URL（例如 http://localhost:8501/task）
-    pub agent_url: String,
-    /// 任务描述
-    pub task: String,
-    /// 上下文（上游输出等）
-    #[serde(default)]
-    pub context: Value,
-    /// 回调 URL（子 Agent 完成后 POST 到这里）
-    pub callback_url: String,
-    /// 创建时间
-    pub created_at: i64,
-    /// 状态：dispatched / submitted / timeout / dispatch_failed
-    pub status: String,
-    /// 子 Agent 提交的结果
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
-    /// 工作流关联：如果此任务由工作流 agent_task 节点触发，记录 run_id + step_id
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub step_id: Option<String>,
-}
-
-/// 子 Agent 提交的结果
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentResult {
-    pub task_id: String,
-    pub agent_id: String,
-    /// 结果内容
-    pub result: Value,
-    /// 裁定：pass / fail / blocked
-    #[serde(default = "default_verdict")]
-    pub verdict: String,
-    /// 说明
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
-    /// 提交时间
-    pub submitted_at: i64,
-}
-
-fn default_verdict() -> String {
-    "pass".to_string()
-}
-
-// ── 内存存储（spike 用，不落盘）──────────────────────────────────────────────
-//
-// 用全局 OnceLock<Arc<AgentHttpStore>> 让 HTTP server 和 Tauri 命令共享同一份 store，
-// 不走 Tauri State（避免 setup 钩子里的生命周期问题）。
-
-use std::sync::OnceLock;
-
-static HTTP_STORE: OnceLock<Arc<AgentHttpStore>> = OnceLock::new();
-
-pub struct AgentHttpStore {
-    /// task_id → AgentTask
-    pub tasks: Mutex<HashMap<String, AgentTask>>,
-    /// task_id → AgentResult
-    pub results: Mutex<HashMap<String, AgentResult>>,
-}
-
-/// 获取全局 store（HTTP server 和 Tauri 命令共用）
-pub fn get_store() -> Arc<AgentHttpStore> {
-    Arc::clone(HTTP_STORE.get().expect("AgentHttpStore not initialized"))
-}
-
-/// 初始化全局 store（在 Tauri setup 钩子里调用一次）
-pub fn init_store() -> Arc<AgentHttpStore> {
-    HTTP_STORE
-        .get_or_init(|| Arc::new(AgentHttpStore::new()))
-        .clone()
-}
-
+// The server no longer owns agent task or execution state.
+#[derive(Default)]
+pub struct AgentHttpStore;
 impl AgentHttpStore {
-    pub fn new() -> Self {
-        AgentHttpStore {
-            tasks: Mutex::new(HashMap::new()),
-            results: Mutex::new(HashMap::new()),
-        }
-    }
+    pub fn new() -> Self { Self }
 }
-
-impl Default for AgentHttpStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub fn init_store() -> Arc<AgentHttpStore> { Arc::new(AgentHttpStore::new()) }
 
 // ── HTTP Server（极简手写，不引入框架）──────────────────────────────────────
 
@@ -192,7 +94,14 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, store: Arc<AgentHt
     };
 
     // 路由
-    let (status, response) = route(method, path, body, &store).await;
+    let (status, response, hook_audit) = if matches!(method, "GET" | "POST")
+        && path.starts_with("/memory/context")
+    {
+        prepare_hook_context(path, body)
+    } else {
+        let (status, response) = route(method, path, body, &store).await;
+        (status, response, None)
+    };
 
     let http_response = format!(
         "HTTP/1.1 {}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: {}\r\n\r\n{}",
@@ -201,8 +110,84 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, store: Arc<AgentHt
         response
     );
 
-    let _ = stream.write_all(http_response.as_bytes()).await;
-    let _ = stream.flush().await;
+    if stream.write_all(http_response.as_bytes()).await.is_ok() && stream.flush().await.is_ok() {
+        if let Some(audit) = hook_audit {
+            if let Some(ledger) = crate::telemetry_store::shared_store() {
+                let _ = ledger.try_record_hook_injection(
+                    crate::agent_sources::agent_label(&audit.source),
+                    audit.tool_name,
+                    &audit.summary,
+                    audit.detail.as_deref(),
+                );
+            }
+            if audit.commit_gate {
+                crate::memory_mcp::hook_commit_prompt_fingerprint(
+                    &audit.source, audit.session_id.as_deref(), &audit.fingerprint,
+                );
+            }
+        }
+    }
+}
+
+struct HookAudit {
+    source: String,
+    session_id: Option<String>,
+    tool_name: &'static str,
+    summary: String,
+    detail: Option<String>,
+    fingerprint: String,
+    commit_gate: bool,
+}
+
+fn prepare_hook_context(path: &str, body: &str) -> (&'static str, String, Option<HookAudit>) {
+    let query = path.split_once('?').map(|(_, query)| query).unwrap_or("");
+    let source = query.split('&').find_map(|part| part.strip_prefix("source="))
+        // dsh 的注入由 cordis pre-step 插件发起（记忆注入插件），采集走
+        // 本地转录扫描而非 Hook payload。
+        .filter(|source| matches!(*source, "claude" | "qoder" | "codex" | "workbuddy" | "dsh"))
+        .unwrap_or("unknown");
+    let event = query.split('&').find_map(|part| part.strip_prefix("event="))
+        .filter(|event| matches!(*event, "SessionStart" | "UserPromptSubmit"))
+        .unwrap_or("SessionStart");
+    let payload = serde_json::from_str::<Value>(body).ok();
+    let session_id = payload.as_ref().and_then(|value| value.get("session_id"))
+        .and_then(Value::as_str).filter(|id| !id.is_empty() && id.len() <= 256)
+        .map(str::to_owned);
+    // dsh 的对话沉淀由转录扫描负责，不把插件请求当 Hook 采集事件入账。
+    if event == "UserPromptSubmit" && payload.is_some() && source != "dsh" {
+        if let (Some(ingest), Some(backend)) = (
+            crate::memory_ingest::ingest_store(), crate::memory_backend::shared_backend(),
+        ) {
+            let _ = ingest.handle_hook(backend, body, source);
+        }
+    }
+    if event == "UserPromptSubmit" {
+        let injection = crate::memory_mcp::hook_prompt_context_gated(source, session_id.as_deref());
+        let (response, summary, detail, commit_gate) = match injection.context {
+            Some(context) => {
+                let summary = format!("每轮提问注入 L3 长期记忆（{} 字符，指纹 {}）",
+                    context.chars().count(), injection.fingerprint);
+                (hook_inject_body(source, event, context.clone()), summary, Some(context), true)
+            }
+            None => (String::new(), format!("跳过未变化的 L3 注入（指纹 {}）", injection.fingerprint), None, false),
+        };
+        return ("200 OK", response, Some(HookAudit {
+            source: source.into(), session_id, tool_name: "prompt_inject", summary,
+            detail, fingerprint: injection.fingerprint, commit_gate,
+        }));
+    }
+    let (context, fingerprint) = crate::memory_mcp::hook_session_start_context(source);
+    let summary = format!("会话启动注入 L3 长期记忆 + L2 工作记忆（{} 字符，指纹 {}）",
+        context.chars().count(), crate::memory_mcp::context_fingerprint(&context));
+    // 智管在线时顺带刷新 dsh 注入插件的离线快照，保持回退内容与实时一致。
+    if source == "dsh" && !context.trim().is_empty() {
+        let _ = crate::dsh_injection::refresh_snapshot(&context);
+    }
+    let response = hook_inject_body(source, event, context.clone());
+    ("200 OK", response, Some(HookAudit {
+        source: source.into(), session_id, tool_name: "session_start_inject", summary,
+        detail: Some(context), fingerprint, commit_gate: true,
+    }))
 }
 
 /// Read one HTTP/1.1 request without assuming that headers and body arrive in
@@ -270,7 +255,7 @@ async fn route(
     method: &str,
     path: &str,
     body: &str,
-    store: &Arc<AgentHttpStore>,
+    _store: &Arc<AgentHttpStore>,
 ) -> (&'static str, String) {
     // CORS preflight
     if method == "OPTIONS" {
@@ -282,172 +267,6 @@ async fn route(
             "200 OK",
             json!({"status": "ok", "service": "agent-manager-http"}).to_string(),
         ),
-
-        ("GET", "/agent/tasks") => {
-            let tasks = store.tasks.lock().unwrap();
-            let list: Vec<&AgentTask> = tasks.values().collect();
-            ("200 OK", serde_json::to_string(&list).unwrap_or_default())
-        }
-
-        ("GET", "/agent/results") => {
-            let results = store.results.lock().unwrap();
-            let list: Vec<&AgentResult> = results.values().collect();
-            ("200 OK", serde_json::to_string(&list).unwrap_or_default())
-        }
-
-        ("POST", p) if p == "/agent/dispatch" || p.starts_with("/agent/dispatch") => {
-            let task: AgentTask = match serde_json::from_str(body) {
-                Ok(t) => t,
-                Err(e) => {
-                    return (
-                        "400 Bad Request",
-                        json!({"error": format!("invalid body: {}", e)}).to_string(),
-                    );
-                }
-            };
-
-            // 存储任务
-            {
-                let mut tasks = store.tasks.lock().unwrap();
-                tasks.insert(task.task_id.clone(), task.clone());
-            }
-
-            // 异步发任务给子 Agent
-            let store2 = Arc::clone(store);
-            let task_clone = task.clone();
-            tokio::spawn(async move {
-                dispatch_to_agent(store2, task_clone).await;
-            });
-
-            (
-                "202 Accepted",
-                json!({
-                    "task_id": task.task_id,
-                    "status": "dispatched",
-                    "agent_url": task.agent_url,
-                })
-                .to_string(),
-            )
-        }
-
-        ("POST", p) if p == "/agent/submit" || p.starts_with("/agent/submit") => {
-            let result: AgentResult = match serde_json::from_str(body) {
-                Ok(r) => r,
-                Err(e) => {
-                    return (
-                        "400 Bad Request",
-                        json!({"error": format!("invalid body: {}", e)}).to_string(),
-                    );
-                }
-            };
-
-            // 存储结果
-            {
-                let mut results = store.results.lock().unwrap();
-                results.insert(result.task_id.clone(), result.clone());
-            }
-
-            // 更新任务状态
-            {
-                let mut tasks = store.tasks.lock().unwrap();
-                if let Some(task) = tasks.get_mut(&result.task_id) {
-                    task.status = "submitted".to_string();
-                    task.result = Some(result.result.clone());
-                }
-            }
-
-            eprintln!(
-                "[agent-http] submit task={} verdict={}",
-                result.task_id, result.verdict
-            );
-
-            (
-                "200 OK",
-                json!({
-                    "task_id": result.task_id,
-                    "status": "received",
-                    "verdict": result.verdict,
-                })
-                .to_string(),
-            )
-        }
-
-        // ── 记忆注入：SessionStart / UserPromptSubmit hook 拉取共享上下文 ──
-        // Claude 形态 harness（Qoder / Claude Code / WorkBuddy）只解析
-        // hookSpecificOutput.additionalContext 的结构化 JSON stdout，纯文本
-        // 会被当作 "no parsed output" 丢弃；端点直接返回协议格式，hook 命令
-        // 保持 curl 透传。不依赖 MCP instructions，也不需要 Agent 主动调用工具。
-        // SessionStart 注入完整稳定层（L3 长期记忆 + 手动长期条目 + L2 近
-        // 30 天工作记忆）；UserPromptSubmit 按内容指纹门控注入 L3——内容
-        // 未变化时返回空正文，本轮零注入成本，harness 按无附加上下文继续。
-        ("GET", p) if p == "/memory/context" || p.starts_with("/memory/context") => {
-            let query = p.split_once('?').map(|(_, query)| query).unwrap_or("");
-            let source = query
-                .split('&')
-                .find_map(|part| part.strip_prefix("source="))
-                .filter(|source| matches!(*source, "claude" | "qoder" | "codex" | "workbuddy"))
-                .unwrap_or("unknown");
-            let event = query
-                .split('&')
-                .find_map(|part| part.strip_prefix("event="))
-                .filter(|event| matches!(*event, "SessionStart" | "UserPromptSubmit"))
-                .unwrap_or("SessionStart");
-            // 与 MCP 调用同表审计：记忆注入摘要同时覆盖 Hook 启动注入、每轮
-            // 提问注入（含内容未变化时的跳过记录）与 MCP 检索，detail 保存
-            // 完整注入正文，面板可逐字回放；summary 里的指纹是渲染正文的短
-            // 哈希，可据此对比两次注入是否逐字节相同。
-            if event == "UserPromptSubmit" {
-                let injection = crate::memory_mcp::hook_prompt_context_gated(source);
-                match injection.context {
-                    Some(context) => {
-                        if let Some(store) = crate::telemetry_store::shared_store() {
-                            let _ = store.try_record_mcp_access(
-                                crate::agent_sources::agent_label(source),
-                                "prompt_inject",
-                                &format!(
-                                    "每轮提问注入 L3 长期记忆（{} 字符，指纹 {}）",
-                                    context.chars().count(),
-                                    injection.fingerprint
-                                ),
-                                Some(&context),
-                                true,
-                            );
-                        }
-                        ("200 OK", hook_inject_body(source, event, context))
-                    }
-                    None => {
-                        if let Some(store) = crate::telemetry_store::shared_store() {
-                            let _ = store.try_record_mcp_access(
-                                crate::agent_sources::agent_label(source),
-                                "prompt_inject",
-                                &format!("跳过未变化的 L3 注入（指纹 {}）", injection.fingerprint),
-                                None,
-                                true,
-                            );
-                        }
-                        // 空 stdout：harness 按无附加上下文继续，不阻塞提问。
-                        ("200 OK", String::new())
-                    }
-                }
-            } else {
-                let context = crate::memory_mcp::hook_session_start_context(source);
-                let fingerprint = crate::memory_mcp::context_fingerprint(&context);
-                if let Some(store) = crate::telemetry_store::shared_store() {
-                    let _ = store.try_record_mcp_access(
-                        crate::agent_sources::agent_label(source),
-                        "session_start_inject",
-                        &format!(
-                            "会话启动注入 L3 长期记忆 + L2 工作记忆（{} 字符，指纹 {}）",
-                            context.chars().count(),
-                            fingerprint
-                        ),
-                        Some(&context),
-                        true,
-                    );
-                }
-                ("200 OK", hook_inject_body(source, event, context))
-            }
-        }
 
         // ── 记忆沉淀 Agent Hook 回调 ──────────────────────────────────────
         ("POST", p) if p == "/memory/hook" || p.starts_with("/memory/hook") => {
@@ -522,6 +341,32 @@ async fn route(
             }
         }
 
+        // ── DSH 插件 MCP 观测上报 ────────────────────────────────────────
+        // The cordis plugin reports tool/call and tool/result pairs; status,
+        // failure classification and "result missing" semantics stay in the
+        // telemetry store so the plugin never decides what counts as lost.
+        ("POST", p) if p.starts_with("/mcp/observation") => {
+            let observation = match crate::dsh_observe::parse_observation(body) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    return ("400 Bad Request", json!({ "error": error }).to_string());
+                }
+            };
+            match crate::telemetry_store::shared_store() {
+                Some(store) => match crate::dsh_observe::record_observation(&store, &observation) {
+                    Ok(()) => (
+                        "202 Accepted",
+                        json!({ "status": "recorded", "phase": if matches!(observation.phase, crate::dsh_observe::DshObservationPhase::Start) { "start" } else { "end" } }).to_string(),
+                    ),
+                    Err(error) => ("500 Internal Server Error", json!({ "error": error }).to_string()),
+                },
+                None => (
+                    "503 Service Unavailable",
+                    json!({ "error": "telemetry store not ready" }).to_string(),
+                ),
+            }
+        }
+
         _ => (
             "404 Not Found",
             json!({"error": "not found", "path": path}).to_string(),
@@ -548,144 +393,20 @@ fn hook_inject_body(source: &str, event: &str, context: String) -> String {
     }
 }
 
-/// 给子 Agent 发任务（HTTP POST 到子 Agent 的端点）
-async fn dispatch_to_agent(store: Arc<AgentHttpStore>, task: AgentTask) {
-    eprintln!(
-        "[agent-http] dispatching task {} to agent {} at {}",
-        task.task_id, task.agent_id, task.agent_url
-    );
-
-    let payload = json!({
-        "task_id": task.task_id,
-        "agent_id": task.agent_id,
-        "task": task.task,
-        "context": task.context,
-        "callback_url": task.callback_url,
-    });
-
-    let result = reqwest::Client::new()
-        .post(&task.agent_url)
-        .json(&payload)
-        .timeout(std::time::Duration::from_secs(120))
-        .send()
-        .await;
-
-    match result {
-        Ok(resp) => {
-            eprintln!(
-                "[agent-http] agent {} accepted task {} (HTTP {})",
-                task.agent_id,
-                task.task_id,
-                resp.status()
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "[agent-http] failed to dispatch to agent {}: {}",
-                task.agent_id, e
-            );
-            // 更新任务状态为失败
-            let mut tasks = store.tasks.lock().unwrap();
-            if let Some(t) = tasks.get_mut(&task.task_id) {
-                t.status = "dispatch_failed".to_string();
-            }
-        }
-    }
-}
-
-// ── Tauri 命令（前端可调用，用于测试）────────────────────────────────────────
-//
-// 注意：不用 State<'_, AgentHttpStore>，改用全局 get_store()。
-// 因为 setup 钩子里 Tauri runtime 还没完全起来，manage() 注册的 State
-// 和 HTTP server 的 Arc<AgentHttpStore> 是两份独立数据，无法共享。
-// 全局 OnceLock 保证两者访问同一份 store。
-
-/// 手动给子 Agent 发任务（测试用）
-#[tauri::command]
-pub async fn dispatch_agent_task(
-    agent_id: String,
-    agent_url: String,
-    task: String,
-    context: Option<Value>,
-) -> Result<String, String> {
-    let store = get_store();
-    let task_id = uuid::Uuid::new_v4().to_string();
-    let callback_url = format!("http://localhost:{}/agent/submit", AGENT_HTTP_PORT);
-
-    let agent_task = AgentTask {
-        task_id: task_id.clone(),
-        agent_id,
-        agent_url,
-        task,
-        context: context.unwrap_or(json!({})),
-        callback_url,
-        created_at: chrono::Utc::now().timestamp_millis(),
-        status: "dispatched".to_string(),
-        result: None,
-        run_id: None,
-        step_id: None,
-    };
-
-    // 存储任务
-    {
-        let mut tasks = store.tasks.lock().unwrap();
-        tasks.insert(task_id.clone(), agent_task.clone());
-    }
-
-    // 同步发任务给子 Agent
-    let payload = json!({
-        "task_id": agent_task.task_id,
-        "agent_id": agent_task.agent_id,
-        "task": agent_task.task,
-        "context": agent_task.context,
-        "callback_url": agent_task.callback_url,
-    });
-
-    eprintln!(
-        "[agent-http] dispatching task {} to {}",
-        agent_task.task_id, agent_task.agent_url
-    );
-
-    match reqwest::Client::new()
-        .post(&agent_task.agent_url)
-        .json(&payload)
-        .timeout(std::time::Duration::from_secs(120))
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            eprintln!("[agent-http] agent accepted task (HTTP {})", resp.status());
-            Ok(task_id)
-        }
-        Err(e) => {
-            let mut tasks = store.tasks.lock().unwrap();
-            if let Some(t) = tasks.get_mut(&task_id) {
-                t.status = "dispatch_failed".to_string();
-            }
-            Err(format!("dispatch failed: {}", e))
-        }
-    }
-}
-
-/// 查看所有任务（测试用）
-#[tauri::command]
-pub fn list_agent_tasks() -> Vec<AgentTask> {
-    let store = get_store();
-    let tasks = store.tasks.lock().unwrap();
-    tasks.values().cloned().collect()
-}
-
-/// 查看所有结果（测试用）
-#[tauri::command]
-pub fn list_agent_results() -> Vec<AgentResult> {
-    let store = get_store();
-    let results = store.results.lock().unwrap();
-    results.values().cloned().collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::hook_inject_body;
+
+    #[tokio::test]
+    async fn removed_dispatch_and_task_routes_are_unavailable() {
+        let store = std::sync::Arc::new(super::AgentHttpStore::new());
+        for (method, path) in [("POST", "/agent/dispatch"), ("POST", "/agent/submit"), ("GET", "/agent/tasks"), ("GET", "/agent/results")] {
+            let (status, _) = super::route(method, path, "{}", &store).await;
+            assert_eq!(status, "404 Not Found", "{method} {path}");
+        }
+        assert_eq!(super::route("GET", "/health", "", &store).await.0, "200 OK");
+    }
+
 
     #[test]
     fn claude_shape_sources_get_structured_hook_envelope() {

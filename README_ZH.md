@@ -4,9 +4,9 @@
 
 # 智管-Vibe Assistant
 
-**一个窗口，管住本机所有 AI Agent —— 进程、记忆与网络。**
+**一个工作空间，管理记忆、Skill 与 MCP。**
 
-[![版本](https://img.shields.io/badge/版本-v1.0.2-blue.svg)](https://github.com/Zafer-Liu/Vibe_Assistant/releases)
+[![版本](https://img.shields.io/badge/版本-v1.1.0-blue.svg)](https://github.com/Zafer-Liu/Vibe_Assistant/releases)
 [![License](https://img.shields.io/badge/License-Apache%202.0-yellow.svg)](LICENSE)
 [![Stars](https://img.shields.io/github/stars/Zafer-Liu/Vibe_Assistant?style=flat-square)](https://github.com/Zafer-Liu/Vibe_Assistant/stargazers)
 [![CI](https://img.shields.io/github/actions/workflow/status/Zafer-Liu/Vibe_Assistant/ci.yml?style=flat-square&label=CI)](https://github.com/Zafer-Liu/Vibe_Assistant/actions)
@@ -40,79 +40,31 @@ English | **[简体中文](./README_ZH.md)**
 
 ## ✨ 项目亮点
 
-**智管-Vibe Assistant** 是一个基于 Tauri 2 + React 19 + Rust 的桌面应用，专门解决「本机跑了一堆 AI Agent，管理混乱」的问题。
+**智管-Vibe Assistant** 是基于 Tauri 2 + React 19 + Rust 的本地桌面工作空间，核心是三件事：
 
-核心理念：**所有 Agent，一个窗口管到底。**
+- **记忆管理**：采集与检索会话记忆，维护近 30 天工作记忆与长期 Profile，并向已接入客户端注入上下文。
+- **Skill 管理**：集中浏览、发布和部署技能，比较共享版本与本地修改，复用装备方案。
+- **MCP 管理**：集中维护服务与客户端配置，发现工具，查看调用统计和错误日志。
+- 辅助功能：Token 用量、端口、网络、环境变量、备份与云端记忆同步；支持中英文和明暗主题。
 
-<img src="./Images/diagram-architecture.png" alt="系统架构" width="100%" />
-
-- **一键启动与监控**——启动 / 停止、流式日志、内嵌 Web UI 标签页与交互式终端，不用开一堆终端、不用记启动命令
-- **一个共享大脑**——L0–L3 分层记忆：从每个编码 Agent 的会话中自动沉淀知识，蒸馏后自动注入回所有 Agent
-- **一键发布到公网**——Cloudflare Tunnel 临时链接开会演示，Caddy 反向代理长期托管
-- **趁手的系统工具箱**——端口管理、带测速的网络监控、用户 / 系统环境变量编辑器
-- **中英文完整界面**，实时切换
+本应用不再提供客户端进程启动、终端、内嵌 Web UI、协同任务或代理发布。Claude、Codex 等客户端仍通过原有接入配置使用记忆、Skill 与 MCP。已有记忆、配置和历史产物不会因移除运行管理功能而删除。
 
 ---
 
 ## 📑 完整目录
 
-- [Agent 管理](#agent-管理)
-- [MCP 服务器中心](#mcp-服务器中心)
-- [代理发布与临时分享](#代理发布)
+- [记忆中心](#记忆中心)
+- [Skill 管理](#skills)
+- [MCP 连接中心](#mcp-服务器中心)
 - [系统工具箱](#系统工具箱)
-  - [Port Manager 端口管理](#端口管理)
-  - [网络管理](#网络管理)
-  - [环境变量](#环境变量)
-- [记忆中心 —— 跨 Agent 分层记忆](#记忆中心)
-- [手机只读状态页](#手机状态页)
 - [安装方式](#安装)
 - [快速上手](#快速上手)
-- [LLM 配置说明](#llm-配置)
-- [支持的项目类型](#项目类型)
-- [数据存储路径](#数据路径)
-- [遥测与外部接入](#遥测接入)
-- [版本更新](#版本更新)
+- [模型配置](#llm-配置)
+- [数据存储](#数据路径)
+- [遥测与 Hook 接入](#遥测接入)
 - [FAQ](#faq)
 - [参与贡献](#参与贡献)
 - [License](#license)
-
----
-
-<a id="agent-管理"></a>
-
-## 🤖 Agent 管理
-
-### 自动识别项目类型
-
-选择项目目录后自动检测技术栈并填写启动命令——Python（uv / FastAPI / Django / Streamlit / Flask）、Node.js、Rust、Go、npm 全局 CLI、可执行文件；端口号从 `.env`、`pyproject.toml` 脚本和源码 `port=` 中自动发现。详见[支持的项目类型](#项目类型)。
-
-### 启动与监控
-
-![Agent1](Images/Agent1.png)
-
-- 一键启动 / 停止 Agent 进程
-- 实时流式日志（stdout + stderr），支持自动滚动
-- 查看 PID、端口状态、启动时间
-- 侧边栏拖拽排序
-- **CLI 自动识别**：检测本机已安装的 Claude Code / Codex / Qoder / Kimi / Copilot 等 CLI，一键导入为 Agent——Agents 页与首次引导均可
-- **从 GitHub 安装**：粘贴仓库地址克隆并自动填充配置；设置里可选填 GitHub Token，支持私有仓库与限流缓解
-
-### 内嵌 Web UI
-
-![Agent2](Images/Agent2.png)
-
-有 Web 界面的 Agent（Streamlit / Flask / FastAPI 等）直接在应用内打开，不用切换浏览器：
-
-- 多标签页同时打开多个 Agent UI，标签栏高度可拖拽
-- 一键全屏
-- 按 Agent 配置 UI Token，打开时自动以 `#token=…` 附到地址上
-
-TUI 类 Agent（Claude Code、Codex CLI 等）在内嵌交互式终端中打开。
-
-### 首次引导与应用内更新
-
-- 首次启动向导：导入识别到的 CLI → 配置提取模型 → 完成；可随时从设置重新打开
-- 内置更新检查（启动自动检查 + 侧边栏手动检查）
 
 ---
 
@@ -135,55 +87,6 @@ TUI 类 Agent（Claude Code、Codex CLI 等）在内嵌交互式终端中打开�
 - 常用 MCP 服务器集中保存为目录条目
 - 一键安装到 Claude Code、Claude Desktop、Codex CLI、Codex Desktop、Qoder、WorkBuddy、MiniMax Code、Kimi、ZCode 等宿主
 - 从各 Agent 现有配置一键导入，安装状态实时可视（已安装 / 配置漂移）
-
----
-
-<a id="代理发布"></a>
-
-## 🌐 代理发布 —— 把 Agent 分享到公网
-
-无需固定 IP，无需域名，无需服务器，两条路径把本机 Agent 发布到公网：
-
-<img src="./Images/diagram-share.png" alt="代理发布流程" width="100%" />
-
-### 🔗 临时分享（推荐 · 适合开会场景）
-
-![agency](Images/Agency.png)
-
-一键生成临时公网链接：
-
-```
-你的电脑 localhost:5001
-        ↓ Cloudflare Tunnel
-https://abc-xyz.trycloudflare.com  ← 发给同事
-```
-
-1. 安装 cloudflared（见下方）
-2. 确认 Agent 已启动
-3. 在「代理发布」页找到目标 Agent → 点击 **生成链接**
-4. 等待约 5–15 秒，出现 `https://xxx.trycloudflare.com`
-5. 复制链接发给同事；会后点 **关闭**，链接立即失效
-
-```powershell
-# Windows（推荐用 Scoop）
-scoop install cloudflared
-
-# macOS
-brew install cloudflared
-```
-
-或从 [cloudflared Releases](https://github.com/cloudflare/cloudflared/releases/latest) 直接下载。
-
-> ⚠️ 临时链接无访问控制，请仅在需要时开启，会后立即关闭。
-
-### 🛡️ Caddy 反向代理（长期发布）
-
-适合固定域名、持续开放访问的场景：
-
-- 绑定自定义域名（自动申请 HTTPS 证书）
-- 用户名 / 密码访问控制（bcrypt 加密存储）
-- 多用户权限精细管理（每条规则可独立设置允许哪些用户访问）
-- 一键生成 Caddyfile + 启动 / 重载 Caddy
 
 ---
 
@@ -248,8 +151,8 @@ brew install cloudflared
 
 ### 📥 自动沉淀（Agent → 记忆）
 
-- 支持 **Codex、Claude Code、Qoder、WorkBuddy、MiniMax Code、Kimi、GitHub Copilot、ZCode** 八个来源——前四个装 Hook 采集，八个都支持本地转录扫描
-- 会话先落盘本地 SQLite 账本再异步提取——离线、模型未配置都不丢采集记录，失败会话可手动重跑
+- 支持 **Codex、Claude Code、Qoder、WorkBuddy、MiniMax Code、Kimi、GitHub Copilot、ZCode、DeepSeek Harness** 九个来源——Codex/Claude/Qoder/WorkBuddy 装 Hook 采集，九个都支持本地转录扫描（DeepSeek Harness 的 zstd 压缩会话直接解压解析），DeepSeek Harness 另有 pre-step 注入插件实现等价的自动注入
+- 会话先落盘本地 SQLite 账本再异步提取——离线、模型未配置都不丢采集记录，排队中的提取可取消，失败会话可手动重跑
 - 「待提取记忆」「已整理对话」面板随时回看完整对话、提取进度与失败原因（失败原因附带模型原始输出，便于诊断）
 - L1 清洗与去重（「记忆清洗」）：本地 BGE 语义候选 + LLM 裁决，带可回滚检查点
 - **从文件夹导入**：指定任意转录文件夹，直接提取其中的记忆
@@ -278,11 +181,13 @@ brew install cloudflared
 | Hook 自动注入 | SessionStart 注入一次 L2；UserPromptSubmit 每轮注入 L3（内容指纹门控，未变化轮次零注入成本） | 开局获得工作背景，全程遵循长期偏好 |
 | 共享记忆 MCP | Agent 按需调用 `recall_memory` 语义检索 | 只取任务相关记忆，控制上下文体积 |
 
-**一键接入：** 为 **Claude Code、Claude Desktop、Codex CLI、Codex Desktop、Qoder、WorkBuddy、MiniMax Code、Kimi、ZCode** 九个宿主一键安装 / 卸载共享记忆 MCP，并为 Claude Code、Codex、Qoder、WorkBuddy 四个支持 Hook 的 Agent 管理采集与注入 Hook；数据目录支持按设备自定义。
+**一键接入：** 为 **Claude Code、Claude Desktop、Codex CLI、Codex Desktop、Qoder、WorkBuddy、MiniMax Code、Kimi、ZCode、DeepSeek Harness** 十个宿主一键安装 / 卸载共享记忆 MCP，并为 Claude Code、Codex、Qoder、WorkBuddy 四个支持 Hook 的 Agent 管理采集与注入 Hook；数据目录支持按设备自定义。
 
 ### ✍️ 自定义记忆
 
 在「近 30 天工作记忆」或「长期 Profile」卡片下手写补充记忆：只有用户能删改，自动清洗不会碰它们，且始终注入。
+
+<a id="skills"></a>
 
 ### 📚 共享 Skill 库与技能市场
 
@@ -295,7 +200,7 @@ brew install cloudflared
 
 ![Token 用量统计](Images/tokencenter.png)
 
-聚合各 Agent 本机转录的真实输入 / 输出 / 缓存用量，口径与供应商计费对齐——覆盖 Codex、Claude Code、Qoder、WorkBuddy、MiniMax Code、Kimi、GitHub Copilot、Gemini CLI、OpenCode、OpenClaw 等：
+聚合各 Agent 本机转录的真实输入 / 输出 / 缓存用量，口径与供应商计费对齐——覆盖 Codex、Claude Code、Qoder、WorkBuddy、MiniMax Code、Kimi、GitHub Copilot、DeepSeek Harness、Gemini CLI、OpenCode、OpenClaw 等：
 
 - 汇总看板 + 逐会话用量明细 + 实时会话动态
 - 注入看板：按来源统计会话 / 每轮注入次数、指纹门控命中率与估算 token 成本
@@ -307,15 +212,8 @@ brew install cloudflared
 - 同步范围：L2 / L3 已发布文档 + 用户自定义记忆
 - **AES-256-GCM 端到端加密**：密钥派生自同步密码、不落盘，服务端只存密文、对内容零理解
 - CAS 冲突检测、增量拉取、墓碑删除；本地 SQLite 永远权威，云端不可达不影响注入
+- 三种同步目标：**内置保险库服务端**，或任意 **WebDAV / S3 兼容**存储（`s3://` 地址自动识别；整库打包为单个加密信封上传）
 - 单文件自部署服务端，开源在 [`vault/`](vault/README.md)：支持 Docker / Railway / 香橙派 + Tailscale
-
----
-
-<a id="手机状态页"></a>
-
-## 📱 手机只读状态页
-
-在 **设置 → 移动只读状态** 中开启：局域网内经 token 保护的页面展示运行中 / 需要关注 / 已完成的智能体任务，每 5 秒刷新——长任务挂着跑，手机上随时瞄一眼，不暴露任何写操作。
 
 ---
 
@@ -355,34 +253,20 @@ npm run build
 
 构建产物在 `src-tauri/target/release/bundle/` 下。
 
+Windows 的 `npm run dev` 会将 Cargo 构建目录设为 Medium 完整性，避免继承沙箱工作区的 Low 标签后，程序无法写入 AppData、报 SQLite 只读错误。此预检仅调整构建产物目录，不修改数据库或工作区的权限。
+
 ---
 
 <a id="快速上手"></a>
 
 ## 🚀 快速上手
 
-### 第一步：添加 Agent
+1. 首次启动查看记忆中心、Skill、MCP 的模块介绍；也可从 **设置 → 重新打开使用引导** 重看。默认首页为记忆中心。
+2. 在记忆中心手动添加项目背景或偏好；需要自动提取时，在设置保存并验证记忆提取模型，再检查记忆采集与注入。
+3. 在技能库阅读本地 Skill，选择目标客户端发布；在已发布页面查看部署状态与差异。
+4. 在 MCP 连接中心导入或添加服务，检查命令或 URL，为需要的客户端配置，并查看工具与调用记录。
 
-1. 侧边栏 **Agents** → 右上角 **＋ New Agent**
-2. 点击 📁 选择项目目录（或切换「从 GitHub 安装」粘贴仓库地址）
-3. 启动命令自动填好，按需调整；有 Web UI 的 Agent 确认端口号 → **保存**
-4. 点击 ▶ 启动
-
-### 第二步：打开 Agent
-
-- Web UI 类（Streamlit / Flask 等）：**Open UI** → 应用内嵌标签页
-- TUI 类（Claude Code / Codex）：**Open Terminal** → 应用内嵌终端
-
-### 第三步：开启记忆中心（可选）
-
-1. **设置 → LLM 与记忆提取** 确认提取模型（支持 Ollama 本地模型）
-2. **记忆中心 → 记忆注入** 为各 Agent 安装 Hook / 共享记忆 MCP
-3. 正常使用 Agent，记忆自动沉淀，L2/L3 按计划自动保鲜
-
-### 第四步：开会分享 Agent（可选）
-
-1. 安装 cloudflared
-2. 打开 **代理发布** → 找到目标 Agent → **生成链接** → 复制发送
+整个流程无需导入或启动客户端进程。
 
 ---
 
@@ -390,7 +274,7 @@ npm run build
 
 ## 🤖 LLM 配置说明
 
-MCP 解析与记忆提取都依赖 LLM。在 **设置 → LLM 与记忆提取** 中添加：
+记忆自动提取与整理需要配置模型；手动记忆管理、Skill 与 MCP 配置可独立使用。在 **设置 → LLM 与记忆提取** 中添加：
 
 | 字段 | 说明 | 示例 |
 |------|------|------|
@@ -401,31 +285,9 @@ MCP 解析与记忆提取都依赖 LLM。在 **设置 → LLM 与记忆提取** 
 
 点击 **测试连接**，绿色即配置成功。API Key 落盘前经 AES-256-GCM 加密（机器绑定）。
 
-**内置预设**：DeepSeek（`deepseek-chat`）、OpenAI（`gpt-4o-mini`）或任意自定义兼容端点。
+**内置预设**：**88API**（赞助商入口，Base URL 已预填——填入 Key 即可使用）、DeepSeek（`deepseek-chat`）、OpenAI（`gpt-4o-mini`）或任意自定义兼容端点。任意已填 Key 的提供商均可**一键获取模型列表**，新模型无需手动填写。
 
 **本地模型（Ollama）**：设置页内置 Ollama 模块——连接后自动列出已拉取模型（参数规模 / 量化 / 体积），一键接入为自定义提供商或直接设为记忆提取模型。
-
----
-
-<a id="项目类型"></a>
-
-## 🔍 支持的项目类型
-
-| 项目类型 | 识别条件 | 自动生成的命令 |
-|---------|---------|--------------|
-| Python · uv | `pyproject.toml` + `uv.lock` | `uv run python main.py` |
-| Python · FastAPI | requirements 含 `fastapi` | `uvicorn main:app --reload --port PORT` |
-| Python · Django | `manage.py` 存在 | `python manage.py runserver 0.0.0.0:8000` |
-| Python · Streamlit | requirements 含 `streamlit` | `streamlit run app.py --server.port 8501` |
-| Python · Flask | requirements 含 `flask` | `python app.py` |
-| Python · 通用 | `main.py` / `app.py` 等 | `python main.py` |
-| Node.js | `package.json` | `npm run dev` |
-| Rust | `Cargo.toml` | `cargo run` |
-| Go | `go.mod` | `go run .` |
-| npm 全局命令 | `%APPDATA%\npm\*.cmd` | 交互式 PowerShell + 自动输入命令 |
-| 可执行文件 | `.exe` / `.bat` / `.cmd` / `.sh` | 直接运行 |
-
-端口号自动检测：扫描 `.env` 文件、`pyproject.toml` 脚本、源码中的 `port=` 配置。
 
 ---
 
@@ -435,11 +297,11 @@ MCP 解析与记忆提取都依赖 LLM。在 **设置 → LLM 与记忆提取** 
 
 | 数据 | Windows | macOS / Linux |
 |------|---------|---------------|
-| Agent 配置 | `%APPDATA%\agent-manager\agents.json` | `~/Library/Application Support/agent-manager/`（macOS）、`~/.local/share/agent-manager/`（Linux） |
+| 历史运行配置（保留，不再使用） | `%APPDATA%\agent-manager\agents.json` | `~/Library/Application Support/agent-manager/`（macOS）、`~/.local/share/agent-manager/`（Linux） |
 | LLM 提供商 | `%APPDATA%\agent-manager\llm_config.json` | 同目录 |
 | 记忆与遥测数据库 | `%APPDATA%\agent-manager\telemetry.sqlite3` | 同目录 |
 | Agent 数据源目录覆盖 | `%APPDATA%\agent-manager\agent_source_paths.json` | 同目录 |
-| 生成的 Caddyfile | `%APPDATA%\agent-manager\Caddyfile` | 同目录 |
+| 历史 Caddyfile（不再使用） | `%APPDATA%\agent-manager\Caddyfile` | 同目录 |
 | Claude Desktop MCP 配置 | `%APPDATA%\Claude\claude_desktop_config.json` | `~/Library/Application Support/Claude/claude_desktop_config.json` |
 
 「设置」页支持一键 **导出 / 导入配置备份**，方便迁移与灾难恢复。
@@ -452,7 +314,7 @@ MCP 解析与记忆提取都依赖 LLM。在 **设置 → LLM 与记忆提取** 
 
 记忆流水线以本地 SQLite 作为事件账本：Hook 事件先落盘、再异步提取，模型离线不会丢失采集记录。
 
-- **Codex、Claude Code、Qoder**：可在记忆中心分别安装 / 卸载本机 Hook；端口和鉴权跟随「外部触发」配置
+- **Codex、Claude Code、Qoder**：可在「记忆中心 → 记忆采集」分别安装 / 卸载本机 Hook；端口和鉴权跟随「外部触发」配置
 - **WorkBuddy**：不写其 Claude Code 配置避免重复采集；可通过标准遥测端点提交已聚合的会话 / 用量数据
 - **Token 口径**：Codex、Claude、WorkBuddy 从本机转录读取真实用量；转录未提供完整供应商用量的来源显示明确标记的本地估算；零散 Hook 事件只保留审计记录不重复累计，适配器可用 `session_usage` 以真实最终值覆盖估算
 
@@ -470,31 +332,26 @@ MCP 解析与记忆提取都依赖 LLM。在 **设置 → LLM 与记忆提取** 
 
 `input_tokens` 必须是该会话完整输入总量，`cached_tokens` 仅作缓存命中明细展示（不要再加进总量）；同一 `source + session_id` 后续重报覆盖先前值而非叠加。
 
-### 外部任务派发
-
-同一个本机服务还能向任何支持 HTTP 的 Agent 推送任务并收集结果——外部系统不碰界面也能驱动你的 Agent：
-
-| 端点 | 用途 |
-|------|------|
-| `POST /agent/dispatch` | 把任务转发到 Agent 的 HTTP 地址（异步，202） |
-| `POST /agent/submit` | Agent 回报执行结果 |
-| `GET /agent/tasks` | 查看在途任务（已派发 / 已提交 / 失败） |
-| `GET /agent/results` | 查看已收集的结果 |
-
----
-
 <a id="版本更新"></a>
 
 ## 🗺️ 版本更新
 
-> **当前版本 `v1.0.2`**
+> **当前版本 `v1.1.0`**
 
+**v1.1.0**
+
+- ✅ **云端保险库同步**——除内置保险库服务器外，新增 WebDAV / S3 兼容存储同步加密记忆保险库
+- ✅ **88API 内置 Provider**——赞助商入口内置，模型列表自动获取，新模型无需手动填写
+- ✅ **记忆提取可取消**——待提取任务可在「待定记忆」面板取消，失败会话仍可重跑
+- ✅ **默认浅色主题**——全新安装默认浅色模式，深色模式仍可在设置中切换
+- ✅ **功能聚焦瘦身**——进程启动、内嵌终端 / Web UI、协作任务与代理发布下线；记忆、配置与历史产出文件全部保留
+
+**v1.0.x**
 - ✅ **项目更名 Vibe Assistant**（智管-Vibe Assistant）——显示名、提示词、文档与窗口标题；协议标识与数据路径未变，既有 Hook、MCP 安装与本地数据全部兼容
 - ✅ **环境变量管理**——用户 / 系统两级，PATH 逐条分行编辑，`REG_EXPAND_SZ` 展开预览，关键变量删除保护
 - ✅ **L2/L3 记忆定时重算**——间隔可调（默认 L2 7 天 / L3 30 天），有新记忆才调用模型，L3 重建后自动发布
 - ✅ **网络管理**——逐网卡实时流量、公网 IP（直连 + 代理出口）、双链路带宽测速
 - ✅ **技能市场**——从 OpenAI / Anthropic 官方仓库安装精选技能到共享 Skill 库
-- ✅ **手机只读状态页**——局域网 token 保护的智能体任务状态
 - ✅ **移除工作流功能**——可视化工作流构建、任务看板与运行历史下线，让应用更聚焦（历史见各版本发布说明）
 - ✅ **L1 提取加固**——截断 JSON 补救、契约漂移容忍、错误附模型原文输出便于诊断
 
@@ -546,77 +403,11 @@ L3 采用「草案 → 人工发布」闸门：草案必须点击 **确认发布
 
 ---
 
-<details>
-<summary><b>📦 Agent 管理相关</b></summary>
 
-<details>
-<summary><b>Agent 启动后状态显示"错误"？</b></summary>
-
-查看 Agent 详情页日志，通常是：
-
-- 端口被占用：在 Port Manager 找到占用进程并终止
-- 依赖未安装：在终端手动跑一次启动命令看具体报错
-- 工作目录不对：确认 Agent 配置中的路径
-
-</details>
-
-<details>
-<summary><b>内嵌 Web UI 打开后空白？</b></summary>
-
-Agent 可能还在启动中（端口尚未监听）。等几秒后点 UI 面板工具栏的刷新。
-
-</details>
-
-<details>
-<summary><b>Claude Code 终端打开后空白？</b></summary>
-
-正常现象：应用先启动 PowerShell，等约 800ms 后向 stdin 写入 `claude` 命令，1–2 秒后 TUI 渲染出来。
-
-</details>
-
-<details>
-<summary><b>自动识别的 Python 命令不对？</b></summary>
-
-识别基于文件扫描，边缘情况可能判断有误；在 Agent 编辑界面手动改命令即可，保存后立即生效。
-
-</details>
-
-</details>
 
 ---
 
-<details>
-<summary><b>🌐 代理发布相关</b></summary>
 
-<details>
-<summary><b>点"生成链接"后一直没有 URL？</b></summary>
-
-1. cloudflared 未安装或不在 PATH → 点「重新检测」确认路径
-2. 网络问题 → cloudflared 需要能访问 Cloudflare
-3. Agent 未启动 → 隧道转发到本机端口，Agent 需在运行状态
-
-</details>
-
-<details>
-<summary><b>同事打开链接显示"无法访问此网站"？</b></summary>
-
-确认：Agent 正在运行、隧道未关闭（应用里还是绿色 URL）、链接是完整的 `https://xxx.trycloudflare.com`。
-
-</details>
-
-<details>
-<summary><b>Caddy 找不到 / proxy_apply 失败？</b></summary>
-
-```powershell
-scoop install caddy   # Windows
-brew install caddy    # macOS
-```
-
-安装后在代理发布页点刷新。
-
-</details>
-
-</details>
 
 ---
 
@@ -692,6 +483,6 @@ Bug 报告或功能建议：[Issues](https://github.com/Zafer-Liu/Vibe_Assistant
 
 ## ⭐ 项目目标
 
-**把 Agent 的管理交给智管，把时间留给真正重要的事。**
+**把有用的记忆、可复用的技能和工具连接，留在同一个工作空间。**
 
 </div>
