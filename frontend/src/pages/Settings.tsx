@@ -10,9 +10,8 @@ import { ErrorRecovery } from '../components/ErrorRecovery'
 
 export type SettingsSection = 'general' | 'llm' | 'memory' | 'cloud'
 
-export function Settings({ section, onSectionChange: _onSectionChange, onOpenOnboarding }: {
+export function Settings({ section, onOpenOnboarding }: {
   section: SettingsSection
-  onSectionChange?: (s: SettingsSection) => void
   onOpenOnboarding: () => void
 }) {
   const { t } = useTranslation()
