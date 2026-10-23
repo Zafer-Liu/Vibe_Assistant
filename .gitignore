@@ -68,6 +68,8 @@ docs/
 .tmp-mindmemos-upstream/
 PRODUCT.md
 /spike
+# 记忆中心广告片制作素材（视频/音频，约 42MB，仅存本地）
+/spike/memory_ad/
 /.qoder
 
 # zvec-grep workspace index
