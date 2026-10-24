@@ -78,15 +78,14 @@ jobs:
       - name: Install frontend dependencies
         run: cd frontend && npm ci
 
-      - name: Build MCP fallback launcher
-        shell: bash
-        run: |
-          cargo build --manifest-path src-tauri/mcp-launcher/Cargo.toml --release --target "${{ matrix.target }}"
-          mkdir -p src-tauri/binaries
-          suffix=''
-          if [[ '${{ matrix.os }}' == windows-* ]]; then suffix='.exe'; fi
-          cp "src-tauri/mcp-launcher/target/${{ matrix.target }}/release/mcp-launcher${suffix}" \
-             "src-tauri/binaries/mcp-launcher-${{ matrix.target }}${suffix}"
+      # Builds both external binaries (mcp-launcher + mcp-relay) that
+      # tauri.conf.json lists under bundle.externalBin. Sharing the script with
+      # local dev keeps the two lists from drifting apart again: a missing
+      # externalBin file fails the Tauri build script before compilation.
+      - name: Build MCP sidecar binaries
+        run: node tools/build-mcp-launcher.mjs --release
+        env:
+          TAURI_TARGET_TRIPLE: ${{ matrix.target }}
 
       - name: Build & publish release
         uses: tauri-apps/tauri-action@v0

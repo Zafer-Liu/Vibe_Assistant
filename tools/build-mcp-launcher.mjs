@@ -5,7 +5,12 @@ import { fileURLToPath } from 'node:url'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const tauri = join(root, 'src-tauri')
-const target = process.env.TAURI_TARGET_TRIPLE ?? execFileSync('rustc', ['-vV'], { encoding: 'utf8' })
+// CI passes the matrix target explicitly; a bare local run builds for the host.
+// When a target is given, both crates are built with `--target` so their
+// artifacts land in target/<triple>/ and the later `tauri build --target`
+// reuses them instead of recompiling from scratch.
+const explicitTarget = process.env.TAURI_TARGET_TRIPLE
+const target = explicitTarget ?? execFileSync('rustc', ['-vV'], { encoding: 'utf8' })
   .match(/^host: (.+)$/m)?.[1]
 if (!target) throw new Error('Cannot determine the Rust target triple')
 const release = process.argv.includes('--release')
@@ -26,7 +31,15 @@ if (!release) copyFileSync(launcherSource, join(destination, `mcp-launcher${suff
 // freshly built relay afterwards (bundling happens after compilation).
 const relayBundled = join(destination, `mcp-relay-${target}${suffix}`)
 if (!existsSync(relayBundled)) copyFileSync(join(destination, `mcp-launcher-${target}${suffix}`), relayBundled)
-execFileSync('cargo', ['build', '--manifest-path', join(tauri, 'Cargo.toml'), '--bin', 'mcp-relay', ...release ? ['--release'] : []], { stdio: 'inherit' })
-const relaySource = join(tauri, 'target', profile, `mcp-relay${suffix}`)
+const relayArgs = ['build', '--manifest-path', join(tauri, 'Cargo.toml'), '--bin', 'mcp-relay']
+if (release) relayArgs.push('--release')
+// Only pin the target when CI supplied one: a local `--target <host>` build
+// would land in a separate artifact directory and force a full recompile that
+// `tauri dev` / `tauri build` (which build for the host) cannot reuse.
+if (explicitTarget) relayArgs.push('--target', explicitTarget)
+execFileSync('cargo', relayArgs, { stdio: 'inherit' })
+const relaySource = explicitTarget
+  ? join(tauri, 'target', explicitTarget, profile, `mcp-relay${suffix}`)
+  : join(tauri, 'target', profile, `mcp-relay${suffix}`)
 copyFileSync(relaySource, relayBundled)
 if (!release) copyFileSync(relaySource, join(destination, `mcp-relay${suffix}`))
