@@ -1564,7 +1564,7 @@ const zh = {
     newVersionAvailable: '发现新版本：v{{version}}',
     releasedOn: '发布于 {{date}}',
     alreadyLatest: '已是最新版本 ✓',
-    downloadNow: '前往下载',
+    downloadNow: '下载安装包',
     showNotes: '查看更新说明',
     hideNotes: '收起',
   },

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tauri_plugin_shell::ShellExt;
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 // Replace with the actual GitHub owner/repo before publishing
@@ -10,8 +11,39 @@ pub struct VersionInfo {
     pub latest: String,
     pub has_update: bool,
     pub release_url: String,
+    /// Direct download URL of the Windows installer asset (falls back to the release page).
+    pub download_url: String,
     pub release_notes: String,
     pub published_at: String,
+}
+
+/// Pick the best Windows installer asset from a GitHub release.
+/// Preference: NSIS setup.exe > x64 exe > .msi > any exe.
+fn pick_windows_installer(assets: &[serde_json::Value]) -> Option<String> {
+    let score = |name: &str| -> Option<u8> {
+        let lower = name.to_lowercase();
+        let is_installer = lower.ends_with(".exe") || lower.ends_with(".msi");
+        if !is_installer {
+            return None; // skip .blockmap / .zip / signatures
+        }
+        let mut s = 1u8;
+        if lower.contains("setup") {
+            s += 4; // NSIS "-setup.exe"
+        }
+        if lower.contains("x64") || lower.contains("x86_64") {
+            s += 2;
+        }
+        Some(s)
+    };
+    assets
+        .iter()
+        .filter_map(|a| {
+            let name = a["name"].as_str()?;
+            let url = a["browser_download_url"].as_str()?;
+            score(name).map(|s| (s, url))
+        })
+        .max_by_key(|(s, _)| *s)
+        .map(|(_, url)| url.to_string())
 }
 
 /// Compare two semver strings, returns true if `a` is strictly newer than `b`.
@@ -69,14 +101,38 @@ pub async fn check_for_update() -> Result<VersionInfo, String> {
 
     let has_update = !latest_tag.is_empty() && is_newer(&latest_tag, CURRENT_VERSION);
 
+    // Prefer a direct installer asset so the browser starts downloading immediately.
+    let download_url = json["assets"]
+        .as_array()
+        .and_then(|assets| pick_windows_installer(assets))
+        .unwrap_or_else(|| release_url.clone());
+
     Ok(VersionInfo {
         current: CURRENT_VERSION.to_string(),
         latest: latest_tag,
         has_update,
         release_url,
+        download_url,
         release_notes,
         published_at,
     })
+}
+
+/// Open a URL with the system default browser.
+/// `window.open()` inside the WebView is silently blocked by WebView2, so the
+/// frontend calls this command instead.
+// shell::open is deprecated in favor of tauri-plugin-opener; we stay on the
+// already-registered shell plugin to avoid a new dependency for one call.
+// Called from Rust (no scope), it skips JS-side scope validation entirely.
+#[allow(deprecated)]
+#[tauri::command]
+pub async fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err(format!("Refusing to open non-http(s) URL: {url}"));
+    }
+    app.shell()
+        .open(url, None)
+        .map_err(|e| format!("Failed to open URL: {e}"))
 }
 
 /// Return just the current app version (useful for the About panel without a network call).

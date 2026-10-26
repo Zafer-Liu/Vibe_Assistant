@@ -1566,7 +1566,7 @@ const en: TranslationSchema = {
     newVersionAvailable: 'New version available: v{{version}}',
     releasedOn: 'Released on {{date}}',
     alreadyLatest: 'You are on the latest version ✓',
-    downloadNow: 'Download',
+    downloadNow: 'Download Installer',
     showNotes: 'Show release notes',
     hideNotes: 'Collapse',
   },

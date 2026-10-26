@@ -161,6 +161,7 @@ pub fn run() {
             // Updater
             check_for_update,
             get_app_version,
+            open_external_url,
             // Memory engine
             memory_backend_status,
             memory_backend_start,

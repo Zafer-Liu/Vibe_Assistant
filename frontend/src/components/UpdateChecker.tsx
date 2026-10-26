@@ -8,6 +8,8 @@ interface VersionInfo {
   latest: string
   has_update: boolean
   release_url: string
+  /** Direct installer asset URL; falls back to the release page. */
+  download_url: string
   release_notes: string
   published_at: string
 }
@@ -31,7 +33,14 @@ export function UpdateChecker({ autoCheck = false, compact = false, sidebar = fa
   const [state, setState] = useState<CheckState>('idle')
   const [info, setInfo] = useState<VersionInfo | null>(null)
   const [error, setError] = useState('')
+  const [openError, setOpenError] = useState('')
   const [expanded, setExpanded] = useState(false)
+  const [appVersion, setAppVersion] = useState('')
+
+  // Show the real compiled-in version before any network check completes.
+  useEffect(() => {
+    invoke<string>('get_app_version').then(setAppVersion).catch(() => {})
+  }, [])
 
   const check = useCallback(async (silent = false) => {
     setState('checking')
@@ -56,10 +65,21 @@ export function UpdateChecker({ autoCheck = false, compact = false, sidebar = fa
     check(true)
   }, [autoCheck, check])
 
-  function openRelease() {
-    if (info?.release_url) {
-      window.open(info.release_url, '_blank')
+  // window.open() is silently blocked inside the Tauri WebView (WebView2),
+  // so delegate to the shell plugin via a Rust command to use the system browser.
+  async function openUrl(url: string) {
+    setOpenError('')
+    if (!url) return
+    try {
+      await invoke('open_external_url', { url })
+    } catch (e) {
+      setOpenError(String(e))
     }
+  }
+
+  function openDownload() {
+    // Prefer the direct installer asset so the browser starts downloading immediately.
+    openUrl(info?.download_url || info?.release_url || '')
   }
 
   // ── Compact badge mode (used in sidebar / title area) ────────────────
@@ -67,7 +87,7 @@ export function UpdateChecker({ autoCheck = false, compact = false, sidebar = fa
     if (state === 'done' && info?.has_update) {
       return (
         <button
-          onClick={openRelease}
+          onClick={openDownload}
           className="flex items-center gap-1 rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-medium text-blue-700 hover:bg-blue-200 dark:bg-blue-900/40 dark:text-blue-300 dark:hover:bg-blue-800/60"
           title={t('updater.newVersionAvailable', { version: info.latest })}
         >
@@ -93,7 +113,7 @@ export function UpdateChecker({ autoCheck = false, compact = false, sidebar = fa
         </button>
         {state === 'done' && info?.has_update && (
           <button
-            onClick={openRelease}
+            onClick={openDownload}
             className="flex items-center gap-1.5 text-xs font-bold text-blue-600 hover:underline dark:text-blue-400"
           >
             <ArrowUpCircle className="h-3.5 w-3.5 shrink-0" />
@@ -124,7 +144,7 @@ export function UpdateChecker({ autoCheck = false, compact = false, sidebar = fa
             {t('updater.title')}
           </p>
           <p className="text-xs text-gray-500 dark:text-gray-400 font-mono">
-            {t('updater.currentVersion', { version: '1.1.0' })}
+            {t('updater.currentVersion', { version: info?.current || appVersion || '…' })}
           </p>
         </div>
 
@@ -178,12 +198,15 @@ export function UpdateChecker({ autoCheck = false, compact = false, sidebar = fa
               )}
 
               <button
-                onClick={openRelease}
+                onClick={openDownload}
                 className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-500"
               >
                 <Download className="h-3.5 w-3.5" />
                 {t('updater.downloadNow')}
               </button>
+              {openError && (
+                <p className="text-xs text-red-500 dark:text-red-400">{openError}</p>
+              )}
             </div>
           ) : (
             <div className="flex items-center gap-2">
