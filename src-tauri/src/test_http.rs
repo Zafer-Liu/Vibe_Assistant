@@ -24,8 +24,26 @@ pub mod fake_dav {
         next_put_status: Arc<Mutex<Option<u16>>>,
     }
 
+    /// 服务端 ETag 的方言：合规服务按 entity-tag 语法剥引号后比对；
+    /// 坚果云返回不带引号的裸值，且对 If-Match 做原始字符串比对。
+    #[derive(Clone, Copy, PartialEq)]
+    pub enum EtagStyle {
+        Quoted,
+        Raw,
+    }
+
     impl Server {
         pub fn start() -> Self {
+            Self::start_with(EtagStyle::Quoted)
+        }
+
+        /// 坚果云式服务端：ETag 不带引号，If-Match 逐字符比对。客户端若在
+        /// 回传凭据时擅自加引号，条件写会一律 412。
+        pub fn start_raw_etags() -> Self {
+            Self::start_with(EtagStyle::Raw)
+        }
+
+        fn start_with(style: EtagStyle) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("绑定回环地址失败");
             let addr = listener.local_addr().expect("读取监听地址失败");
             let files: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -43,7 +61,7 @@ pub mod fake_dav {
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     if let Ok(stream) = stream {
-                        handle(stream, &f, &e, &fp, &ns, &es);
+                        handle(stream, &f, &e, &fp, &ns, &es, style);
                     }
                 }
             });
@@ -103,6 +121,7 @@ pub mod fake_dav {
         fail_put: &Arc<AtomicBool>,
         next_put_status: &Arc<Mutex<Option<u16>>>,
         etag_seq: &Arc<AtomicUsize>,
+        style: EtagStyle,
     ) {
         let mut buf = Vec::new();
         let mut tmp = [0u8; 4096];
@@ -158,7 +177,13 @@ pub mod fake_dav {
                 }
                 let current = etags.lock().unwrap().get(&target).cloned();
                 if let Some(want) = headers.get("if-match") {
-                    if current.as_deref() != Some(normalize(want)) {
+                    let matched = match style {
+                        // 合规服务：剥掉 W/ 与引号后比对（weak 也当强算）。
+                        EtagStyle::Quoted => current.as_deref() == Some(normalize(want)),
+                        // 坚果云：拿 If-Match 的原文和服务端存的裸值逐字符比。
+                        EtagStyle::Raw => current.as_deref() == Some(want.trim()),
+                    };
+                    if !matched {
                         return write(&mut stream, "412 Precondition Failed", "", b"");
                     }
                 }
@@ -170,7 +195,7 @@ pub mod fake_dav {
                 let tag = format!("etag-{}", etag_seq.fetch_add(1, Ordering::SeqCst));
                 files.lock().unwrap().insert(target.clone(), body);
                 etags.lock().unwrap().insert(target, tag.clone());
-                write(&mut stream, "201 Created", &format!("ETag: \"{tag}\"\r\n"), b"")
+                write(&mut stream, "201 Created", &etag_header(style, &tag), b"")
             }
             "GET" => {
                 if !exists {
@@ -178,12 +203,7 @@ pub mod fake_dav {
                 }
                 let data = files.lock().unwrap().get(&target).cloned().unwrap_or_default();
                 let tag = etags.lock().unwrap().get(&target).cloned().unwrap_or_default();
-                write(
-                    &mut stream,
-                    "200 OK",
-                    &format!("ETag: \"{tag}\"\r\n"),
-                    &data,
-                )
+                write(&mut stream, "200 OK", &etag_header(style, &tag), &data)
             }
             "HEAD" => {
                 if !exists {
@@ -191,7 +211,7 @@ pub mod fake_dav {
                 }
                 let len = files.lock().unwrap().get(&target).map(|v| v.len()).unwrap_or(0);
                 let tag = etags.lock().unwrap().get(&target).cloned().unwrap_or_default();
-                write_head(&mut stream, "200 OK", &format!("ETag: \"{tag}\"\r\n"), len)
+                write_head(&mut stream, "200 OK", &etag_header(style, &tag), len)
             }
             "MKCOL" => write(&mut stream, "201 Created", "", b""),
             _ => write(&mut stream, "405 Method Not Allowed", "", b""),
@@ -200,5 +220,13 @@ pub mod fake_dav {
 
     fn normalize(raw: &str) -> &str {
         raw.trim().trim_start_matches("W/").trim_matches('"')
+    }
+
+    /// 按方言发 ETag 头：合规服务带引号，坚果云式发裸值。
+    fn etag_header(style: EtagStyle, tag: &str) -> String {
+        match style {
+            EtagStyle::Quoted => format!("ETag: \"{tag}\"\r\n"),
+            EtagStyle::Raw => format!("ETag: {tag}\r\n"),
+        }
     }
 }

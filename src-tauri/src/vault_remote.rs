@@ -126,15 +126,18 @@ fn rate_limited(kind: &str, status: u16) -> String {
     }
 }
 
+/// ETag 原样保存、原样回传：`If-Match` 把 GET 拿到的值逐字节发回去。
+/// 坚果云返回不带引号的裸值（`Etag: 5Cvp…`），且对 `If-Match` 做原始
+/// 字符串比对——统一加引号会让条件写永远 412。比较时才用
+/// `normalize_etag` 去掉 `W/` 前缀与引号。
 fn etag_of(resp: &reqwest::blocking::Response) -> Option<String> {
     resp.headers()
         .get(reqwest::header::ETAG)
         .and_then(|v| v.to_str().ok())
-        .map(normalize_etag)
+        .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
 }
 
-/// ETag 可能带引号（`W/"abc"`），条件写时原样回传，比较时统一去引号。
 fn normalize_etag(raw: &str) -> String {
     raw.trim().trim_start_matches("W/").trim_matches('"').to_string()
 }
@@ -298,7 +301,8 @@ impl Remote for WebDav {
         // conditional 为假表示「服务端不给 ETag，我们无从做条件写」，此时只能
         // 退化成最后写入者胜——比永远写不进去要好，但要如实告诉上层。
         let conditional = if let Some(tag) = etag {
-            headers.push(("If-Match", format!("\"{}\"", normalize_etag(tag))));
+            // 原样回传：见 etag_of 的注释（坚果云不接受加引号的形式）。
+            headers.push(("If-Match", tag.to_string()));
             true
         } else {
             // 没有版本凭据时先看一眼远端有没有：有且它不给 ETag → 无条件覆盖；
@@ -335,7 +339,7 @@ impl Remote for WebDav {
                                     headers.retain(|(name, _)| {
                                         *name != "If-Match" && *name != "If-None-Match"
                                     });
-                                    headers.push(("If-Match", format!("\"{}\"", normalize_etag(tag))));
+                                    headers.push(("If-Match", tag.to_string()));
                                     continue;
                                 }
                                 None => return Err(
@@ -670,7 +674,10 @@ impl Remote for S3 {
             let resp = self.send(reqwest::Method::HEAD, Vec::new(), &[])?;
             match resp.status().as_u16() {
                 200 => {
-                    if etag_of(&resp).as_deref() != Some(normalize_etag(expected).as_str()) {
+                    // 预检只判「版本是否还是我们读到的那个」，两边都归一化；
+                    // 真正的 if-match 凭据仍按原样回传。
+                    let head_tag = etag_of(&resp).map(|tag| normalize_etag(&tag));
+                    if head_tag.as_deref() != Some(normalize_etag(expected).as_str()) {
                         return Ok(PutOutcome::Changed);
                     }
                 }
@@ -682,7 +689,8 @@ impl Remote for S3 {
         let conditional: String;
         match etag {
             Some(tag) => {
-                conditional = format!("\"{}\"", normalize_etag(tag));
+                // 原样回传，与 WebDAV 同理：服务端给什么形式就回什么形式。
+                conditional = tag.to_string();
                 extra.push(("if-match", &conditional));
             }
             None => {
@@ -910,6 +918,42 @@ mod tests {
             other => panic!("当前 ETag 应写入成功，实际 {other:?}"),
         }
         let (data, _) = remote.get().expect("third get").expect("envelope exists");
+        assert_eq!(data, b"envelope-v2".to_vec());
+    }
+
+    /// 坚果云式服务端（裸 ETag + If-Match 原始字符串比对）：凭据必须原样
+    /// 回传。曾经的实现在回传时统一加引号，对这类服务端每次条件写都 412，
+    /// 上层表现为「远端信封在本轮同步期间被其他设备更新」每轮必现。
+    #[test]
+    fn webdav_conditional_write_survives_raw_etag_server() {
+        let server = fake_dav::Server::start_raw_etags();
+        let config = RemoteConfig {
+            kind: RemoteKind::WebDav,
+            url: server.url.clone(),
+            user: "me@example.com".to_string(),
+            credential: "app-password".to_string(),
+            ..RemoteConfig::default()
+        };
+        let remote = open(&config).expect("webdav remote");
+
+        match remote.put(b"envelope-v1", None).expect("首次写入") {
+            PutOutcome::Written(_) => {}
+            other => panic!("首次写入应成功，实际 {other:?}"),
+        }
+        let (_, etag) = remote.get().expect("读取").expect("信封已存在");
+        let etag = etag.expect("裸 ETag 服务端也应返回 ETag");
+
+        // 过期凭据 → 412 → Changed。
+        match remote.put(b"envelope-stale", Some("etag-old")).expect("过期写入") {
+            PutOutcome::Changed => {}
+            other => panic!("过期 ETag 应被拒，实际 {other:?}"),
+        }
+        // 刚拿到的凭据原样回传 → 必须成功；加引号的旧实现在这里 412。
+        match remote.put(b"envelope-v2", Some(&etag)).expect("条件写入") {
+            PutOutcome::Written(_) => {}
+            other => panic!("原样回传的 ETag 应写入成功，实际 {other:?}"),
+        }
+        let (data, _) = remote.get().expect("回读").expect("信封已存在");
         assert_eq!(data, b"envelope-v2".to_vec());
     }
 

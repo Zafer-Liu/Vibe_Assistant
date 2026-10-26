@@ -2766,6 +2766,35 @@ mod tests {
         );
     }
 
+    /// 坚果云式服务端（裸 ETag + If-Match 原始字符串比对）上，第二轮推送
+    /// 不再每轮都报「远端信封在本轮同步期间被其他设备更新」：凭据原样
+    /// 回传后条件写成立。曾经过回传时统一加引号，对这类服务端两次尝试
+    /// 全部 412，本地推送永远滞留 pending。
+    #[test]
+    fn raw_etag_server_pushes_merge_instead_of_failing_every_round() {
+        let server = fake_dav::Server::start_raw_etags();
+        let a = paired(&server.url);
+        let b = paired(&server.url);
+
+        add_l1(&a, "alpha", "A 写下的记忆");
+        let first = run_sync(&a).expect("A 首轮");
+        assert!(first.errors.is_empty(), "A 首轮不该有错误：{:?}", first.errors);
+
+        // B 在 A 已写入的远端上推送：旧实现（If-Match 加引号）在这一轮
+        // 两次尝试都会 412，报「将在下一轮合并」且永远推不上去。
+        add_l1(&b, "beta", "B 的增量");
+        let second = run_sync(&b).expect("B 推送");
+        assert!(
+            second.errors.is_empty(),
+            "坚果云式服务端不该每轮都报并发更新：{:?}",
+            second.errors
+        );
+        assert!(second.pushed >= 1, "B 的记忆应推上去");
+        let envelope = remote_envelope(&server);
+        assert!(object(&envelope, "l1-user:alpha").is_some(), "A 的记忆还在");
+        assert!(object(&envelope, "l1-user:beta").is_some(), "B 的记忆应已在远端");
+    }
+
     /// 用量统计是「每台设备只写自己那一个对象」：本机变了就重写自己的，
     /// 别人的必须原样保留。
     #[test]
