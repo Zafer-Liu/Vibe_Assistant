@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { open } from '@tauri-apps/plugin-dialog'
 import { ArrowLeft, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, FileText, FolderOpen, History, Loader2, RefreshCw, Webhook, X, XCircle, Zap } from 'lucide-react'
 import { useMemoryFields } from '../store/memoryStore'
+import { useMcpFields } from '../store/mcpStore'
 import { useTelemetryFields } from '../store/telemetryStore'
 import { useVisiblePolling } from '../hooks/useVisiblePolling'
 import { ErrorRecovery, type RecoveryTarget } from '../components/ErrorRecovery'
@@ -18,6 +19,8 @@ const collectEventCount = (hook: HookStatus | null) => hook?.events.filter(event
 export const MemoryCapture = memo(function MemoryCapture({ onBack, onOpenInjection, active = true }: { onBack: () => void; onOpenInjection: () => void; active?: boolean }) {
   const { t } = useTranslation()
   const { hookStatus, qoderHookStatus, codexHookStatus, workbuddyHookStatus, dshHookStatus, ingestStatus, agentSources, checkIngest, installHook, uninstallHook, setIngestEnabled, loadAgentSources, setAgentSourceOverride, setAgentSourceScanEnabled } = useMemoryFields('hookStatus', 'qoderHookStatus', 'codexHookStatus', 'workbuddyHookStatus', 'dshHookStatus', 'ingestStatus', 'agentSources', 'checkIngest', 'installHook', 'uninstallHook', 'setIngestEnabled', 'loadAgentSources', 'setAgentSourceOverride', 'setAgentSourceScanEnabled')
+  // dsh 的采集/注入由独立桥接插件接管，状态与操作走 dsh_bridge 命令。
+  const { dshBridge, loadDshBridge, setDshBridge } = useMcpFields('dshBridge', 'loadDshBridge', 'setDshBridge')
   const { telemetryEvents, checkTelemetry } = useTelemetryFields('telemetryEvents', 'checkTelemetry')
   const [hookAction, setHookAction] = useState<string | null>(null)
   const [scanAction, setScanAction] = useState<string | null>(null)
@@ -28,8 +31,8 @@ export const MemoryCapture = memo(function MemoryCapture({ onBack, onOpenInjecti
   const [notice, setNotice] = useState<{ kind: 'ok' | 'err'; text: string; recovery?: RecoveryTarget } | null>(null)
 
   useEffect(() => {
-    if (active) void Promise.allSettled([loadAgentSources(), checkTelemetry({ limit: 50 })])
-  }, [active, loadAgentSources, checkTelemetry])
+    if (active) void Promise.allSettled([loadAgentSources(), checkTelemetry({ limit: 50 }), loadDshBridge()])
+  }, [active, loadAgentSources, checkTelemetry, loadDshBridge])
   useVisiblePolling(checkIngest, 10_000, active)
 
   function flash(kind: 'ok' | 'err', text: string, recovery?: RecoveryTarget) {
@@ -55,7 +58,11 @@ export const MemoryCapture = memo(function MemoryCapture({ onBack, onOpenInjecti
   }
 
   const hookStatusByAgent: Record<string, HookStatus | null> = {
-    codex: codexHookStatus, claude: hookStatus, qoder: qoderHookStatus, workbuddy: workbuddyHookStatus, dsh: dshHookStatus,
+    codex: codexHookStatus, claude: hookStatus, qoder: qoderHookStatus, workbuddy: workbuddyHookStatus,
+    // 桥接插件加载后以它为准（注入特性在位即等价旧 agent/pre-step 钩子）。
+    dsh: dshBridge
+      ? { agent_type: 'dsh', installed: dshBridge.installed, events: dshBridge.installed && (dshBridge.features.injection ?? true) ? ['agent/pre-step'] : [] }
+      : dshHookStatus,
   }
   const readyCount = agentSources.filter(source => isCaptureReady(source, hookStatusByAgent[source.id])).length
 
@@ -70,16 +77,30 @@ export const MemoryCapture = memo(function MemoryCapture({ onBack, onOpenInjecti
   async function handleHookInstall(agentType: HookAgentType, label: string) {
     if (hookAction) return
     setHookAction(agentType)
-    try { await installHook(agentType); flash('ok', t('memory.capture.hookInstalledToast', { label })) }
+    try {
+      if (agentType === 'dsh') await setDshBridge(true)
+      else await installHook(agentType)
+      flash('ok', t('memory.capture.hookInstalledToast', { label }))
+    }
     catch (error) { flash('err', t('memory.capture.hookInstallFailed', { error: String(error) })) }
-    finally { setHookAction(null) }
+    finally {
+      setHookAction(null)
+      if (agentType === 'dsh') void loadDshBridge().catch(() => {})
+    }
   }
   async function handleHookUninstall(agentType: HookAgentType, label: string) {
     if (hookAction) return
     setHookAction(agentType)
-    try { await uninstallHook(agentType); flash('ok', t('memory.capture.hookRemovedToast', { label })) }
+    try {
+      if (agentType === 'dsh') await setDshBridge(false)
+      else await uninstallHook(agentType)
+      flash('ok', t('memory.capture.hookRemovedToast', { label }))
+    }
     catch (error) { flash('err', t('memory.capture.hookRemoveFailed', { error: String(error) })) }
-    finally { setHookAction(null) }
+    finally {
+      setHookAction(null)
+      if (agentType === 'dsh') void loadDshBridge().catch(() => {})
+    }
   }
   async function handleChangeSourceDir(id: string) {
     const selected = await open({ directory: true, multiple: false, title: t('memory.capture.dirDialogTitle') })

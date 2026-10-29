@@ -2,7 +2,7 @@ import { mcpApi } from '../api/mcp'
 import { create } from 'zustand'
 import { useShallow } from 'zustand/react/shallow'
 
-import type { McpAgentStatus, McpCallRefresh, McpCallStats, McpCatalogEntry, McpImportScan, McpObservationStatus, DshObservationStatus, McpProfile, MemoryMcpRuntimeStatus, MemoryMcpStatus, MemoryMcpTarget } from '../types/mcp'
+import type { McpAgentStatus, McpCallRefresh, McpCallStats, McpCatalogEntry, McpImportScan, McpObservationStatus, DshBridgeStatus, DshBridgeFeatures, McpProfile, MemoryMcpRuntimeStatus, MemoryMcpStatus, MemoryMcpTarget } from '../types/mcp'
 
 import { jsonEqual } from '../lib/stateEquality'
 
@@ -29,9 +29,9 @@ interface McpStore {
   mcpStatuses: McpAgentStatus[]
   mcpObservationStatuses: McpObservationStatus[]
   mcpObservationError: string
-  /** DeepSeek Harness cordis 插件观测的安装状态；对所有 MCP 服务生效。 */
-  dshObservation: DshObservationStatus | null
-  dshObservationError: string
+  /** DeepSeek Harness 统一桥接插件（dsh-vibe-assistant-bridge）的安装状态。 */
+  dshBridge: DshBridgeStatus | null
+  dshBridgeError: string
   mcpStatusError: string
   mcpStatusState: 'idle' | 'loading' | 'ready' | 'error'
   mcpStatusCheckedAt: string | null
@@ -50,8 +50,9 @@ interface McpStore {
   checkMcpStatuses: () => Promise<void>
   loadMcpObservationStatuses: () => Promise<McpObservationStatus[]>
   setMcpObservation: (name: string, agent: string, enabled: boolean) => Promise<McpObservationStatus>
-  loadDshObservation: () => Promise<DshObservationStatus>
-  setDshObservation: (enabled: boolean) => Promise<DshObservationStatus>
+  loadDshBridge: () => Promise<DshBridgeStatus>
+  setDshBridge: (enabled: boolean) => Promise<DshBridgeStatus>
+  setDshBridgeFeatures: (features: DshBridgeFeatures) => Promise<DshBridgeStatus>
   importMcpFromAgents: () => Promise<McpImportScan>
   invalidateMcpStatuses: () => void
 }
@@ -77,9 +78,9 @@ export const useMcpStore = create<McpStore>((set, get) => ({
 
   mcpObservationError: '',
 
-  dshObservation: null,
+  dshBridge: null,
 
-  dshObservationError: '',
+  dshBridgeError: '',
 
   mcpStatusError: '',
 
@@ -297,23 +298,29 @@ export const useMcpStore = create<McpStore>((set, get) => ({
     return status
   },
 
-  async loadDshObservation() {
+  async loadDshBridge() {
     try {
-      const status = await mcpApi.dshObservationStatus()
+      const status = await mcpApi.dshBridgeStatus()
       set((state) => ({
-        ...(jsonEqual(state.dshObservation, status) ? {} : { dshObservation: status }),
-        dshObservationError: '',
+        ...(jsonEqual(state.dshBridge, status) ? {} : { dshBridge: status }),
+        dshBridgeError: '',
       }))
       return status
     } catch (error) {
-      set({ dshObservationError: String(error) })
+      set({ dshBridgeError: String(error) })
       throw error
     }
   },
 
-  async setDshObservation(enabled) {
-    const status = await mcpApi.dshObservationSet({ enabled })
-    set({ dshObservation: status, dshObservationError: '' })
+  async setDshBridge(enabled) {
+    const status = await mcpApi.dshBridgeSet({ enabled })
+    set({ dshBridge: status, dshBridgeError: '' })
+    return status
+  },
+
+  async setDshBridgeFeatures(features) {
+    const status = await mcpApi.dshBridgeFeatures({ features })
+    set({ dshBridge: status, dshBridgeError: '' })
     return status
   },
 

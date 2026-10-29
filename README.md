@@ -50,11 +50,27 @@ Process launching, embedded terminals and Web UIs, collaboration tasks, and prox
 
 ---
 
+## 🎬 How It Works
+
+Three systems, one goal: give every agent the same memory, skills, and tools without copying config or losing track of who said what.
+
+| System | The problem it solves | Watch it work |
+|--------|----------------------|---------------|
+| **🧬 Memory** | Injecting full history blows up context; injecting nothing loses continuity | [L0→L3 pipeline](#memory-deep-dive) |
+| **🔌 MCP** | Each agent wants its own config format; debugging calls across 10 clients is hell | [Unified management](#mcp-deep-dive) |
+| **📚 Skills** | Copying SKILL.md files between agents; version drift you can't see | [Shared library](#skill-deep-dive) |
+
+---
+
 ## 📑 Table of Contents
 
+- [How It Works](#how-it-works)
 - [Memory Center](#memory)
+  - [Memory deep dive: L0–L3](#memory-deep-dive)
 - [Skill management](#skills)
+  - [Skill deep dive: scan → publish → equip](#skill-deep-dive)
 - [MCP Server Center](#mcp)
+  - [MCP deep dive: one config, ten clients](#mcp-deep-dive)
 - [System Toolkit](#system)
 - [Install](#install)
 - [Quick Start](#quickstart)
@@ -72,6 +88,16 @@ Process launching, embedded terminals and Web UIs, collaboration tasks, and prox
 ## 🔌 MCP Server Center
 
 A single catalog for MCP servers on your machine — manage them once, distribute everywhere.
+
+<a id="mcp-deep-dive"></a>
+
+### 🎬 How MCP flows: one config → ten clients
+
+<video src="./Images/animations/mcp-system.webm" width="100%" autoplay loop muted playsinline></video>
+
+One catalog defines your MCP servers; Vibe Assistant writes each client's native config format (Claude JSON, Codex TOML, dsh YAML, and seven others). A stdio relay sits between agent and server to observe call boundaries (server, tool, success, latency — never arguments or content) and reports to a local telemetry ledger. Config changes hot-reload into running clients without restarts.
+
+**Why it matters**: stop hand-editing ten config files; debug "which tool failed and when" across every agent in one place; your prompts and tool outputs never leave your machine.
 
 ![MCP Server Center](Images/mcpcenter.png)
 
@@ -135,7 +161,15 @@ The equivalent of Windows' "Edit environment variables" dialog, without opening 
 
 Every coding Agent you use remembers your preferences, decisions, and current work — and every other Agent benefits from it.
 
-<img src="./Images/en/diagram-memory.png" alt="Memory pipeline" width="100%" />
+<a id="memory-deep-dive"></a>
+
+### 🎬 How memory flows: L0 → L3
+
+<video src="./Images/animations/memory-system.webm" width="100%" autoplay loop muted playsinline></video>
+
+Every conversation an agent completes becomes raw events (L0). An LLM extracts 1–3 typed records per session (L1). Every 30 days of L1 evidence consolidates into working memory (L2). A human-reviewed draft of L2 publishes as the long-term profile (L3) that every connected agent receives at session start. The split keeps context budgets small while preserving an audit trail back to the original conversation.
+
+**Why it matters**: durable memory without the "paste 500K tokens of history" cost; a human gate prevents model mistakes from polluting long-term preferences.
 
 ![Memory Center](Images/memorycentre.png)
 
@@ -182,6 +216,23 @@ The published L2 working memory and L3 Profile no longer depend on clicking butt
 
 **One-click setup**: install / uninstall the shared-memory MCP into **Claude Code, Claude Desktop, Codex CLI, Codex Desktop, Qoder, WorkBuddy, MiniMax Code, Kimi, ZCode, DeepSeek Harness**, and manage capture/injection hooks for the four hook-capable Agents (Claude Code, Codex, Qoder, WorkBuddy). Per-device data directory overrides are supported.
 
+### 🔗 DeepSeek Harness bridge plugin
+
+[dsh-vibe-assistant-bridge](https://github.com/Zafer-Liu/dsh-vibe-assistant-bridge) is the official bridge plugin that turns DeepSeek Harness into a first-class Vibe Assistant citizen — one bundle, six capabilities:
+
+| Capability | What it does |
+|------------|--------------|
+| **Memory injection** | L2/L3 shared memory folded into every session start (offline snapshot fallback) |
+| **MCP observation** | Tool call boundaries reported to the local ledger (no arguments, no content) |
+| **Token usage** | Per-message usage reported in real time, deduplicated against transcript scans |
+| **Collection trigger** | Session end signals immediate L0→L1 extraction (no waiting for the scan cycle) |
+| **Recall tools** | `recall_memory` / `get_user_profile` as native dsh tools |
+| **Skill tools** | `list_shared_skills` / `read_shared_skill` as native dsh tools |
+
+**Install**: click **一键接入** (one-click setup) in Vibe Assistant's MCP library, or in the dsh desktop app go to **Plugins → Add plugin** and paste `dsh-vibe-assistant-bridge`. Requires Vibe Assistant running locally (loopback HTTP on port 9420).
+
+**Source & development**: [Zafer-Liu/dsh-vibe-assistant-bridge](https://github.com/Zafer-Liu/dsh-vibe-assistant-bridge) (MIT). Also discoverable in the community plugin directory via the `dsh-plugin` topic.
+
 ### ✍️ Custom memories
 
 Hand-written entries under the working-memory or long-term cards — only you can edit or delete them, automatic cleaning never touches them, and they are always injected.
@@ -189,6 +240,16 @@ Hand-written entries under the working-memory or long-term cards — only you ca
 <a id="skills"></a>
 
 ### 📚 Shared Skill library & marketplace
+
+<a id="skill-deep-dive"></a>
+
+### 🎬 How skills flow: scan → publish → equip
+
+<video src="./Images/animations/skill-system.webm" width="100%" autoplay loop muted playsinline></video>
+
+Every agent's `SKILL.md` files scan into one shared library, keyed by content hash. Before any sync you preview exactly what will be added (green), updated (yellow), or conflicted (red). "Publish + equip" writes approved skills back to every agent's directory in one step. Version drift is visible per agent; one click rolls back the latest publish or adopts a local edit as the new shared version. The marketplace installs curated skills from official OpenAI and Anthropic repositories with size bounds and path validation.
+
+**Why it matters**: no more "which agent has the latest version of this skill"; conflicts are explicit choices, not silent overwrites; marketplace skills are audited before they touch disk.
 
 ![Skill Library](Images/skillcenter.png)
 

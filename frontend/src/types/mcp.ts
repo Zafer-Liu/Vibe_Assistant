@@ -72,12 +72,23 @@ export interface McpObservationStatus {
   active_connections: number
 }
 
-/** DeepSeek Harness cordis 插件观测的安装状态；对全部 MCP 服务生效。 */
-export interface DshObservationStatus {
+/** dsh 桥接插件的特性开关（Rust 侧覆盖行未写时默认全开）。 */
+export interface DshBridgeFeatures {
+  injection: boolean
+  observation: boolean
+  usage: boolean
+  collect: boolean
+  tools: boolean
+}
+
+/** 统一桥接插件（dsh-vibe-assistant-bridge）的安装状态；对全部 MCP 服务生效。 */
+export interface DshBridgeStatus {
   installed: boolean
-  entry_id: string
-  plugin_path: string | null
-  events: string[]
+  version: string | null
+  detail: string
+  features: DshBridgeFeatures
+  legacy_memory_inject: boolean
+  legacy_mcp_observe: boolean
 }
 
 /** 「从 Agent 导入」在某个 Agent 配置里发现的候选服务器。 */

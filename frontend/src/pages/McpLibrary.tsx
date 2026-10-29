@@ -37,7 +37,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
   const { t, i18n } = useTranslation()
   const [equipmentOpen, setEquipmentOpen] = useState(false)
   useEffect(() => { setEquipmentOpen(false) }, [section])
-  const { mcpCatalog, mcpStatuses, mcpObservationStatuses, mcpObservationError, mcpStatusError: statusError, mcpStatusState, mcpCallStats, mcpCallRefreshState, mcpCallError, memoryMcp, memoryMcpRuntime, memoryMcpRuntimeError, loadMcpCatalog, checkMcpStatuses, loadMcpCallStats, loadMcpObservationStatuses, setMcpObservation, dshObservation, dshObservationError, loadDshObservation, setDshObservation, refreshMcpCallObservations, deleteMcpEntry, checkMemoryMcp, checkMemoryMcpRuntime, installMemoryMcp, uninstallMemoryMcp } = useMcpFields('mcpCatalog', 'mcpStatuses', 'mcpObservationStatuses', 'mcpObservationError', 'mcpStatusError', 'mcpStatusState', 'mcpCallStats', 'mcpCallRefreshState', 'mcpCallError', 'memoryMcp', 'memoryMcpRuntime', 'memoryMcpRuntimeError', 'loadMcpCatalog', 'checkMcpStatuses', 'loadMcpCallStats', 'loadMcpObservationStatuses', 'setMcpObservation', 'dshObservation', 'dshObservationError', 'loadDshObservation', 'setDshObservation', 'refreshMcpCallObservations', 'deleteMcpEntry', 'checkMemoryMcp', 'checkMemoryMcpRuntime', 'installMemoryMcp', 'uninstallMemoryMcp')
+  const { mcpCatalog, mcpStatuses, mcpObservationStatuses, mcpObservationError, mcpStatusError: statusError, mcpStatusState, mcpCallStats, mcpCallRefreshState, mcpCallError, memoryMcp, memoryMcpRuntime, memoryMcpRuntimeError, loadMcpCatalog, checkMcpStatuses, loadMcpCallStats, loadMcpObservationStatuses, setMcpObservation, dshBridge, dshBridgeError, loadDshBridge, setDshBridge, setDshBridgeFeatures, refreshMcpCallObservations, deleteMcpEntry, checkMemoryMcp, checkMemoryMcpRuntime, installMemoryMcp, uninstallMemoryMcp } = useMcpFields('mcpCatalog', 'mcpStatuses', 'mcpObservationStatuses', 'mcpObservationError', 'mcpStatusError', 'mcpStatusState', 'mcpCallStats', 'mcpCallRefreshState', 'mcpCallError', 'memoryMcp', 'memoryMcpRuntime', 'memoryMcpRuntimeError', 'loadMcpCatalog', 'checkMcpStatuses', 'loadMcpCallStats', 'loadMcpObservationStatuses', 'setMcpObservation', 'dshBridge', 'dshBridgeError', 'loadDshBridge', 'setDshBridge', 'setDshBridgeFeatures', 'refreshMcpCallObservations', 'deleteMcpEntry', 'checkMemoryMcp', 'checkMemoryMcpRuntime', 'installMemoryMcp', 'uninstallMemoryMcp')
 
   const [dashboardStats, setDashboardStats] = useState<McpDashboardStats | null>(null)
   const [dashboardError, setDashboardError] = useState(false)
@@ -177,7 +177,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
       await Promise.all([
         checkMcpStatuses().catch(() => {}),
         loadMcpObservationStatuses().catch(() => {}),
-        loadDshObservation().catch(() => {}),
+        loadDshBridge().catch(() => {}),
         ...(callViewRef.current.section === 'calls' ? [loadMcpCallStats({
           server: callViewRef.current.callServer || undefined, source: callViewRef.current.callSource || undefined, recentLimit: 200,
         }).catch(() => {})] : []),
@@ -200,7 +200,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
       setLoading(false)
       setBooting(false)
     }
-  }, [loadMcpCatalog, checkMcpStatuses, loadMcpCallStats, loadMcpObservationStatuses, loadDshObservation, refreshMcpCallObservations, checkMemoryMcp, checkMemoryMcpRuntime, loadDashboard])
+  }, [loadMcpCatalog, checkMcpStatuses, loadMcpCallStats, loadMcpObservationStatuses, loadDshBridge, refreshMcpCallObservations, checkMemoryMcp, checkMemoryMcpRuntime, loadDashboard])
 
   const refreshAfterConfigChange = useCallback(async () => {
     useMcpStore.getState().invalidateMcpStatuses()
@@ -224,7 +224,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
       try {
         await Promise.all([
           loadDashboard(),
-          ...(section === 'services' ? [loadMcpObservationStatuses().catch(() => []), loadDshObservation().catch(() => {})] : []),
+          ...(section === 'services' ? [loadMcpObservationStatuses().catch(() => []), loadDshBridge().catch(() => {})] : []),
           ...(section === 'calls' ? [loadMcpCallStats({
             server: callServer || undefined, source: callSource || undefined, recentLimit: 200,
           }).catch(() => {})] : []),
@@ -243,7 +243,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
       if (eventTimer !== undefined) clearTimeout(eventTimer)
       void unlisten.then(stop => stop())
     }
-  }, [active, section, callServer, callSource, loadDashboard, loadMcpObservationStatuses, loadDshObservation, loadMcpCallStats, checkNewFailures])
+  }, [active, section, callServer, callSource, loadDashboard, loadMcpObservationStatuses, loadDshBridge, loadMcpCallStats, checkNewFailures])
 
   const invalidateFailedRequests = useCallback(() => {
     ++failedRequestId.current
@@ -323,7 +323,8 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
     mcpStatuses.find((s) => s.name === name && s.agent === agent), [mcpStatuses])
   const observationOf = useCallback((name: string, agent: string) =>
     mcpObservationStatuses.find((status) => status.name === name && status.agent === (agent === 'codex_desktop' ? 'codex_cli' : agent)), [mcpObservationStatuses])
-  const dshObservationEnabled = dshObservation?.installed ?? false
+  const dshBridgeInstalled = dshBridge?.installed ?? false
+  const dshObservationEnabled = dshBridgeInstalled && (dshBridge?.features.observation ?? true)
 
   async function changeAssignment(entry: McpCatalogEntry, agent: string, assigned: boolean, repair = false) {
     setBusyAssignment(`${entry.name}:${agent}`)
@@ -377,12 +378,46 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
     setBusyDshObservation(true)
     setObservationNotice(null)
     try {
-      await setDshObservation(enabled)
+      if (!dshBridgeInstalled) {
+        // 未安装时开启观测 = 一键接入整个桥接插件；关闭则是天然无操作。
+        if (enabled) await setDshBridge(true)
+      } else {
+        const features = dshBridge?.features ?? { injection: true, observation: true, usage: true, collect: true, tools: true }
+        await setDshBridgeFeatures({ ...features, observation: enabled })
+      }
     } catch (error) {
       setObservationNotice({ tone: 'error', message: t('mcpLibrary.dshPluginFailed', { error: String(error) }) })
-      await loadDshObservation().catch(() => {})
     } finally {
       setBusyDshObservation(false)
+      await loadDshBridge().catch(() => {})
+    }
+  }
+
+  async function toggleDshBridgeInstalled(enabled: boolean) {
+    setBusyDshObservation(true)
+    setObservationNotice(null)
+    try {
+      await setDshBridge(enabled)
+    } catch (error) {
+      setObservationNotice({ tone: 'error', message: t('mcpLibrary.dshPluginFailed', { error: String(error) }) })
+    } finally {
+      setBusyDshObservation(false)
+      await loadDshBridge().catch(() => {})
+    }
+  }
+
+  async function toggleDshBridgeFeature(feature: 'injection' | 'observation' | 'usage' | 'collect' | 'tools', enabled: boolean) {
+    if (!dshBridgeInstalled) return
+    setBusyDshObservation(true)
+    setObservationNotice(null)
+    try {
+      const features = dshBridge?.features ?? { injection: true, observation: true, usage: true, collect: true, tools: true }
+      await setDshBridgeFeatures({ ...features, [feature]: enabled })
+    } catch (error) {
+      setObservationNotice({ tone: 'error', message: t('mcpLibrary.dshPluginFailed', { error: String(error) }) })
+    } finally {
+      setBusyDshObservation(false)
+      await loadDshBridge().catch(() => {})
     }
   }
 
@@ -578,7 +613,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
 
       {!loadError && section === 'services' && <>
       <div className="min-h-0 flex-1 overflow-y-auto p-5">
-        {/* DeepSeek Harness cordis 插件观测：对所有 MCP 服务生效 */}
+        {/* DeepSeek Harness 统一桥接插件：注入/观测/用量/收集/原生工具 */}
         <article className="mb-3 rounded-xl border border-gray-200 bg-white p-4 transition hover:border-violet-300 dark:border-gray-700 dark:bg-gray-900 dark:hover:border-violet-500/40">
           <div className="flex flex-wrap items-start gap-3">
             <div className="rounded-lg bg-violet-500/10 p-2 text-violet-600 dark:text-violet-400">
@@ -587,20 +622,43 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
                 <h3 className="min-w-0 truncate text-sm font-semibold text-gray-900 dark:text-gray-100">{t('mcpLibrary.dshPluginTitle')}</h3>
-                <span className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium ${dshObservationEnabled ? 'border-emerald-500/50 bg-emerald-50 text-emerald-700 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-300' : 'border-gray-300 bg-gray-50 text-gray-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-400'}`}
-                  title={dshObservation?.plugin_path ?? dshObservation?.entry_id}>
-                  <span className={`h-1.5 w-1.5 rounded-full ${dshObservationEnabled ? 'bg-emerald-500' : 'bg-gray-400'}`} />
-                  {t(dshObservationEnabled ? 'mcpLibrary.dshPluginOn' : 'mcpLibrary.dshPluginOff')}
+                <span className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium ${dshBridgeInstalled ? 'border-emerald-500/50 bg-emerald-50 text-emerald-700 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-300' : 'border-gray-300 bg-gray-50 text-gray-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-400'}`}
+                  title={dshBridge?.detail ?? ''}>
+                  <span className={`h-1.5 w-1.5 rounded-full ${dshBridgeInstalled ? 'bg-emerald-500' : 'bg-gray-400'}`} />
+                  {dshBridgeInstalled ? t('mcpLibrary.dshBridgeVersion', { version: dshBridge?.version ?? '?' }) : t('mcpLibrary.dshBridgeMissing')}
                 </span>
               </div>
               <p className="mt-1 text-xs leading-5 text-gray-500 dark:text-gray-400">{t('mcpLibrary.dshPluginHint')}</p>
-              {dshObservationError && <p role="alert" className="mt-1 break-words text-xs text-red-600 dark:text-red-400">{t('mcpLibrary.dshPluginFailed', { error: dshObservationError })}</p>}
+              {dshBridgeInstalled && (dshBridge?.legacy_memory_inject || dshBridge?.legacy_mcp_observe) && (
+                <p className="mt-1 break-words text-xs text-amber-600 dark:text-amber-400">{t('mcpLibrary.dshBridgeLegacy')}</p>
+              )}
+              {dshBridgeError && <p role="alert" className="mt-1 break-words text-xs text-red-600 dark:text-red-400">{t('mcpLibrary.dshPluginFailed', { error: dshBridgeError })}</p>}
             </div>
-            <button type="button" onClick={() => { void toggleDshObservation(!dshObservationEnabled) }} disabled={busyDshObservation || loading || configBusy}
+            <button type="button" onClick={() => { void toggleDshBridgeInstalled(!dshBridgeInstalled) }} disabled={busyDshObservation || loading || configBusy}
               className="shrink-0 rounded-md border border-gray-300 px-2.5 py-1.5 text-xs font-medium text-gray-700 transition hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-800">
-              {busyDshObservation ? <Loader2 size={12} className="animate-spin" /> : t(dshObservationEnabled ? 'mcpLibrary.dshPluginDisable' : 'mcpLibrary.dshPluginEnable')}
+              {busyDshObservation ? <Loader2 size={12} className="animate-spin" /> : t(dshBridgeInstalled ? 'mcpLibrary.dshBridgeRemove' : 'mcpLibrary.dshBridgeInstall')}
             </button>
           </div>
+          {dshBridgeInstalled && (
+            <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-gray-100 pt-3 dark:border-gray-800">
+              <span className="text-[11px] font-medium text-gray-500 dark:text-gray-400">{t('mcpLibrary.dshBridgeFeatures')}</span>
+              {([['injection', 'dshBridgeFeatureInjection'], ['observation', 'dshBridgeFeatureObservation'], ['usage', 'dshBridgeFeatureUsage'], ['collect', 'dshBridgeFeatureCollect'], ['tools', 'dshBridgeFeatureTools']] as const).map(([feature, key]) => {
+                const enabled = dshBridge?.features[feature] ?? true
+                return (
+                  <label key={feature} className="inline-flex cursor-pointer items-center gap-1.5 text-xs text-gray-700 dark:text-gray-300">
+                    <input
+                      type="checkbox"
+                      checked={enabled}
+                      disabled={busyDshObservation || loading || configBusy}
+                      onChange={(event) => { void toggleDshBridgeFeature(feature, event.target.checked) }}
+                      className="h-3.5 w-3.5 accent-violet-600"
+                    />
+                    {t(`mcpLibrary.${key}`)}
+                  </label>
+                )
+              })}
+            </div>
+          )}
         </article>
         {/* 内置共享记忆 MCP：与其他服务相同的条目展示 */}
         <article className="mb-3 rounded-xl border border-gray-200 bg-white p-4 transition hover:border-violet-300 dark:border-gray-700 dark:bg-gray-900 dark:hover:border-violet-500/40">

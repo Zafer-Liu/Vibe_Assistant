@@ -5,6 +5,7 @@ mod backup;
 pub mod cloud_sync;
 mod env_manager;
 mod desktop_lifecycle;
+mod dsh_bridge;
 mod dsh_injection;
 mod dsh_mcp;
 mod dsh_observe;
@@ -273,8 +274,9 @@ pub fn run() {
             mcp_registry::mcp_status_all,
             mcp_registry::mcp_observation_status_all,
             mcp_registry::mcp_observation_set,
-            dsh_observe::dsh_observation_status,
-            dsh_observe::dsh_observation_set,
+            dsh_bridge::dsh_bridge_status,
+            dsh_bridge::dsh_bridge_set,
+            dsh_bridge::dsh_bridge_features,
             mcp_registry::mcp_import_from_agents,
             mcp_registry::mcp_configuration_compare,
             mcp_registry::mcp_configuration_resolve,

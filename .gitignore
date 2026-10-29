@@ -80,3 +80,8 @@ PRODUCT.md
 .tmp_ratio.py
 gpup3.ps1
 DESIGN.md
+
+# HyperFrames animation source projects (rendered videos live in Images/animations/)
+/animations/
+# Session scratch files
+.tmp_*

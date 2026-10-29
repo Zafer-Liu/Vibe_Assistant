@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { McpAgentStatus, McpCallRefresh, McpCallStats, McpDashboardStats, McpCatalogEntry, McpObservationStatus, DshObservationStatus, McpProfile, MemoryMcpRuntimeStatus, MemoryMcpStatus, MemoryMcpTarget } from '../types/mcp'
+import type { McpAgentStatus, McpCallRefresh, McpCallStats, McpDashboardStats, McpCatalogEntry, McpObservationStatus, DshBridgeStatus, DshBridgeFeatures, McpProfile, MemoryMcpRuntimeStatus, MemoryMcpStatus, MemoryMcpTarget } from '../types/mcp'
 import type { McpScanResult, ClaudeDesktopMcpConfig, McpFailedCallPage, McpToolDiscovery, McpImportScan, McpConfigurationComparison, McpArbitrationResult } from '../types/mcp'
 
 export const mcpApi = {
@@ -23,8 +23,9 @@ export const mcpApi = {
   mcpStatusAll: () => invoke<McpAgentStatus[]>('mcp_status_all'),
   mcpObservationStatusAll: () => invoke<McpObservationStatus[]>('mcp_observation_status_all'),
   mcpObservationSet: (args: { name: string; agent: string; enabled: boolean }) => invoke<McpObservationStatus>('mcp_observation_set', args),
-  dshObservationStatus: () => invoke<DshObservationStatus>('dsh_observation_status'),
-  dshObservationSet: (args: { enabled: boolean }) => invoke<DshObservationStatus>('dsh_observation_set', args),
+  dshBridgeStatus: () => invoke<DshBridgeStatus>('dsh_bridge_status'),
+  dshBridgeSet: (args: { enabled: boolean }) => invoke<DshBridgeStatus>('dsh_bridge_set', args),
+  dshBridgeFeatures: (args: { features: DshBridgeFeatures }) => invoke<DshBridgeStatus>('dsh_bridge_features', args),
   mcpImportFromAgents: () => invoke<McpImportScan>('mcp_import_from_agents'),
   mcpConfigurationCompare: (args: { name: string }) => invoke<McpConfigurationComparison>('mcp_configuration_compare', args),
   mcpConfigurationResolve: (args: { name: string; revision: string; source: string | null; targets: string[] }) => invoke<McpArbitrationResult>('mcp_configuration_resolve', args),

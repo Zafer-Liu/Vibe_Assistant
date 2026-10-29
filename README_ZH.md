@@ -51,9 +51,27 @@ English | **[简体中文](./README_ZH.md)**
 
 ---
 
+## 🎬 核心原理
+
+三大系统，一个目标：让每个 agent 拥有同一份记忆、技能与工具——不重复配置、不丢失上下文。
+
+| 系统 | 解决的痛点 | 看原理 |
+|------|-----------|--------|
+| **🧬 记忆** | 全量注入撑爆上下文；不注入丢失连续性 | [L0→L3 流转](#记忆原理深入) |
+| **🔌 MCP** | 每个 agent 要自己的配置格式；跨 10 个客户端排查调用如噩梦 | [统一管理](#mcp原理深入) |
+| **📚 Skill** | 在 agent 之间复制 SKILL.md；看不见版本漂移 | [共享库](#skill原理深入) |
+
+---
+
 ## 📑 完整目录
 
+- [核心原理](#核心原理)
 - [记忆中心](#记忆中心)
+  - [记忆原理深入：L0–L3](#记忆原理深入)
+- [Skill 管理](#skills)
+  - [Skill 原理深入：扫描 → 发布 → 装备](#skill原理深入)
+- [MCP 连接中心](#mcp-服务器中心)
+  - [MCP 原理深入：一份配置，十个客户端](#mcp原理深入)
 - [Skill 管理](#skills)
 - [MCP 连接中心](#mcp-服务器中心)
 - [系统工具箱](#系统工具箱)
@@ -73,6 +91,16 @@ English | **[简体中文](./README_ZH.md)**
 ## 🔌 MCP 服务器中心
 
 本机 MCP 服务器的统一目录——管理一次，处处分发。
+
+<a id="mcp原理深入"></a>
+
+### 🎬 MCP 如何流转：一份配置 → 十个客户端
+
+<video src="./Images/animations/mcp-system.webm" width="100%" autoplay loop muted playsinline></video>
+
+统一目录定义你的 MCP 服务器；Vibe Assistant 写出每个客户端的原生配置格式（Claude JSON、Codex TOML、dsh YAML 等十种）。stdio 中继位于 agent 与服务器之间，观测调用边界（服务器、工具、成功、耗时——绝不记录参数与返回内容），并上报本地遥测账本。配置变更热重载到运行中的客户端，无需重启。
+
+**为什么重要**：不再手改十个配置文件；在一个地方排查「哪个工具何时失败」；你的 prompt 与工具输出绝不离开本机。
 
 ![MCP 服务器中心](Images/mcpcenter.png)
 
@@ -136,7 +164,15 @@ English | **[简体中文](./README_ZH.md)**
 
 让每个编码 Agent 记住你的偏好、决策与当前进展，并让其他所有 Agent 从中受益。
 
-<img src="./Images/diagram-memory.png" alt="记忆分层流水线" width="100%" />
+<a id="记忆原理深入"></a>
+
+### 🎬 记忆如何流转：L0 → L3
+
+<video src="./Images/animations/memory-system.webm" width="100%" autoplay loop muted playsinline></video>
+
+每次 agent 完成的会话成为原始事件（L0）；LLM 从每次会话提取 1–3 条带类型的记录（L1）；每 30 天的 L1 证据整编为工作记忆（L2）；L2 的草稿经人工确认后发布为长期 Profile（L3），在每个会话开局注入到所有连接的 agent。分层让上下文预算保持小巧，同时保留回到原始会话的审计链。
+
+**为什么重要**：不用「粘贴 50 万 token 历史」的代价获得持久记忆；人工发布门防止模型错误污染长期偏好。
 
 ![记忆中心](Images/memorycentre.png)
 
@@ -183,6 +219,23 @@ English | **[简体中文](./README_ZH.md)**
 
 **一键接入：** 为 **Claude Code、Claude Desktop、Codex CLI、Codex Desktop、Qoder、WorkBuddy、MiniMax Code、Kimi、ZCode、DeepSeek Harness** 十个宿主一键安装 / 卸载共享记忆 MCP，并为 Claude Code、Codex、Qoder、WorkBuddy 四个支持 Hook 的 Agent 管理采集与注入 Hook；数据目录支持按设备自定义。
 
+### 🔗 DeepSeek Harness 桥接插件
+
+[dsh-vibe-assistant-bridge](https://github.com/Zafer-Liu/dsh-vibe-assistant-bridge) 是官方桥接插件，让 DeepSeek Harness 成为 Vibe Assistant 的一等公民——一个 bundle，六项能力：
+
+| 能力 | 作用 |
+|------|------|
+| **记忆注入** | 每次会话开局注入 L2/L3 共享记忆（离线快照回退） |
+| **MCP 调用观测** | 工具调用边界上报本地账本（不记录参数与返回内容） |
+| **Token 用量上报** | 逐条消息实时上报，与转录扫描口径幂等去重 |
+| **会话结束收集触发** | 会话停止即触发 L0→L1 提取（无需等待扫描周期） |
+| **召回工具** | `recall_memory` / `get_user_profile` 注册为 dsh 原生工具 |
+| **Skill 工具** | `list_shared_skills` / `read_shared_skill` 注册为 dsh 原生工具 |
+
+**安装：** 在 Vibe Assistant 的 MCP 库点「一键接入」，或在 dsh 桌面版的 **Plugins → Add plugin** 粘贴 `dsh-vibe-assistant-bridge`。需 Vibe Assistant 在本地运行（回环 HTTP 端口 9420）。
+
+**源码与开发：** [Zafer-Liu/dsh-vibe-assistant-bridge](https://github.com/Zafer-Liu/dsh-vibe-assistant-bridge)（MIT）。也可通过 `dsh-plugin` topic 在社区插件目录发现。
+
 ### ✍️ 自定义记忆
 
 在「近 30 天工作记忆」或「长期 Profile」卡片下手写补充记忆：只有用户能删改，自动清洗不会碰它们，且始终注入。
@@ -190,6 +243,16 @@ English | **[简体中文](./README_ZH.md)**
 <a id="skills"></a>
 
 ### 📚 共享 Skill 库与技能市场
+
+<a id="skill原理深入"></a>
+
+### 🎬 Skill 如何流转：扫描 → 发布 → 装备
+
+<video src="./Images/animations/skill-system.webm" width="100%" autoplay loop muted playsinline></video>
+
+每个 agent 的 `SKILL.md` 文件扫描进共享库，按内容哈希识别。任何同步前预览确切的新增（绿）、更新（黄）、冲突（红）。「发布 + 装备」一步把批准的技能写回每个 agent 的目录。版本漂移按 agent 可见；一键回滚最近一次发布，或把本地修改采纳为共享新版。技能市场从 OpenAI 与 Anthropic 官方仓库安装精选技能，下载受限且路径校验。
+
+**为什么重要**：不再问「哪个 agent 有这个技能的最新版」；冲突是显式选择而非静默覆盖；市场技能在落盘前经审计。
 
 ![Skill 库](Images/skillcenter.png)
 

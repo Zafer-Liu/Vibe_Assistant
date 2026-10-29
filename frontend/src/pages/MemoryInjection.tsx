@@ -24,7 +24,7 @@ function formatLogDetail(detail: string) {
 export const MemoryInjection = memo(function MemoryInjection({ onBack, onOpenCapture, active = true }: { onBack: () => void; onOpenCapture: () => void; active?: boolean }) {
   const { t } = useTranslation()
   const { hookStatus, qoderHookStatus, codexHookStatus, workbuddyHookStatus, dshHookStatus, agentSources, memoryInjectionLogs, memoryInjectionStats, checkIngest, installHook, loadAgentSources, loadMemoryInjectionLogs, loadInjectionStats, setAgentSourceScanEnabled } = useMemoryFields('hookStatus', 'qoderHookStatus', 'codexHookStatus', 'workbuddyHookStatus', 'dshHookStatus', 'agentSources', 'memoryInjectionLogs', 'memoryInjectionStats', 'checkIngest', 'installHook', 'loadAgentSources', 'loadMemoryInjectionLogs', 'loadInjectionStats', 'setAgentSourceScanEnabled')
-  const { memoryMcp, checkMemoryMcp, installMemoryMcp, uninstallMemoryMcp } = useMcpFields('memoryMcp', 'checkMemoryMcp', 'installMemoryMcp', 'uninstallMemoryMcp')
+  const { memoryMcp, checkMemoryMcp, installMemoryMcp, uninstallMemoryMcp, dshBridge, loadDshBridge, setDshBridge } = useMcpFields('memoryMcp', 'checkMemoryMcp', 'installMemoryMcp', 'uninstallMemoryMcp', 'dshBridge', 'loadDshBridge', 'setDshBridge')
   const [hookAction, setHookAction] = useState<string | null>(null)
   const [mcpAction, setMcpAction] = useState<string | null>(null)
   const [scanAction, setScanAction] = useState<string | null>(null)
@@ -34,7 +34,7 @@ export const MemoryInjection = memo(function MemoryInjection({ onBack, onOpenCap
   const [notice, setNotice] = useState<{ kind: 'ok' | 'err'; text: string; recovery?: RecoveryTarget } | null>(null)
   const SUMMARY_PREVIEW_COUNT = 5
 
-  useEffect(() => { if (active) { void loadAgentSources(); void checkMemoryMcp().catch(() => {}) } }, [active, loadAgentSources, checkMemoryMcp])
+  useEffect(() => { if (active) { void loadAgentSources(); void checkMemoryMcp().catch(() => {}); void loadDshBridge().catch(() => {}) } }, [active, loadAgentSources, checkMemoryMcp, loadDshBridge])
   useVisiblePolling(checkIngest, 30_000, active)
   useVisiblePolling(loadMemoryInjectionLogs, 10_000, active)
   useVisiblePolling(loadInjectionStats, 30_000, active)
@@ -77,6 +77,20 @@ export const MemoryInjection = memo(function MemoryInjection({ onBack, onOpenCap
     try { await installHook(agentType); flash('ok', t('memory.injection.injectEnabledToast', { label })) }
     catch (error) { flash('err', t('memory.injection.hookInstallFailed', { error: String(error) })) }
     finally { setHookAction(null) }
+  }
+  // dsh 的注入由独立桥接插件（dsh-vibe-assistant-bridge）接管：一键接入 =
+  // 经 dsh 官方插件通道安装并自动迁移旧内嵌插件与记忆 MCP 注册。
+  async function handleBridgeInstall() {
+    if (hookAction) return
+    setHookAction('dsh')
+    try {
+      await setDshBridge(true)
+      flash('ok', t('memory.injection.bridgeEnabledToast', { label: 'DeepSeek Harness' }))
+    } catch (error) { flash('err', t('memory.injection.bridgeInstallFailed', { error: String(error) })) }
+    finally {
+      setHookAction(null)
+      void loadDshBridge().catch(() => {})
+    }
   }
   async function handleScanToggle(id: string, enabled: boolean) {
     if (scanAction) return
@@ -138,13 +152,16 @@ export const MemoryInjection = memo(function MemoryInjection({ onBack, onOpenCap
           <div className="mt-3 grid gap-2 border-t border-slate-100 pt-3 dark:border-slate-800">
             {agentSources.map(source => {
               const hook = hookStatusByAgent[source.id]
-              const enabled = injectEnabled(hook)
+              const isDsh = source.id === 'dsh'
+              const enabled = isDsh
+                ? dshBridge?.installed === true && (dshBridge.features.injection ?? true)
+                : injectEnabled(hook)
               const working = hookAction === source.id
               const scanAvailable = source.supports_transcript_scan && source.transcript_roots.some(root => root.exists)
               return <div key={source.id} className="grid gap-2 rounded-lg border border-slate-100 p-3 dark:border-slate-800 md:grid-cols-[minmax(110px,1fr)_minmax(0,1.7fr)_minmax(0,1.7fr)] md:items-center">
                 <span className="text-sm font-medium text-slate-700 dark:text-slate-200">{source.label}</span>
                 <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs"><span className="font-medium text-violet-700 dark:text-violet-300">{t('memory.injection.hookColumn')}</span>
-                  {!source.supports_hooks ? <span className="text-slate-500">{t('memory.injection.hookUnavailable')}</span> : !hook ? <span className="text-slate-500">{t('memory.injection.statusChecking')}</span> : enabled ? <span className="inline-flex items-center gap-1 text-emerald-700 dark:text-emerald-300"><CheckCircle2 size={12} />{t('memory.injection.injectEnabled')}</span> : <><span className="text-slate-500 dark:text-slate-400">{t('memory.injection.injectDisabled')}</span><button type="button" onClick={() => { void handleHookInstall(source.id as HookAgentType, source.label) }} disabled={working} className="rounded-md bg-violet-600 px-2 py-1 font-medium text-white hover:bg-violet-500 disabled:opacity-50">{working ? <Loader2 size={12} className="animate-spin motion-reduce:animate-none" /> : t('memory.injection.enableInject')}</button></>}
+                  {!source.supports_hooks ? <span className="text-slate-500">{t('memory.injection.hookUnavailable')}</span> : !hook && !isDsh ? <span className="text-slate-500">{t('memory.injection.statusChecking')}</span> : isDsh && !dshBridge ? <span className="text-slate-500">{t('memory.injection.statusChecking')}</span> : enabled ? <span className="inline-flex items-center gap-1 text-emerald-700 dark:text-emerald-300"><CheckCircle2 size={12} />{t('memory.injection.injectEnabled')}</span> : <><span className="text-slate-500 dark:text-slate-400">{t(isDsh ? 'memory.injection.bridgeNotInstalled' : 'memory.injection.injectDisabled')}</span><button type="button" onClick={() => { void (isDsh ? handleBridgeInstall() : handleHookInstall(source.id as HookAgentType, source.label)) }} disabled={working} className="rounded-md bg-violet-600 px-2 py-1 font-medium text-white hover:bg-violet-500 disabled:opacity-50">{working ? <Loader2 size={12} className="animate-spin motion-reduce:animate-none" /> : t(isDsh ? 'memory.injection.bridgeEnable' : 'memory.injection.enableInject')}</button></>}
                 </div>
                 <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs"><span className="font-medium text-sky-700 dark:text-sky-300">{t('memory.injection.scanColumn')}</span>
                   {source.supports_transcript_scan ? <><span className={source.scan_enabled && scanAvailable ? 'text-emerald-700 dark:text-emerald-300' : 'text-slate-500 dark:text-slate-400'}>{t(source.scan_enabled ? (scanAvailable ? 'memory.capture.scanEnabled' : 'memory.capture.scanMissing') : 'memory.capture.scanDisabled')}</span><button type="button" role="switch" aria-checked={source.scan_enabled} aria-label={t('memory.capture.localScanFor', { label: source.label })} onClick={() => { void handleScanToggle(source.id, !source.scan_enabled) }} disabled={scanAction !== null} className={`relative ml-auto h-5 w-9 rounded-full transition-colors disabled:opacity-50 ${source.scan_enabled ? 'bg-sky-600' : 'bg-slate-300 dark:bg-slate-600'}`}><span className="absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all" style={{ left: source.scan_enabled ? '18px' : '2px' }} /></button></> : <span className="text-slate-500">{t('memory.capture.scanUnavailable')}</span>}

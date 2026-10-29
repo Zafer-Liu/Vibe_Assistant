@@ -1514,3 +1514,115 @@ fn format_conversation_strips_injected_context_but_keeps_dialogue() {
     assert!(!text.contains("meta awareness"));
     assert!(text.contains("未闭合的块"));
 }
+
+#[test]
+fn dsh_plugin_usage_is_idempotent_and_matches_transcript_namespace() {
+    let store = TelemetryStore::in_memory();
+    let session = "session-019f8e90-36f5-71a2-bddf-f0fe9ee23b57";
+    let payload = serde_json::json!({
+        // 插件可能上报裸 uuid，入库前统一归一成目录名口径。
+        "session_id": "019f8e90-36f5-71a2-bddf-f0fe9ee23b57",
+        "model": "zhipu/glm-5.3",
+        "input_tokens": 1200,
+        "output_tokens": 80,
+        "cached_tokens": 300,
+        "occurred_at": "2026-10-28T10:00:00Z",
+        "message_id": "42",
+    });
+    let first = store.record_dsh_plugin_usage(&payload).unwrap();
+    let second = store.record_dsh_plugin_usage(&payload).unwrap();
+    assert_eq!(first, second);
+    // message_id 即事件 seq：与 read_dsh_usage_records 的 identity 完全一致，
+    // 同一条 assistant/message 在两条路径下命中同一 record_id。
+    assert_eq!(first, usage_record_id("dsh", session, "message", "42"));
+    let conn = store.conn.lock().unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM usage_records WHERE source='dsh' AND session_id=?1",
+            params![session],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    let row: (String, i64, i64, i64, Option<String>) = conn
+        .query_row(
+            "SELECT origin, input_tokens, output_tokens, cached_tokens, model
+               FROM usage_records WHERE source='dsh' AND session_id=?1",
+            params![session],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row.0, "dsh_plugin");
+    // input 列为输入合计（1200 未命中 + 300 缓存命中），与转录扫描口径一致。
+    assert_eq!((row.1, row.2, row.3), (1500, 80, 300));
+    assert_eq!(row.4.as_deref(), Some("zhipu/glm-5.3"));
+}
+
+#[test]
+fn dsh_plugin_usage_replaces_transcript_record_with_same_identity() {
+    let store = TelemetryStore::in_memory();
+    let session = "session-019f8e90-36f5-71a2-bddf-f0fe9ee23b57";
+    // 模拟转录扫描先写入同一条 assistant/message（identity=seq="42"）。
+    let record_id = usage_record_id("dsh", session, "message", "42");
+    let transcript_record = TranscriptUsageRecord {
+        record_id: record_id.clone(),
+        occurred_at: Some("2026-10-28T10:00:00.000Z".to_string()),
+        model: Some("zhipu/glm-5.3".to_string()),
+        input_tokens: 1000,
+        output_tokens: 60,
+        cached_tokens: 0,
+    };
+    {
+        let mut conn = store.conn.lock().unwrap();
+        let transaction = conn.transaction().unwrap();
+        TelemetryStore::write_priced_usage_records(
+            &transaction,
+            &[],
+            "2026-10-28T10:00:01.000Z",
+            "dsh",
+            session,
+            "native_transcript",
+            std::slice::from_ref(&transcript_record),
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+    }
+    // 插件随后重报同一条消息：record_id 命中，INSERT OR REPLACE 原位覆盖
+    // 而非叠加计费。
+    let payload = serde_json::json!({
+        "session_id": session,
+        "model": "zhipu/glm-5.3",
+        "input_tokens": 1200,
+        "output_tokens": 80,
+        "cached_tokens": 300,
+        "message_id": "42",
+    });
+    assert_eq!(store.record_dsh_plugin_usage(&payload).unwrap(), record_id);
+    let conn = store.conn.lock().unwrap();
+    let row: (i64, i64, i64, String) = conn
+        .query_row(
+            "SELECT input_tokens, output_tokens, cached_tokens, origin
+               FROM usage_records WHERE source='dsh' AND session_id=?1",
+            params![session],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(row, (1500, 80, 300, "dsh_plugin".to_string()));
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM usage_records WHERE source='dsh' AND session_id=?1",
+            params![session],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}

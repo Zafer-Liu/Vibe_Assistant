@@ -1,5 +1,10 @@
 //! DeepSeek Harness 的 MCP 调用观测插件（cordis）。
 //!
+//! 【遗留模块】新安装一律走统一桥接插件 `dsh-agent-manager-bridge`
+//! （见 `dsh_bridge.rs`）；本模块仅保留两用途：安装/卸载供迁移清理旧条目，
+//! `parse_observation`/`record_observation` 继续服务 HTTP 端点
+//! （bridge 插件上报的 payload 与旧插件完全同构）。
+//!
 //! DSH 没有外部进程式 Hook，但 cordis 插件可以监听 `session/event`：每条
 //! `tool/call` 与 `tool/result` 都会经过事件总线（与 AcpBridge、工具恢复等
 //! 内置插件使用同一条通道）。本模块把观测插件分发到 desktop profile：
@@ -22,6 +27,7 @@ use sha2::{Digest, Sha256};
 pub(crate) const PLUGIN_ENTRY_ID: &str = "agent-manager-mcp-observe";
 const PLUGIN_FILE_NAME: &str = "agent-manager-mcp-observe.mjs";
 /// 相对模块说明符：include 层的 baseUrl 是 profile 目录。
+#[allow(dead_code)] // 遗留安装路径：保留旧插件形态作文档，迁移只用 uninstall/status
 const PLUGIN_RELATIVE_NAME: &str = "./plugins/agent-manager-mcp-observe.mjs";
 
 // ── 路径与端点 ────────────────────────────────────────────────────────────────
@@ -35,6 +41,7 @@ pub(crate) fn plugin_path() -> Option<PathBuf> {
 }
 
 /// 插件回传地址：与记忆注入插件共用智管本地 HTTP 服务（端口 9420）。
+#[allow(dead_code)]
 pub(crate) fn endpoint() -> String {
     format!(
         "http://127.0.0.1:{}/mcp/observation?source=dsh",
@@ -45,6 +52,7 @@ pub(crate) fn endpoint() -> String {
 // ── 插件源码 ──────────────────────────────────────────────────────────────────
 
 /// 插件 JS：ESM、零依赖（仅 Node 内置能力），由智管整份分发与升级。
+#[allow(dead_code)]
 fn plugin_source() -> &'static str {
     r#"// Agent Manager (智管) MCP observation bridge for DeepSeek Harness.
 // Installed and updated by Agent Manager; manual edits will be overwritten.
@@ -161,6 +169,7 @@ export function apply(ctx, config) {
 
 // ── patch 条目渲染与移除 ──────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 fn render_entry() -> String {
     format!(
         "- insert:\n    - id: {PLUGIN_ENTRY_ID}\n      name: {PLUGIN_RELATIVE_NAME}\n      config:\n        endpoint: {}\n        timeoutMs: 1500\n        maxInflight: 8\n        maxPending: 512",
@@ -193,6 +202,7 @@ fn rewrite_observation_items(text: &str) -> Result<String, String> {
 
 /// 安装/修复观测插件：写入插件文件，并确保 patch 层恰好有一条指向它的
 /// insert 条目（幂等：先移除旧条目再追加）。
+#[allow(dead_code)]
 pub(crate) fn install() -> Result<(), String> {
     let plugin = plugin_path()
         .ok_or_else(|| "无法定位 DeepSeek Harness 配置目录（~/.dsh）".to_string())?;
@@ -256,21 +266,6 @@ pub(crate) fn status() -> DshObservationStatus {
         plugin_path: plugin.map(|path| path.to_string_lossy().into_owned()),
         events: observed_events(),
     }
-}
-
-#[tauri::command]
-pub fn dsh_observation_status() -> DshObservationStatus {
-    status()
-}
-
-#[tauri::command]
-pub fn dsh_observation_set(enabled: bool) -> Result<DshObservationStatus, String> {
-    if enabled {
-        install()?;
-    } else {
-        uninstall()?;
-    }
-    Ok(status())
 }
 
 // ── 插件回传载荷 ──────────────────────────────────────────────────────────────

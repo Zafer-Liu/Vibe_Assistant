@@ -1183,6 +1183,272 @@ fn read_dsh_session(path: &Path) -> Result<Vec<(String, String)>, String> {
     Ok(messages)
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// dsh bridge 插件的单会话即时收集（POST /collect/trigger，agent/turn-stopping）
+// ────────────────────────────────────────────────────────────────────────────
+
+/// 校验并归一化插件上报的 dsh 会话标识：接受裸 uuid 或 `session-<uuid>`
+/// 目录名，返回裸 uuid。L0 入账使用的会话口径是目录名全文（见
+/// `agent_sources::session_id_for_path` 的 dsh 分支），由收集流程在定位
+/// 目录后自行重建，两条口径不在此处混淆。
+pub(crate) fn dsh_session_uuid(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let bare = trimmed.strip_prefix("session-").unwrap_or(trimmed);
+    if bare.len() != 36 || uuid::Uuid::parse_str(bare).is_err() {
+        return Err("session_id 必须是 dsh 会话 uuid 或 session-<uuid> 目录名".into());
+    }
+    Ok(bare.to_string())
+}
+
+/// /collect/trigger 的单会话收集结果（后台日志与测试断言共用）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct DshCollectOutcome {
+    /// 会话口径与扫描器一致：目录名全文（`session-<uuid>`）。
+    pub session_id: String,
+    /// 定位到的最高代际转录路径。
+    pub transcript: String,
+    /// L0 是否新入账（内容指纹变化时为 true）。
+    pub ingested: bool,
+    /// L1 提取结果：extracted | queued | skipped | busy | cancelled | failed。
+    pub l1: &'static str,
+    pub detail: String,
+}
+
+/// 在 `<dshHome>/sessions` 下定位 `session-<uuid>` 目录（有界遍历，上限与
+/// 扫描器一致），并选出其中最高代际的转录文件。找不到目录或目录内没有
+/// 可读转录时返回可读错误。
+fn locate_dsh_session_transcript(session_uuid: &str) -> Result<PathBuf, String> {
+    let home = crate::agent_sources::dsh_home()
+        .ok_or_else(|| "无法定位 DeepSeek Harness 数据目录（~/.dsh）".to_string())?;
+    let sessions_root = home.join("sessions");
+    let wanted = format!("session-{session_uuid}");
+    let mut pending = vec![sessions_root.clone()];
+    let mut visited = 0usize;
+    while let Some(directory) = pending.pop() {
+        if visited >= NATIVE_SCAN_MAX_ENTRIES {
+            break;
+        }
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path.file_name().and_then(|name| name.to_str()) == Some(wanted.as_str()) {
+                return latest_dsh_transcript(&path)
+                    .ok_or_else(|| format!("会话目录 {wanted} 中没有可读的会话转录"));
+            }
+            pending.push(path);
+        }
+    }
+    Err(format!(
+        "在 {} 下未找到会话目录 {wanted}",
+        sessions_root.display()
+    ))
+}
+
+/// 会话目录内代际最高的转录（`session.vN.jsonl(.zstd)`）。
+/// `is_latest_generation` 已保证只有最高代通过；同代并存多个文件时取
+/// 修改时间最新的一个。
+fn latest_dsh_transcript(session_dir: &Path) -> Option<PathBuf> {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in fs::read_dir(session_dir).ok()?.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !(name.ends_with(".jsonl") || name.ends_with(".jsonl.zstd")) {
+            continue;
+        }
+        if !crate::dsh_transcript::is_latest_generation(&path) {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if best.as_ref().map_or(true, |(time, _)| modified >= *time) {
+            best = Some((modified, path));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// dsh bridge 插件会话停止钩子（`agent/turn-stopping → POST /collect/trigger`）
+/// 的后台收集：定位会话转录 → 与 scan_native_transcripts 同构的 L0 入账
+/// （should_scan_transcript 门控 + read_dsh_session + record_native_conversation
+/// + record_transcript_scan）→ 对齐 memory_ingest_organize_session 的单会话
+/// L1 提取（ManualExtractionGuard 互斥、两次尝试、store_typed_l1_memories、
+/// queue_semantic_l1_index、失败 set_l1_failure）。只读本地转录与账本，
+/// 不触碰 dsh 自身状态；由 agent_http 在 tokio 后台任务中调用，错误与
+/// 结果均以可读文本返回（供日志与测试断言）。
+pub(crate) async fn collect_dsh_session(session_uuid: &str) -> Result<DshCollectOutcome, String> {
+    let transcript = locate_dsh_session_transcript(session_uuid)?;
+    let store = crate::telemetry_store::shared_store().ok_or("本地对话账本尚未初始化")?;
+    // 会话口径与扫描器一致：目录名全文，保证 L0 event_key 与用量命名空间相同。
+    let session_id = transcript
+        .parent()
+        .and_then(|directory| directory.file_name())
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .ok_or("会话目录名缺失，无法入账")?;
+    let event_key = format!("native:dsh:{session_id}:TranscriptSync");
+    let transcript_display = transcript.display().to_string();
+    let mut ingested = false;
+    let scan_note: &str;
+    if store.should_scan_transcript("dsh", &transcript, false) {
+        // 同一会话可能已被镜像来源入账（ZCode/Claude 互为镜像的既有规则）；
+        // dsh 当前无镜像，但保持与扫描器一致的双计防护。
+        if store.native_session_recorded_by_other_source("dsh", &session_id)? {
+            store.record_transcript_scan("dsh", &transcript, Some(&session_id), Ok(()));
+            return Ok(DshCollectOutcome {
+                session_id,
+                transcript: transcript_display,
+                ingested,
+                l1: "skipped",
+                detail: "会话已由其他来源入账，跳过重复采集".into(),
+            });
+        }
+        let messages = match read_dsh_session(&transcript) {
+            Ok(messages) => messages,
+            Err(error) => {
+                store.record_transcript_scan("dsh", &transcript, Some(&session_id), Err(&error));
+                return Err(format!("读取 dsh 会话转录失败（{transcript_display}）：{error}"));
+            }
+        };
+        if messages.is_empty() {
+            store.record_transcript_scan("dsh", &transcript, Some(&session_id), Ok(()));
+            return Ok(DshCollectOutcome {
+                session_id,
+                transcript: transcript_display,
+                ingested,
+                l1: "skipped",
+                detail: "会话转录为空，无需入账".into(),
+            });
+        }
+        let occurred_at = fs::metadata(&transcript)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .map(chrono::DateTime::<chrono::Utc>::from)
+            .map(|time| time.to_rfc3339())
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        ingested = store.record_native_conversation(
+            "dsh",
+            &session_id,
+            &transcript,
+            &occurred_at,
+            &messages,
+        )?;
+        store.record_transcript_scan("dsh", &transcript, Some(&session_id), Ok(()));
+        scan_note = if ingested { "转录已入账" } else { "转录内容未变化" };
+    } else {
+        scan_note = "转录未变化，跳过 L0 重扫";
+    }
+
+    // L1 提取：对齐 memory_ingest_organize_session（ManualExtractionGuard
+    // 互斥、两次尝试、失败落 l1_state='failed'）。
+    let conversation = store.conversation_by_event_key(&event_key)?;
+    let Some(conversation) = conversation else {
+        return Ok(DshCollectOutcome {
+            session_id,
+            transcript: transcript_display,
+            ingested,
+            l1: "queued",
+            detail: format!("{scan_note}；会话暂无待提取内容（可能已整理完成）"),
+        });
+    };
+    let Ok(run) = ManualExtractionGuard::start() else {
+        return Ok(DshCollectOutcome {
+            session_id,
+            transcript: transcript_display,
+            ingested,
+            l1: "busy",
+            detail: format!("{scan_note}；已有记忆提取任务正在运行，会话保留在待提取队列"),
+        });
+    };
+    let ingest = ingest_store();
+    let log = |state: &str, detail: String| {
+        if let Some(ingest) = ingest {
+            ingest.log(IngestLog {
+                at: now_str(),
+                agent_id: GLOBAL_MEMORY_OWNER.into(),
+                kind: "memory".into(),
+                state: state.into(),
+                detail,
+            });
+        }
+    };
+    log(
+        "working",
+        format!("dsh 会话结束触发收集（{session_id}）：正在提取记忆要点"),
+    );
+    let mut last_error = String::new();
+    let mut stored_count: Option<usize> = None;
+    for retry in 0..=1 {
+        if run.cancelled() {
+            break;
+        }
+        match run.extract(&conversation.conversation_text).await {
+            None => break,
+            Some(Ok(Ok(candidates))) => {
+                if run.cancelled() {
+                    break;
+                }
+                let count = store.store_typed_l1_memories(&event_key, &candidates)?;
+                crate::memory_backend::queue_semantic_l1_index(
+                    candidates.iter().map(|item| item.content.clone()).collect(),
+                );
+                stored_count = Some(count);
+                log("stored", format!("dsh 会话收集完成：写入 {count} 条记忆"));
+                break;
+            }
+            Some(Err(_)) => {
+                last_error = format!(
+                    "记忆模型在 {} 秒内未完成",
+                    ORGANIZE_ONE_CONVERSATION_TIMEOUT.as_secs()
+                )
+            }
+            Some(Ok(Err(error))) => last_error = error,
+        }
+        if retry < 1 && !run.pause_before_retry().await {
+            break;
+        }
+    }
+    if let Some(count) = stored_count {
+        return Ok(DshCollectOutcome {
+            session_id,
+            transcript: transcript_display,
+            ingested,
+            l1: "extracted",
+            detail: format!("{scan_note}；L1 提取完成，写入 {count} 条记忆"),
+        });
+    }
+    if run.cancelled() {
+        log("cancelled", "dsh 会话记忆提取已中断".into());
+        return Ok(DshCollectOutcome {
+            session_id,
+            transcript: transcript_display,
+            ingested,
+            l1: "cancelled",
+            detail: format!("{scan_note}；记忆提取已中断"),
+        });
+    }
+    store.set_l1_failure(&event_key, &last_error)?;
+    log("retrying", format!("dsh 会话记忆提取失败：{last_error}"));
+    Ok(DshCollectOutcome {
+        session_id,
+        transcript: transcript_display,
+        ingested,
+        l1: "failed",
+        detail: format!("{scan_note}；记忆提取失败：{last_error}"),
+    })
+}
+
 /// Extract only user/assistant text from a Qoder project JSONL. Tool payloads
 /// are intentionally excluded from memories and token estimates. The limits
 /// keep historical imports bounded before an LLM ever sees the transcript.

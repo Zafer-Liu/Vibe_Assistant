@@ -23,7 +23,7 @@ use std::path::PathBuf;
 /// cordis patch 条目与插件文件共用的稳定 id。
 pub(crate) const PLUGIN_ENTRY_ID: &str = "agent-manager-memory-inject";
 const PLUGIN_FILE_NAME: &str = "agent-manager-memory-inject.mjs";
-const SNAPSHOT_FILE_NAME: &str = "agent-manager-memory-snapshot.md";
+const SNAPSHOT_FILE_NAME: &str = "vibe-assistant-memory-snapshot.md";
 /// 相对模块说明符：include 层的 baseUrl 是 profile 目录。
 const PLUGIN_RELATIVE_NAME: &str = "./plugins/agent-manager-memory-inject.mjs";
 

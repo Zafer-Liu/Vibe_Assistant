@@ -57,7 +57,7 @@ pub use types::{
     TelemetrySummary, TelemetryUsageAnalytics, TelemetryUsageBucket, TelemetryUsageCostGroup,
     TelemetryUsageHeatCell, TelemetryUsageRecord, TelemetryUsageRefresh, UsageDayAggregate,
 };
-use types::TranscriptUsage;
+use types::{TranscriptUsage, TranscriptUsageRecord};
 
 impl TelemetryStore {
     pub fn new() -> Result<Self, String> {
@@ -3198,73 +3198,25 @@ impl TelemetryStore {
                 .map_err(|_| "telemetry store lock poisoned".to_string())?;
             let transaction = conn.transaction().map_err(|e| e.to_string())?;
             for (source, session_id, usage, origin, records) in &updates {
-                transaction.execute(
-                    "INSERT INTO session_token_usage (source, session_id, input_tokens, output_tokens, cached_tokens, origin, refreshed_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                     ON CONFLICT(source, session_id) DO UPDATE SET
-                       input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens,
-                       cached_tokens=excluded.cached_tokens, origin=excluded.origin, refreshed_at=excluded.refreshed_at",
-                    params![source, session_id, usage.input_tokens, usage.output_tokens, usage.cached_tokens, origin, now],
-                ).map_err(|e| e.to_string())?;
+                Self::upsert_session_usage_total(
+                    &transaction, source, session_id, usage, origin, &now,
+                )?;
                 transaction
                     .execute(
                         "DELETE FROM usage_records WHERE source = ?1 AND session_id = ?2",
                         params![source, session_id],
                     )
                     .map_err(|e| e.to_string())?;
-                for record in records {
-                    let occurred_at = normalize_occurred_at(record.occurred_at.as_deref())
-                        .unwrap_or_else(|| now.clone());
-                    // 一期定价：入库即计算 provider 归属 + 成本快照
-                    // （pricing_source 记录价格来源，支持后续追溯重算）。
-                    let memo_key =
-                        format!("{source}|{}", record.model.as_deref().unwrap_or(""));
-                    let (normalized_provider, normalized_model) = normalize_memo
-                        .entry(memo_key)
-                        .or_insert_with(|| {
-                            let normalized = crate::pricing::normalize_model(
-                                &transaction,
-                                record.model.as_deref(),
-                                source,
-                            );
-                            (normalized.provider_id, normalized.model_id)
-                        })
-                        .clone();
-                    let gateway = pricing_providers
-                        .iter()
-                        .find(|provider| provider.id == normalized_provider)
-                        .filter(|provider| !provider.base_url.is_empty())
-                        .map(|provider| {
-                            provider
-                                .base_url
-                                .trim_start_matches("https://")
-                                .trim_start_matches("http://")
-                                .split('/')
-                                .next()
-                                .unwrap_or_default()
-                                .to_string()
-                        })
-                        .filter(|host| !host.is_empty());
-                    let priced = crate::pricing::price_usage(
-                        &transaction,
-                        &pricing_providers,
-                        source,
-                        &normalized_provider,
-                        &normalized_model,
-                        record.input_tokens,
-                        record.output_tokens,
-                        record.cached_tokens,
-                    );
-                    transaction.execute(
-                        "INSERT OR REPLACE INTO usage_records
-                         (record_id, source, session_id, occurred_at, model, record_kind, input_tokens, output_tokens, cached_tokens, origin,
-                          provider_id, gateway, route, cost_usd, pricing_source)
-                         VALUES (?1, ?2, ?3, ?4, ?5, 'response', ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13)",
-                        params![record.record_id, source, session_id, occurred_at, record.model,
-                            record.input_tokens, record.output_tokens, record.cached_tokens, origin,
-                            normalized_provider, gateway, priced.cost_usd, priced.pricing_source],
-                    ).map_err(|e| e.to_string())?;
-                }
+                Self::write_priced_usage_records(
+                    &transaction,
+                    &pricing_providers,
+                    &now,
+                    source,
+                    session_id,
+                    origin,
+                    records,
+                    &mut normalize_memo,
+                )?;
             }
             transaction.commit().map_err(|e| e.to_string())?;
         }
@@ -3278,6 +3230,223 @@ impl TelemetryStore {
                 updates.len()
             ),
         })
+    }
+
+    /// 会话总量投影 upsert（usage 投影的第一层；该会话无逐条明细时看板的
+    /// 兜底行）。原 refresh_transcript_usage 内联事务体之一，提取为独立
+    /// 方法供转录扫描与 dsh 插件上报共用同一写入口径。
+    fn upsert_session_usage_total(
+        transaction: &Transaction<'_>,
+        source: &str,
+        session_id: &str,
+        usage: &TranscriptUsage,
+        origin: &str,
+        now: &str,
+    ) -> Result<(), String> {
+        transaction
+            .execute(
+                "INSERT INTO session_token_usage (source, session_id, input_tokens, output_tokens, cached_tokens, origin, refreshed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(source, session_id) DO UPDATE SET
+                   input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens,
+                   cached_tokens=excluded.cached_tokens, origin=excluded.origin, refreshed_at=excluded.refreshed_at",
+                params![source, session_id, usage.input_tokens, usage.output_tokens, usage.cached_tokens, origin, now],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// usage_records 明细行的定价与写入内核（原 refresh_transcript_usage 的
+    /// 内联事务体）。occurred_at 缺失时以 now 兜底；定价先经
+    /// pricing::normalize_model 归一（normalize_memo 跨行复用，避免同模型
+    /// 字符串重复做全表 alias 扫描），再经 pricing::price_usage 计算成本
+    /// 快照（pricing_source 记录价格来源，支持后续追溯重算）。幂等性由
+    /// record_id + INSERT OR REPLACE 保证，调用方负责让同一逻辑观测在
+    /// 不同上报路径下命中同一 record_id。
+    fn write_priced_usage_records(
+        transaction: &Transaction<'_>,
+        pricing_providers: &[crate::provider_catalog::ProviderConfig],
+        now: &str,
+        source: &str,
+        session_id: &str,
+        origin: &str,
+        records: &[TranscriptUsageRecord],
+        normalize_memo: &mut HashMap<String, (String, String)>,
+    ) -> Result<(), String> {
+        for record in records {
+            let occurred_at = normalize_occurred_at(record.occurred_at.as_deref())
+                .unwrap_or_else(|| now.to_string());
+            let memo_key = format!("{source}|{}", record.model.as_deref().unwrap_or(""));
+            let (normalized_provider, normalized_model) = normalize_memo
+                .entry(memo_key)
+                .or_insert_with(|| {
+                    let normalized = crate::pricing::normalize_model(
+                        transaction,
+                        record.model.as_deref(),
+                        source,
+                    );
+                    (normalized.provider_id, normalized.model_id)
+                })
+                .clone();
+            let gateway = pricing_providers
+                .iter()
+                .find(|provider| provider.id == normalized_provider)
+                .filter(|provider| !provider.base_url.is_empty())
+                .map(|provider| {
+                    provider
+                        .base_url
+                        .trim_start_matches("https://")
+                        .trim_start_matches("http://")
+                        .split('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .filter(|host| !host.is_empty());
+            let priced = crate::pricing::price_usage(
+                transaction,
+                pricing_providers,
+                source,
+                &normalized_provider,
+                &normalized_model,
+                record.input_tokens,
+                record.output_tokens,
+                record.cached_tokens,
+            );
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO usage_records
+                     (record_id, source, session_id, occurred_at, model, record_kind, input_tokens, output_tokens, cached_tokens, origin,
+                      provider_id, gateway, route, cost_usd, pricing_source)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'response', ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13)",
+                    params![record.record_id, source, session_id, occurred_at, record.model,
+                        record.input_tokens, record.output_tokens, record.cached_tokens, origin,
+                        normalized_provider, gateway, priced.cost_usd, priced.pricing_source],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// dsh bridge 插件逐条 usage 上报（`POST /telemetry/usage?source=dsh`）
+    /// 的幂等入库。与转录扫描口径（read_dsh_usage_records /
+    /// refresh_transcript_usage）共用 record_id 命名空间：插件把
+    /// assistant/message 的事件 seq 放进 message_id 时，同一消息无论先经
+    /// 哪条路径入账都命中同一 record_id，INSERT OR REPLACE 原位覆盖、不
+    /// 双计；转录扫描的 DELETE+重插则整体接管该会话明细（插件先报、扫描
+    /// 后到时被替换）。只写 usage_records（origin=dsh_plugin），不动
+    /// session_token_usage——看板聚合是 detail-first，会话总量行仅在无明
+    /// 细时兜底，插件逐条数据天然成为该会话的权威口径。
+    ///
+    /// 载荷：`{session_id, model?, input_tokens, output_tokens, cached_tokens,
+    /// occurred_at?, message_id?}`。session_id 接受裸 uuid 或 `session-<uuid>`
+    /// 目录名，统一归一成扫描器口径；cached 按「缓存命中 ⊆ 输入」钳制。
+    /// 校验失败返回可读 Err（HTTP 层映射 400）。成功返回 record_id。
+    pub fn record_dsh_plugin_usage(&self, payload: &Value) -> Result<String, String> {
+        let raw_session = payload
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or("session_id 不能为空")?;
+        let session_id = Self::canonical_dsh_session_id(raw_session)?;
+        // 插件转发 DeepSeek 原始字段：input_tokens 是未命中缓存的输入，
+        // cached_tokens 是缓存命中。账本口径与 read_dsh_usage_records 对齐
+        // （input 列 = 输入合计、含缓存命中；cached 列标记折价部分）——否则
+        // 同一 record_id 被两条路径先后覆盖时，缓存命中部分会漏计。
+        let raw_input = Self::usage_counter(payload, "input_tokens")?;
+        let output_tokens = Self::usage_counter(payload, "output_tokens")?;
+        let cached_tokens = Self::usage_counter(payload, "cached_tokens")?;
+        let input_tokens = raw_input + cached_tokens;
+        let cached_tokens = cached_tokens.min(input_tokens);
+        if input_tokens <= 0 && output_tokens <= 0 {
+            return Err("input_tokens 与 output_tokens 不能同时为零".into());
+        }
+        let model = payload
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.chars().take(128).collect::<String>());
+        let occurred_at = match payload.get("occurred_at").and_then(Value::as_str) {
+            Some(raw) if !raw.trim().is_empty() => Some(
+                normalize_occurred_at(Some(raw)).ok_or("occurred_at 不是合法的 RFC3339 时间")?,
+            ),
+            _ => None,
+        };
+        let message_id = payload
+            .get("message_id")
+            .and_then(Value::as_str)
+            .map(|raw| {
+                raw.chars()
+                    .filter(|character| !character.is_control())
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
+            .filter(|value| !value.is_empty())
+            .map(|value| value.chars().take(128).collect::<String>());
+        // identity：message_id（插件传事件 seq）与 read_dsh_usage_records 的
+        // seq identity 完全一致，是跨路径不双计的关键；缺失时退回
+        // 「模型+计数+时间」稳定组合，同载荷重试仍幂等。
+        let identity = match &message_id {
+            Some(message_id) => message_id.clone(),
+            None => format!(
+                "{}|{input_tokens}|{output_tokens}|{cached_tokens}|{}",
+                model.as_deref().unwrap_or(""),
+                occurred_at.as_deref().unwrap_or(""),
+            ),
+        };
+        let record_id = usage_record_id("dsh", &session_id, "message", &identity);
+        let record = TranscriptUsageRecord {
+            record_id: record_id.clone(),
+            occurred_at,
+            model,
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+        };
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let pricing_providers = crate::provider_catalog::pricing_snapshot().unwrap_or_default();
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| "telemetry store lock poisoned".to_string())?;
+        let transaction = conn.transaction().map_err(|e| e.to_string())?;
+        let mut normalize_memo = HashMap::new();
+        Self::write_priced_usage_records(
+            &transaction,
+            &pricing_providers,
+            &now,
+            "dsh",
+            &session_id,
+            "dsh_plugin",
+            std::slice::from_ref(&record),
+            &mut normalize_memo,
+        )?;
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(record_id)
+    }
+
+    /// dsh 插件上报的 session_id 归一化：接受裸 uuid 或目录名
+    /// `session-<uuid>`，统一为转录扫描口径（见 agent_sources::
+    /// session_id_for_path 的 dsh 分支），保证 usage_record_id 与
+    /// refresh_transcript_usage 同命名空间。仅认带连字符的规范 uuid 形态。
+    fn canonical_dsh_session_id(raw: &str) -> Result<String, String> {
+        let bare = raw.strip_prefix("session-").unwrap_or(raw);
+        if bare.len() != 36 || uuid::Uuid::parse_str(bare).is_err() {
+            return Err("session_id 必须是 dsh 会话 uuid 或 session-<uuid> 目录名".into());
+        }
+        Ok(format!("session-{bare}"))
+    }
+
+    /// 非负整数 usage 计数字段（JSON u64 → i64 安全收窄）。
+    fn usage_counter(payload: &Value, key: &str) -> Result<i64, String> {
+        let value = payload
+            .get(key)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("{key} 缺失或不是非负整数"))?;
+        i64::try_from(value).map_err(|_| format!("{key} 超出可记录范围"))
     }
 
     fn usage_sessions_to_scan(&self) -> Result<Vec<(String, String, Option<PathBuf>)>, String> {
