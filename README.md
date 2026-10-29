@@ -93,7 +93,7 @@ A single catalog for MCP servers on your machine — manage them once, distribut
 
 ### 🎬 How MCP flows: one config → ten clients
 
-![How MCP flows: one config to ten clients](Images/animations/mcp-system.webm)
+![How MCP flows: one config to ten clients](Images/animations/mcp-system.gif)
 
 One catalog defines your MCP servers; Vibe Assistant writes each client's native config format (Claude JSON, Codex TOML, dsh YAML, and seven others). A stdio relay sits between agent and server to observe call boundaries (server, tool, success, latency — never arguments or content) and reports to a local telemetry ledger. Config changes hot-reload into running clients without restarts.
 
@@ -165,7 +165,7 @@ Every coding Agent you use remembers your preferences, decisions, and current wo
 
 ### 🎬 How memory flows: L0 → L3
 
-![How memory flows: L0 to L3](Images/animations/memory-system.webm)
+![How memory flows: L0 to L3](Images/animations/memory-system.gif)
 
 Every conversation an agent completes becomes raw events (L0). An LLM extracts 1–3 typed records per session (L1). Every 30 days of L1 evidence consolidates into working memory (L2). A human-reviewed draft of L2 publishes as the long-term profile (L3) that every connected agent receives at session start. The split keeps context budgets small while preserving an audit trail back to the original conversation.
 
@@ -245,7 +245,7 @@ Hand-written entries under the working-memory or long-term cards — only you ca
 
 ### 🎬 How skills flow: scan → publish → equip
 
-![How skills flow: scan, publish, equip](Images/animations/skill-system.webm)
+![How skills flow: scan, publish, equip](Images/animations/skill-system.gif)
 
 Every agent's `SKILL.md` files scan into one shared library, keyed by content hash. Before any sync you preview exactly what will be added (green), updated (yellow), or conflicted (red). "Publish + equip" writes approved skills back to every agent's directory in one step. Version drift is visible per agent; one click rolls back the latest publish or adopts a local edit as the new shared version. The marketplace installs curated skills from official OpenAI and Anthropic repositories with size bounds and path validation.
 
