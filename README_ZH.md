@@ -96,7 +96,7 @@ English | **[简体中文](./README_ZH.md)**
 
 ### 🎬 MCP 如何流转：一份配置 → 十个客户端
 
-<video src="./Images/animations/mcp-system.webm" width="100%" autoplay loop muted playsinline></video>
+![How MCP flows: one config to ten clients](Images/animations/mcp-system.webm)
 
 统一目录定义你的 MCP 服务器；Vibe Assistant 写出每个客户端的原生配置格式（Claude JSON、Codex TOML、dsh YAML 等十种）。stdio 中继位于 agent 与服务器之间，观测调用边界（服务器、工具、成功、耗时——绝不记录参数与返回内容），并上报本地遥测账本。配置变更热重载到运行中的客户端，无需重启。
 
@@ -168,7 +168,7 @@ English | **[简体中文](./README_ZH.md)**
 
 ### 🎬 记忆如何流转：L0 → L3
 
-<video src="./Images/animations/memory-system.webm" width="100%" autoplay loop muted playsinline></video>
+![How memory flows: L0 to L3](Images/animations/memory-system.webm)
 
 每次 agent 完成的会话成为原始事件（L0）；LLM 从每次会话提取 1–3 条带类型的记录（L1）；每 30 天的 L1 证据整编为工作记忆（L2）；L2 的草稿经人工确认后发布为长期 Profile（L3），在每个会话开局注入到所有连接的 agent。分层让上下文预算保持小巧，同时保留回到原始会话的审计链。
 
@@ -248,7 +248,7 @@ English | **[简体中文](./README_ZH.md)**
 
 ### 🎬 Skill 如何流转：扫描 → 发布 → 装备
 
-<video src="./Images/animations/skill-system.webm" width="100%" autoplay loop muted playsinline></video>
+![How skills flow: scan, publish, equip](Images/animations/skill-system.webm)
 
 每个 agent 的 `SKILL.md` 文件扫描进共享库，按内容哈希识别。任何同步前预览确切的新增（绿）、更新（黄）、冲突（红）。「发布 + 装备」一步把批准的技能写回每个 agent 的目录。版本漂移按 agent 可见；一键回滚最近一次发布，或把本地修改采纳为共享新版。技能市场从 OpenAI 与 Anthropic 官方仓库安装精选技能，下载受限且路径校验。
 
