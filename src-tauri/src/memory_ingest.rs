@@ -416,35 +416,32 @@ impl IngestStore {
             .map(|(role, content)| format!("[{role}]\n{content}"))
             .collect::<Vec<_>>()
             .join("\n\n");
-        let extraction_messages = l1_extraction_messages(&transcript);
-        let extracted = match llm::complete_text_for(&provider, &extraction_messages, None, crate::llm_trace::ModelPurpose::MemoryExtract).await {
-            Ok(text) => match parse_typed_l1_candidates(&text) {
-                Ok(candidates) => candidates,
-                Err(error) => {
-                    if let Some(telemetry) = crate::telemetry_store::shared_store() {
-                        let _ = telemetry.set_l1_failure_for_session(session_id, &error);
-                    }
-                    self.restore_session_for(session_id, buf.clone());
-                    self.log(IngestLog {
-                        at: now_str(),
-                        agent_id: buf.agent_id.clone(),
-                        kind: "memory".into(),
-                        state: "failed".into(),
-                        detail: format!(
-                            "L1 标签校验失败：{error}；完整会话已保留，可修正模型输出后重跑"
-                        ),
-                    });
-                    return;
-                }
-            },
-            Err(error) => {
+        let extracted = match extract_l1_with_provider(&provider, &transcript).await {
+            Ok(candidates) => candidates,
+            Err(L1ExtractError::Transport(error)) => {
                 self.restore_session_for(session_id, buf.clone());
                 self.log(IngestLog {
                     at: now_str(),
                     agent_id: buf.agent_id.clone(),
                     kind: "memory".into(),
                     state: "retrying".into(),
-                    detail: format!("{}；已保留完整会话等待重试", error),
+                    detail: format!("{error}；已保留完整会话等待重试"),
+                });
+                return;
+            }
+            Err(L1ExtractError::Contract(error)) => {
+                if let Some(telemetry) = crate::telemetry_store::shared_store() {
+                    let _ = telemetry.set_l1_failure_for_session(session_id, &error);
+                }
+                self.restore_session_for(session_id, buf.clone());
+                self.log(IngestLog {
+                    at: now_str(),
+                    agent_id: buf.agent_id.clone(),
+                    kind: "memory".into(),
+                    state: "failed".into(),
+                    detail: format!(
+                        "L1 标签校验失败：{error}；完整会话已保留，可修正模型输出后重跑"
+                    ),
                 });
                 return;
             }
@@ -594,12 +591,83 @@ fn strip_memory_thinking(role: &str, content: &str) -> String {
     }
 }
 
+/// L1 提取在请求层与契约层各有失败出口，调用方处置不同：Transport 保留
+/// 会话等待自动重试；Contract 说明模型输出本身不合契约（自修复轮也救不
+/// 回），需要落 l1_state='failed' 供手动重跑。
+enum L1ExtractError {
+    Transport(String),
+    Contract(String),
+}
+
+impl L1ExtractError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Transport(message) | Self::Contract(message) => message,
+        }
+    }
+}
+
 async fn extract_l1_conversation(
     transcript: &str,
 ) -> Result<Vec<crate::telemetry_store::L1MemoryCandidate>, String> {
     let provider = llm::memory_extraction_provider()?;
-    let text = llm::complete_text_for(&provider, &l1_extraction_messages(transcript), None, crate::llm_trace::ModelPurpose::MemoryExtract).await?;
-    parse_typed_l1_candidates(&text)
+    extract_l1_with_provider(&provider, transcript)
+        .await
+        .map_err(L1ExtractError::into_message)
+}
+
+/// 一次完整的 L1 提取：首轮请求 + 契约解析；输出不合契约时先追加一轮
+/// 自修复（见 [`repair_l1_output`]）。这里只产出 L1 正文，不调用决策模型；
+/// 领域分类是显式后续阶段，由待提取/已整理页的整理分类流程执行。
+async fn extract_l1_with_provider(
+    provider: &llm::LlmProvider,
+    transcript: &str,
+) -> Result<Vec<crate::telemetry_store::L1MemoryCandidate>, L1ExtractError> {
+    let purpose = crate::llm_trace::ModelPurpose::MemoryExtract;
+    let text = llm::complete_text_for(provider, &l1_extraction_messages(transcript), None, purpose)
+        .await
+        .map_err(L1ExtractError::Transport)?;
+    match parse_typed_l1_candidates(&text) {
+        Ok(candidates) => Ok(candidates),
+        Err(contract_error) => repair_l1_output(provider, &text, purpose, &contract_error).await,
+    }
+}
+
+/// 首轮输出不合契约时的自修复轮：把模型自己的输出喂回去，用更强的格式
+/// 约束要求改写。原样重发首轮提示词只会得到同样的散文输出（issue #9 的
+/// 会话因此重试 3 次全部失败并永久卡在 failed），修复轮给模型一次低成本
+/// 改写机会；原输出为空时无从改写，直接沿用原始错误。
+async fn repair_l1_output(
+    provider: &llm::LlmProvider,
+    previous_output: &str,
+    purpose: crate::llm_trace::ModelPurpose,
+    original_error: &str,
+) -> Result<Vec<crate::telemetry_store::L1MemoryCandidate>, L1ExtractError> {
+    let Some(messages) = l1_repair_messages(previous_output) else {
+        return Err(L1ExtractError::Contract(original_error.to_string()));
+    };
+    let repaired = llm::complete_text_for(provider, &messages, None, purpose)
+        .await
+        .map_err(|error| L1ExtractError::Transport(format!("自修复请求失败：{error}")))?;
+    parse_typed_l1_candidates(&repaired).map_err(|_| {
+        L1ExtractError::Contract(format!(
+            "{original_error}；自修复轮仍未产出契约 JSON"
+        ))
+    })
+}
+
+/// 自修复轮的消息。用户消息原样携带首轮输出——修复轮据此改写，不再重读
+/// 会话正文，成本只有首轮的零头。原输出全是空白时返回 None（无从改写）。
+fn l1_repair_messages(previous_output: &str) -> Option<Vec<Value>> {
+    let previous = previous_output.trim();
+    if previous.is_empty() {
+        return None;
+    }
+    let language = output_language_directive(previous);
+    Some(vec![
+        json!({"role": "system", "content": format!("你是本地 Vibe Assistant 的记忆整理修复器。上一次整理的输出没有符合 JSON 契约，请把给出的内容改写为契约 JSON：{{\"memories\":[{{\"content\":\"...\",\"type\":\"summary|fact|decision|constraint|preference_candidate|open_item\",\"durability\":\"session|short_term|long_term\"}}]}}。要求：第一条必须是 type 为 summary、durability 为 session 的会话结论摘要；总共最多 3 条；只保留原输出中明确的事实与结论，不要臆测新增；若原输出表示没有值得沉淀的内容，就只输出一条概括该会话做了什么、结论如何的 summary。只输出 JSON 本身，不要代码块，不要任何解释文字。{language}")}),
+        json!({"role": "user", "content": previous}),
+    ])
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -2035,6 +2103,7 @@ fn parse_typed_l1_candidates(
                 &memory_type,
             ),
             memory_type,
+            domains: Vec::new(),
         });
     }
     if candidates.is_empty() {
@@ -3270,6 +3339,15 @@ pub async fn local_memory_list(
     telemetry.local_l1_memories(limit.unwrap_or(200))
 }
 
+/// 全量 L1 记忆：记忆清洗构建全库（含所有设备镜像）语义候选用；
+/// 列表 UI 仍走有上限的 local_memory_list。
+#[tauri::command]
+pub async fn local_memory_list_all(
+    telemetry: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
+) -> Result<Vec<crate::telemetry_store::LocalMemory>, String> {
+    telemetry.all_l1_memories_for_consolidation()
+}
+
 #[tauri::command]
 pub async fn local_memory_stats(
     telemetry: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
@@ -3894,6 +3972,32 @@ mod tests {
             Ok(_) => panic!("no usable items must fail"),
         };
         assert!(error.contains("输出开头"), "empty-candidates error should quote output, got: {error}");
+    }
+
+    #[test]
+    fn l1_repair_round_messages_carry_previous_output_and_contract() {
+        // 空输出无从改写：不发起修复轮，直接沿用原始契约错误。
+        assert!(super::l1_repair_messages("").is_none());
+        assert!(super::l1_repair_messages("  \n\t ").is_none());
+        let messages = super::l1_repair_messages(
+            "这次对话只是一次性的 Docker 排查，没有需要沉淀的内容。",
+        )
+        .expect("prose output should get a repair round");
+        assert_eq!(messages.len(), 2);
+        let system = messages[0]["content"].as_str().unwrap();
+        // 修复提示词必须重申核心契约：首条 summary、最多 3 条、纯 JSON。
+        assert!(system.contains("summary"), "repair prompt must restate summary-first rule");
+        assert!(system.contains("最多 3 条"), "repair prompt must restate the 3-item cap");
+        assert!(system.contains("不要代码块"), "repair prompt must demand bare JSON");
+        assert!(system.contains("memories"), "repair prompt must show the contract shape");
+        // 用户消息原样携带首轮输出：修复轮据此改写，不重读会话正文。
+        assert_eq!(
+            messages[1]["content"].as_str().unwrap(),
+            "这次对话只是一次性的 Docker 排查，没有需要沉淀的内容。"
+        );
+        // 修复轮的产出仍走同一个宽容解析器：模型按提示词输出即可被接受。
+        let repaired = r#"{"memories":[{"content":"会话完成了一次 Docker 排查并给出结论","type":"summary","durability":"session"}]}"#;
+        assert!(parse_typed_l1_candidates(repaired).is_ok());
     }
 
     #[test]

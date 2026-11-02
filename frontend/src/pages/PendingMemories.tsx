@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { invoke } from '@tauri-apps/api/core'
 import {
   ArrowLeft, Brain, CheckCircle2, Clock3, Loader2, MessagesSquare, RefreshCw, RotateCcw, XCircle, X,
 } from 'lucide-react'
@@ -21,6 +22,7 @@ export const PendingMemories = memo(function PendingMemories({ onBack, active = 
   const [filter, setFilter] = useState<StateFilter>('all')
   const [refreshing, setRefreshing] = useState(false)
   const [organizingAll, setOrganizingAll] = useState(false)
+  const [classifying, setClassifying] = useState(false)
   const [organizingKey, setOrganizingKey] = useState<string | null>(null)
   const [notice, setNotice] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
   const [detailKey, setDetailKey] = useState<string | null>(null)
@@ -60,7 +62,7 @@ export const PendingMemories = memo(function PendingMemories({ onBack, active = 
   )
 
   const modelReady = Boolean(ingestStatus?.model_ready)
-  const extractionRunning = organizingAll || organizingKey !== null || Boolean(ingestStatus?.manual_extraction_running)
+  const extractionRunning = classifying || organizingAll || organizingKey !== null || Boolean(ingestStatus?.manual_extraction_running)
 
   async function handleRefresh() {
     if (refreshing) return
@@ -75,19 +77,54 @@ export const PendingMemories = memo(function PendingMemories({ onBack, active = 
 
   async function handleOrganizeAll() {
     if (extractionRunning) return
+    const pendingKeys = (sessions ?? []).map((item) => item.event_key)
     setOrganizingAll(true)
     setNotice(null)
     try {
       const result = await organizeConversations()
-      setNotice(result.cancelled
-        ? { kind: 'ok', text: t('memory.pending.interrupted', { succeeded: result.succeeded, failed: result.failed }) }
-        : result.failed > 0
-          ? { kind: 'err', text: t('memory.pending.organizeAllDonePartial', { succeeded: result.succeeded, failed: result.failed }) }
-          : { kind: 'ok', text: t('memory.pending.organizeAllDone', { succeeded: result.succeeded }) })
+      if (result.cancelled || result.failed > 0) {
+        setNotice(result.cancelled
+          ? { kind: 'ok', text: t('memory.pending.interrupted', { succeeded: result.succeeded, failed: result.failed }) }
+          : { kind: 'err', text: t('memory.pending.organizeAllDonePartial', { succeeded: result.succeeded, failed: result.failed }) })
+        return
+      }
       await reload()
+      const organizedKeys = result.succeeded > 0
+        ? pendingKeys.slice(0, result.succeeded)
+        : []
+      let classified = 0
+      if (organizedKeys.length > 0) {
+        setClassifying(true)
+        setNotice({ kind: 'ok', text: t('memory.pending.classifyProgress', { done: 0, total: organizedKeys.length }) })
+        const BATCH_SIZE = 4
+        try {
+          for (let index = 0; index < organizedKeys.length; index += BATCH_SIZE) {
+            await invoke('memory_domain_classify_snapshot_ids', {
+              snapshotIds: organizedKeys.slice(index, index + BATCH_SIZE),
+            })
+            classified += Math.min(BATCH_SIZE, organizedKeys.length - index)
+            setNotice({ kind: 'ok', text: t('memory.pending.classifyProgress', {
+              done: classified,
+              total: organizedKeys.length,
+            }) })
+          }
+        } catch (error) {
+          setNotice({ kind: 'ok', text: t('memory.pending.organizeAllClassifyFailed', {
+            succeeded: result.succeeded,
+            classified,
+            error: String(error),
+          }) })
+          return
+        }
+      }
+      setNotice({ kind: 'ok', text: t('memory.pending.organizeAllDone', {
+        succeeded: result.succeeded,
+        classified,
+      }) })
     } catch (error) {
       setNotice({ kind: 'err', text: t('memory.pending.organizeFailed', { error: String(error) }) })
     } finally {
+      setClassifying(false)
       setOrganizingAll(false)
     }
   }

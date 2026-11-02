@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { ArrowLeft, CheckCircle2, Loader2, MessagesSquare, RefreshCw } from 'lucide-react'
+import { invoke } from '@tauri-apps/api/core'
+import { ArrowLeft, CheckCircle2, Loader2, MessagesSquare, RefreshCw, Tags } from 'lucide-react'
 import { useMemoryFields } from '../store/memoryStore'
 import { useTelemetryFields } from '../store/telemetryStore'
 import type { MemoryConversationDetail, PendingMemorySession } from '../types/memory'
@@ -18,6 +19,8 @@ export const OrganizedConversations = memo(function OrganizedConversations({ onB
   const [detailKey, setDetailKey] = useState<string | null>(null)
   const [detail, setDetail] = useState<MemoryConversationDetail | null>(null)
   const [detailError, setDetailError] = useState<string | null>(null)
+  const [classifying, setClassifying] = useState(false)
+  const [classifyNotice, setClassifyNotice] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
 
   const reload = useCallback(async () => {
     try {
@@ -59,6 +62,45 @@ export const OrganizedConversations = memo(function OrganizedConversations({ onB
     }
   }
 
+  async function handleClassifyAll() {
+    if (classifying) return
+    const keys = (sessions ?? []).map((item) => item.event_key)
+    if (keys.length === 0) return
+    setClassifying(true)
+    setClassifyNotice(null)
+    try {
+      const config = await invoke<{
+        enabled: boolean
+        provider: 'jev' | 'ollama'
+        model: string
+        has_api_key: boolean
+      }>('memory_domain_config_get')
+      const ready = config.enabled && !!config.model.trim()
+        && (config.provider === 'ollama' || config.has_api_key)
+      if (!ready) throw new Error(t('memory.pending.classifyNotReady'))
+      const BATCH_SIZE = 4
+      let processed = 0
+      for (let index = 0; index < keys.length; index += BATCH_SIZE) {
+        await invoke('memory_domain_classify_snapshot_ids', {
+          snapshotIds: keys.slice(index, index + BATCH_SIZE),
+        })
+        processed += Math.min(BATCH_SIZE, keys.length - index)
+        setClassifyNotice({ kind: 'ok', text: t('memory.pending.classifyProgress', {
+          done: processed,
+          total: keys.length,
+        }) })
+      }
+      setClassifyNotice({ kind: 'ok', text: t('memory.pending.classifyDone', {
+        processed,
+        total: keys.length,
+      }) })
+    } catch (error) {
+      setClassifyNotice({ kind: 'err', text: t('memory.pending.classifyFailed', { error: String(error) }) })
+    } finally {
+      setClassifying(false)
+    }
+  }
+
   async function handleOpenDetail(eventKey: string) {
     setDetailKey(eventKey)
     setDetail(null)
@@ -87,7 +129,11 @@ export const OrganizedConversations = memo(function OrganizedConversations({ onB
             <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">{t('memory.organized.desc')}</p>
           </div>
         </div>
-        <button type="button" onClick={() => { void handleRefresh() }} disabled={refreshing} className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:bg-slate-50 disabled:cursor-wait disabled:opacity-60 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"><RefreshCw size={16} className={refreshing ? 'animate-spin motion-reduce:animate-none' : ''} />{t('memory.organized.refresh')}</button>
+        <div className="flex flex-wrap items-center gap-2">
+          {classifyNotice && <span className={`rounded-lg px-3 py-2 text-xs ${classifyNotice.kind === 'ok' ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300' : 'bg-red-500/10 text-red-700 dark:text-red-300'}`} role="status">{classifyNotice.text}</span>}
+          <button type="button" onClick={() => { void handleClassifyAll() }} disabled={classifying || sessions === null || sessions.length === 0} title={t('memory.pending.classifyTitle')} className="inline-flex h-10 items-center gap-2 rounded-lg border border-emerald-200 bg-white px-3 text-sm font-medium text-emerald-700 transition hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 dark:border-emerald-500/30 dark:bg-slate-900 dark:text-emerald-300 dark:hover:bg-emerald-500/10">{classifying ? <Loader2 size={16} className="animate-spin motion-reduce:animate-none" /> : <Tags size={16} />}{classifying ? t('memory.pending.classifyRunning') : t('memory.pending.classify')}</button>
+          <button type="button" onClick={() => { void handleRefresh() }} disabled={refreshing || classifying} className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:bg-slate-50 disabled:cursor-wait disabled:opacity-60 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"><RefreshCw size={16} className={refreshing ? 'animate-spin motion-reduce:animate-none' : ''} />{t('memory.organized.refresh')}</button>
+        </div>
       </header>
 
       <section className="mt-7" aria-label={t('memory.organized.overviewLabel')}>

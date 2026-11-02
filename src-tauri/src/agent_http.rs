@@ -462,7 +462,7 @@ fn store_unavailable() -> (&'static str, String) {
     )
 }
 
-/// `POST /memory/recall`：`{query, limit? 1-12 默认6}` → recall 同构 JSON。
+/// `POST /memory/recall`：`{query, limit?, domains?, domain_mode?}` → recall 同构 JSON。
 fn handle_memory_recall(
     body: &str,
     store: Option<&crate::telemetry_store::TelemetryStore>,
@@ -474,10 +474,9 @@ fn handle_memory_recall(
     let Some(store) = store else {
         return store_unavailable();
     };
-    // 预算 3000ms：略低于桥接插件默认 2s 请求超时的服务端一侧必须更快——
-    // 插件超时是 2s，这里给语义检索 3s 预算看似更慢，但预算只限制语义检索
-    // 这一步，本地关键词检索与 RRF 融合是毫秒级；总耗时稳定在预算量级内，
-    // 远程嵌入慢时按本地降级返回，不再让调用整段超过插件 deadline。
+    // 路由与语义检索共享 3000ms 预算：JEV 先消耗的时间会从后续语义检索
+    // 预算中扣除。远程决策或嵌入慢时按本地检索降级，避免两段串行请求
+    // 各自占满一个完整超时。
     match crate::memory_mcp::recall_with_store_budget(store, &arguments, Some(3_000)) {
         Ok(value) => ("200 OK", value.to_string()),
         Err(error) => bad_request(error),

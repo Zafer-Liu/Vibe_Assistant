@@ -85,3 +85,4 @@ DESIGN.md
 /animations/
 # Session scratch files
 .tmp_*
+bump-version.bat

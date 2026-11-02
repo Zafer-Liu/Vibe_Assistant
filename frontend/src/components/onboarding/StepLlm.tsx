@@ -51,7 +51,7 @@ export function StepLlm({ onNext, onBusyChange }: {
       <h2 className="text-lg font-bold text-gray-900 dark:text-gray-100">{t('onboarding.llm.title')}</h2>
       <p className="mt-2 text-sm leading-6 text-gray-500 dark:text-gray-400">{t('onboarding.llm.desc')}</p>
       <fieldset disabled={checking} className="mt-5 min-w-0 border-0 p-0 disabled:opacity-70">
-        <LlmSettings embedded onBusyChange={setConfiguring} onReadinessChange={setReady} />
+        <LlmSettings embedded includeDecision={false} onBusyChange={setConfiguring} onReadinessChange={setReady} />
       </fieldset>
       {!ready && <p id={pendingChangesId} role="status" className="mt-3 text-sm text-amber-700 dark:text-amber-400">{t('onboarding.llm.pendingChanges')}</p>}
       {error && <p role="alert" className="mt-3 break-words rounded-lg bg-red-50 p-3 text-sm text-red-600 dark:bg-red-500/10 dark:text-red-400">{error}</p>}

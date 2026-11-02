@@ -927,11 +927,16 @@ fn tool(name: &str, description: &str, input_schema: Value) -> Value {
 
 fn tools() -> Vec<Value> {
     vec![
-        tool("recall_memory", "Search the user's shared long-term memory and return only the query-relevant L1 items. Use this before planning or continuing work when prior preferences, decisions, or constraints may matter.", json!({
+        tool("recall_memory", "Search the user's shared long-term memory. By default the configured decision model selects up to two relevant domains and semantic/keyword retrieval runs only inside them; low-confidence routing falls back to global recall. Pass domains for explicit scoped recall, or domain_mode=off for legacy global retrieval.", json!({
             "type": "object", "properties": {
-                "query": { "type": "string", "description": "Current task or question used to retrieve relevant memory." },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 12, "default": 6 }
+                "query": { "type": "string", "description": "Current task or question used to route domains and retrieve relevant memory." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 12, "default": 6 },
+                "domains": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 2, "uniqueItems": true, "description": "Optional explicit domain ids from list_memory_domains. Explicit ids bypass JEV routing." },
+                "domain_mode": { "type": "string", "enum": ["auto", "manual", "off"], "default": "auto", "description": "auto routes with JEV; manual requires domains; off searches globally without domain filtering." }
             }, "required": ["query"], "additionalProperties": false
+        })),
+        tool("list_memory_domains", "List the real memory domains available for scoped recall, including their stable ids and L1 memory counts.", json!({
+            "type": "object", "properties": {}, "additionalProperties": false
         })),
         tool("get_user_profile", "Get the stable user preferences and constraints distilled by Vibe Assistant.", json!({ "type": "object", "properties": {}, "additionalProperties": false })),
         tool("list_shared_skills", "List published Skills in Vibe Assistant's shared Skill library.", json!({ "type": "object", "properties": {}, "additionalProperties": false })),
@@ -955,7 +960,7 @@ pub(crate) const L3_MCP_HINT_MARKER: &str = "Vibe-Assistant-memory-mcp";
 /// Vibe-Assistant-memory MCP 工具按需检索更多记忆。文案刻意避开
 /// `is_l3_volatile_bullet` 的易变标记（token/模型/端点等），保证能通过
 /// L3 持久化校验。
-pub(crate) const L3_MCP_HINT_SECTION: &str = "## Memory query\n- Agents can call the Vibe-Assistant-memory-mcp tools at any time to retrieve more shared memory: recall_memory for semantic search over past decisions and preferences, get_user_profile for the long-term profile, list_shared_skills and read_shared_skill for reusable workflows.\n- 智能体可随时调用 Vibe-Assistant-memory-mcp 的工具查询更多记忆：recall_memory 语义检索历史决策与偏好，get_user_profile 获取长期画像，list_shared_skills / read_shared_skill 读取共享技能。";
+pub(crate) const L3_MCP_HINT_SECTION: &str = "## Memory query\n- Agents can call the Vibe-Assistant-memory-mcp tools at any time to retrieve more shared memory: recall_memory for decision-model-routed domain recall, list_memory_domains to inspect valid domain ids, get_user_profile for the long-term profile, list_shared_skills and read_shared_skill for reusable workflows. recall_memory defaults to domain_mode=auto; use domain_mode=off only when global retrieval is intended.\n- 智能体可随时调用 Vibe-Assistant-memory-mcp 工具：recall_memory 默认由决策模型路由到相关领域并在域内检索，list_memory_domains 查看可用领域，get_user_profile 获取长期画像，list_shared_skills / read_shared_skill 读取共享技能。需要旧版全局检索时显式使用 domain_mode=off。";
 
 /// 若 L3 正文缺少 MCP 调用提示则原样保留并追加该提示区块；已含标记
 /// （整理侧已写入或用户手写）时保持正文不变。
@@ -1187,24 +1192,57 @@ pub(crate) fn recall_with_store_budget(
         .and_then(Value::as_u64)
         .unwrap_or(6)
         .clamp(1, 12) as u32;
-    let local_memories = store.search_local_l1_memories(query, limit)?;
+    let explicit_domains = arguments.get("domains").map(|value| {
+        value.as_array()
+            .ok_or_else(|| "domains 必须是字符串数组".to_string())?
+            .iter()
+            .map(|item| item.as_str().map(str::trim)
+                .filter(|domain| !domain.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| "domains 必须只包含非空字符串".to_string()))
+            .collect::<Result<Vec<_>, _>>()
+    }).transpose()?;
+    if explicit_domains.as_ref().is_some_and(|domains| domains.len() > 2) {
+        return Err("domains 最多指定两个领域".into());
+    }
+    let domain_mode = arguments.get("domain_mode").and_then(Value::as_str).unwrap_or("auto");
+    let started = std::time::Instant::now();
+    let route = tauri::async_runtime::block_on(crate::memory_domain::route_query_async(
+        store,
+        query,
+        explicit_domains.as_deref(),
+        domain_mode,
+        semantic_budget_ms,
+    ))?;
+    let scoped_domains = (!route.active_domains.is_empty()).then_some(route.active_domains.as_slice());
+    let local_memories = store.search_local_l1_memories_scoped(query, limit, scoped_domains)?;
+    let semantic_domains = route.active_domains.clone();
     // The optional vector sidecar is only a mirror of durable L1. Never
     // return an orphaned vector record after a user intentionally resets L1.
     let durable_ids = store.local_l1_memory_snapshot()?.into_iter()
         .map(|memory| (normalized_memory_content(&memory.memory), memory.id))
         .collect::<HashMap<_, _>>();
     let durable_l1 = durable_ids.keys().cloned().collect::<HashSet<_>>();
+    let remaining_budget_ms = semantic_budget_ms.map(|budget| {
+        budget.saturating_sub(started.elapsed().as_millis() as u64)
+    });
     // 语义检索可能走远程嵌入端点（单次 ~9s 量级）：有预算时挪到独立线程
     // 执行并限时 join，超时按本地关键词降级——结果质量让位于调用方 deadline。
     let semantic_memories;
     let semantic_status;
-    if let Some(budget_ms) = semantic_budget_ms {
+    if remaining_budget_ms == Some(0) {
+        semantic_memories = Vec::new();
+        semantic_status = "local_fallback_budget";
+    } else if let Some(budget_ms) = remaining_budget_ms {
         let query_owned = query.to_string();
+        let semantic_domains = semantic_domains.clone();
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            let scoped = (!semantic_domains.is_empty()).then_some(semantic_domains.as_slice());
             let _ = sender.send(crate::memory_backend::search_semantic_l1_memories(
                 &query_owned,
                 limit,
+                scoped,
             ));
         });
         match receiver.recv_timeout(std::time::Duration::from_millis(budget_ms)) {
@@ -1226,7 +1264,8 @@ pub(crate) fn recall_with_store_budget(
             }
         }
     } else {
-        match crate::memory_backend::search_semantic_l1_memories(query, limit) {
+        let scoped = (!semantic_domains.is_empty()).then_some(semantic_domains.as_slice());
+        match crate::memory_backend::search_semantic_l1_memories(query, limit, scoped) {
             Ok(memories) => {
                 semantic_memories = memories;
                 semantic_status = "semantic";
@@ -1253,10 +1292,13 @@ pub(crate) fn recall_with_store_budget(
     if let Err(error) = store.try_record_memory_recall(&ids) {
         eprintln!("[memory-mcp] recall telemetry skipped: {error}");
     }
+    let domain_scoped = scoped_domains.is_some();
     Ok(json!({
         "query": query,
+        "routing": route,
         "retrieval": {
             "mode": semantic_status,
+            "domain_scoped": domain_scoped,
             "semantic_candidates": semantic_candidate_count,
             "local_keyword_candidates": local_candidate_count,
             "fusion": "rrf",
@@ -1381,6 +1423,10 @@ pub(crate) fn shared_skill_read(source: &str, name: &str) -> Result<Value, Strin
 fn call_tool(name: &str, arguments: &Value) -> Result<Value, String> {
     match name {
         "recall_memory" => recall(arguments),
+        "list_memory_domains" => {
+            let store = crate::telemetry_store::TelemetryStore::new()?;
+            Ok(json!({ "domains": store.memory_domains()? }))
+        }
         "get_user_profile" => user_profile_with_store(
             &crate::telemetry_store::TelemetryStore::new()?,
         ),
@@ -1416,6 +1462,11 @@ fn mcp_call_summary(tool_name: &str, value: Option<&Value>, success: bool) -> St
                 .map_or(0, Vec::len)
         ),
         "get_user_profile" => "读取长期偏好与约束摘要".into(),
+        "list_memory_domains" => format!(
+            "查看记忆领域，返回 {} 项",
+            value.and_then(|result| result.get("domains"))
+                .and_then(Value::as_array).map_or(0, Vec::len)
+        ),
         "list_shared_skills" => format!(
             "查看已发布 Skill，返回 {} 项",
             value

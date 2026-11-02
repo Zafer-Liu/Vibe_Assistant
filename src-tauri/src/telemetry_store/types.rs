@@ -232,12 +232,33 @@ pub struct LocalMemory {
 /// A typed L1 candidate returned by the extraction model.  The type and
 /// durability are deliberately stored with the fact instead of being inferred
 /// again during later consolidation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MemoryDomainAssignment {
+    pub domain_id: String,
+    pub weight: f64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MemoryDomain {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub description: String,
+    pub aliases: Vec<String>,
+    pub enabled: bool,
+    pub memory_count: i64,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct L1MemoryCandidate {
     pub content: String,
     pub memory_type: String,
     pub durability: String,
+    #[serde(default)]
+    pub domains: Vec<MemoryDomainAssignment>,
 }
 
 pub(crate) fn normalize_l1_memory_type(value: &str) -> &'static str {

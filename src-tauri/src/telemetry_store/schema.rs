@@ -211,10 +211,36 @@ pub(super) fn initialize_database(mut conn: Connection) -> Result<Connection, St
            source TEXT NOT NULL,
            session_id TEXT NOT NULL,
            user_defined INTEGER NOT NULL DEFAULT 0,
+           origin_device TEXT,
            event_time TEXT,
            created_at TEXT NOT NULL,
            updated_at TEXT NOT NULL,
            UNIQUE(source_event_key, ordinal)
+         );
+         CREATE TABLE IF NOT EXISTS memory_domains (
+           id TEXT PRIMARY KEY,
+           name TEXT NOT NULL,
+           kind TEXT NOT NULL CHECK(kind IN ('builtin', 'project', 'custom')),
+           description TEXT NOT NULL DEFAULT '',
+           aliases_json TEXT NOT NULL DEFAULT '[]',
+           enabled INTEGER NOT NULL DEFAULT 1,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS local_memory_domains (
+           memory_id TEXT NOT NULL REFERENCES local_memory_items(id) ON DELETE CASCADE,
+           domain_id TEXT NOT NULL REFERENCES memory_domains(id) ON DELETE CASCADE,
+           weight REAL NOT NULL CHECK(weight >= 0 AND weight <= 1),
+           source TEXT NOT NULL CHECK(source IN ('auto', 'manual', 'backfill')),
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           PRIMARY KEY(memory_id, domain_id, source)
+         );
+         CREATE INDEX IF NOT EXISTS idx_local_memory_domains_domain
+           ON local_memory_domains(domain_id, weight DESC);
+         CREATE TABLE IF NOT EXISTS l1_deletion_tombstones (
+           memory_id TEXT PRIMARY KEY,
+           deleted_at TEXT NOT NULL
          );
          CREATE TABLE IF NOT EXISTS mcp_access_logs (
            id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -312,6 +338,27 @@ pub(super) fn initialize_database(mut conn: Connection) -> Result<Connection, St
          );",
     )
     .map_err(|e| e.to_string())?;
+    // Seed exactly once so user-deleted built-ins are not recreated on restart.
+    let domains_seeded = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM app_settings WHERE setting_key = 'memory_domains_seeded_v1')",
+        [],
+        |row| row.get::<_, i64>(0),
+    ).map_err(|e| e.to_string())? != 0;
+    if !domains_seeded {
+        conn.execute_batch(
+        "INSERT OR IGNORE INTO memory_domains
+           (id, name, kind, description, aliases_json, enabled, created_at, updated_at) VALUES
+           ('general', '通用', 'builtin', '跨领域长期适用的用户偏好、硬约束和通用事实，不绑定某类任务。', '[\"通用\",\"全局\",\"偏好\",\"约束\"]', 1, datetime('now'), datetime('now')),
+           ('work', '工作', 'builtin', '本职工作的业务、协作、会议、组织与日常职场任务；不包含明确的求职面试。', '[\"工作\",\"职场\",\"业务\",\"同事\",\"会议\"]', 1, datetime('now'), datetime('now')),
+           ('study', '学习', 'builtin', '课程、知识学习、技术研究、练习、考试准备与技能成长。', '[\"学习\",\"课程\",\"研究\",\"练习\",\"考试\"]', 1, datetime('now'), datetime('now')),
+           ('job_search', '求职', 'builtin', '职位探索、简历、投递、招聘流程、面试、offer 与职业转换。', '[\"求职\",\"招聘\",\"简历\",\"面试\",\"offer\",\"找工作\"]', 1, datetime('now'), datetime('now')),
+           ('life', '生活', 'builtin', '居住、出行、健康、家庭、消费、兴趣和其他个人生活安排。', '[\"生活\",\"居住\",\"出行\",\"健康\",\"家庭\",\"消费\"]', 1, datetime('now'), datetime('now')),
+           ('unclassified', '未分类', 'builtin', '尚未获得可靠领域标签的记忆；仅作为兜底，不作为自动路由目标。', '[]', 1, datetime('now'), datetime('now'));
+           INSERT OR REPLACE INTO app_settings (setting_key, value_json, updated_at)
+           VALUES ('memory_domains_seeded_v1', 'true', datetime('now'));",
+        )
+        .map_err(|e| e.to_string())?;
+    }
     add_column_if_missing(
         &conn,
         "conversation_state",
@@ -514,6 +561,9 @@ pub(super) fn initialize_database(mut conn: Connection) -> Result<Connection, St
     add_local_memory_column_if_missing(&conn, "durability", "TEXT NOT NULL DEFAULT 'short_term'")?;
     // 用户自定义记忆标记：旧库升级后默认 0（自动提取），仅手动添加置 1。
     add_local_memory_column_if_missing(&conn, "user_defined", "INTEGER NOT NULL DEFAULT 0")?;
+    // 跨设备镜像来源：NULL = 本机提取/本机自定义；非空 = 从该设备的
+    // l1-auto-agg 聚合镜像来的提取记忆（只读，重提取/整理不得触碰）。
+    add_local_memory_column_if_missing(&conn, "origin_device", "TEXT")?;
     // Older releases created one TranscriptSync event for every append to
     // the same native session. Keep only the newest revision's memories;
     // its transcript already contains the prior turns.

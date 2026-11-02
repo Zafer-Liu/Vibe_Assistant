@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import { useShallow } from 'zustand/react/shallow'
 import { invoke } from '@tauri-apps/api/core'
 import { createBgeConsolidationCandidateBatches, searchMemoriesWithBge } from '../lib/bgeSemanticSearch'
-import type { AddEventItem, AddResult, ConsolidationResult, EngineStatus, HookStatus, IngestStatus, L1ResetResult, LocalMemoryStats, MemoryConversationDetail, MemoryImportance, MemoryImportanceSummary, MemoryImportResult, MemoryItem, MemoryLayerDocument, MemoryLayerRunResult, OrganizeConversationsResult, PendingMemorySession } from '../types/memory'
+import type { AddEventItem, AddResult, ConsolidationResult, EngineStatus, HookStatus, IngestStatus, L1ResetResult, LocalMemoryStats, MemoryConversationDetail, MemoryDomainItem, MemoryImportance, MemoryImportanceSummary, MemoryImportResult, MemoryItem, MemoryLayerDocument, MemoryLayerRunResult, OrganizeConversationsResult, PendingMemorySession } from '../types/memory'
 import type { AgentSourceInfo } from '../types/agentSources'
 import type { MemoryInjectionLog, MemoryInjectionStats } from '../types/memoryInjection'
 
@@ -41,6 +41,8 @@ interface MemoryStore {
   localMemoryStats: LocalMemoryStats | null
   memoryCacheReady: boolean
   memories: MemoryItem[]
+  memoryDomains: MemoryDomainItem[]
+  selectedMemoryDomainId: string
   lastAddEvents: AddEventItem[]
   lastSearchResults: MemoryItem[]
   lastSearchQuery: string
@@ -79,6 +81,8 @@ interface MemoryStore {
   addUserMemory: (content: string, memoryType: string, scope: 'l2' | 'l3') => Promise<MemoryItem>
   search: (query: string, topK: number) => Promise<MemoryItem[]>
   listMemories: (force?: boolean) => Promise<void>
+  loadMemoryDomains: () => Promise<MemoryDomainItem[]>
+  setSelectedMemoryDomain: (domainId: string) => Promise<void>
   resetL1ForReextraction: () => Promise<L1ResetResult>
   updateMemory: (id: string, content: string) => Promise<void>
   deleteMemory: (id: string) => Promise<void>
@@ -124,6 +128,8 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
   memoryCacheReady: false,
 
   memories: [],
+  memoryDomains: [],
+  selectedMemoryDomainId: 'all',
 
   lastAddEvents: [],
 
@@ -381,23 +387,57 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
     if (!force && get().memoryCacheReady) return
     set({ loading: true })
     try {
-      const [extracted, stats] = await Promise.allSettled([
+      const [extracted, stats, domains] = await Promise.allSettled([
         invoke<MemoryItem[]>('local_memory_list', { limit: 200 }),
         invoke<LocalMemoryStats>('local_memory_stats'),
+        invoke<MemoryDomainItem[]>('memory_domain_list'),
       ])
       if (extracted.status === 'rejected') throw extracted.reason
       const localMemories = extracted.status === 'fulfilled'
         ? extracted.value.map((item) => ({ ...item, retrieval_source: 'local' as const, retrieval_method: 'local' as const }))
         : []
+      const domainIndex = new Map<string, MemoryDomainItem>()
+      for (const domain of domains.status === 'fulfilled' ? domains.value : []) {
+        domainIndex.set(domain.id, domain)
+      }
       // SQLite L1 is authoritative. The optional sidecar may temporarily
       // retain old embeddings after a deliberate rebuild, so it is used for
       // retrieval only and never rendered as an independent memory inventory.
-      const memories = [...localMemories]
+      const memories = await Promise.all(localMemories.map(async (memory) => {
+        if (memory.user_defined) return { ...memory, domains: [] as MemoryDomainItem[] }
+        const assignments = await invoke<Array<{ domain_id: string }>>('memory_domain_links', { memoryId: memory.id })
+        return { ...memory, domains: assignments.map((assignment) => domainIndex.get(assignment.domain_id)).filter(Boolean) as MemoryDomainItem[] }
+      }))
       const records = await invoke<MemoryImportance[]>('memory_importance_list', { memoryIds: memories.map((memory) => memory.id) })
-      set({ memories, importance: Object.fromEntries(records.map((record) => [record.memory_id, record])), localMemoryStats: stats.status === 'fulfilled' ? stats.value : get().localMemoryStats, memoryCacheReady: true })
+      set({
+        memories,
+        memoryDomains: domains.status === 'fulfilled' ? domains.value : get().memoryDomains,
+        importance: Object.fromEntries(records.map((record) => [record.memory_id, record])),
+        localMemoryStats: stats.status === 'fulfilled' ? stats.value : get().localMemoryStats,
+        memoryCacheReady: true,
+      })
+      if (get().lastSearchQuery.trim()) {
+        await get().search(get().lastSearchQuery, 10).catch(() => [])
+      }
     } finally {
       set({ loading: false })
     }
+  },
+
+  async loadMemoryDomains() {
+    try {
+      const domains = await invoke<MemoryDomainItem[]>('memory_domain_list')
+      set((state) => jsonEqual(state.memoryDomains, domains) ? state : { memoryDomains: domains })
+      return domains
+    } catch {
+      return get().memoryDomains
+    }
+  },
+
+  async setSelectedMemoryDomain(domainId) {
+    set({ selectedMemoryDomainId: domainId })
+    await get().listMemories(true)
+    await get().search(get().lastSearchQuery, 10).catch(() => [])
   },
 
   async resetL1ForReextraction() {
@@ -420,7 +460,10 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
   },
 
   async dreaming(onProgress) {
-    const candidateBatches = await createBgeConsolidationCandidateBatches(get().memories, onProgress)
+    // 全库候选（含所有设备的镜像行）：列表页的有上限数据只服务 UI，
+    // 清洗的语义筛查必须覆盖全部可检索记忆。
+    const all = await invoke<MemoryItem[]>('local_memory_list_all')
+    const candidateBatches = await createBgeConsolidationCandidateBatches(all, onProgress)
     return invoke<ConsolidationResult>('memory_consolidate', { candidateBatches })
   },
 

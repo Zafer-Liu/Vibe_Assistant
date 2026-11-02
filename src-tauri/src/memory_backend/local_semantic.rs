@@ -699,9 +699,19 @@ pub(super) fn build_index(telemetry: &TelemetryStore, value: Value) -> Result<Va
     Ok(status)
 }
 
-pub(super) fn search(telemetry: &TelemetryStore, value: Value, query: &str, limit: u32) -> Result<Vec<SemanticMemory>, String> {
+pub(super) fn search(
+    telemetry: &TelemetryStore,
+    value: Value,
+    query: &str,
+    limit: u32,
+    domains: Option<&[String]>,
+) -> Result<Vec<SemanticMemory>, String> {
     let config = Config::parse(value)?;
     if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let allowed_ids = domains.map(|ids| telemetry.memory_ids_for_domains(ids)).transpose()?;
+    if allowed_ids.as_ref().is_some_and(|ids| ids.is_empty()) {
         return Ok(Vec::new());
     }
     let documents = telemetry.local_l1_memory_snapshot()?;
@@ -718,6 +728,9 @@ pub(super) fn search(telemetry: &TelemetryStore, value: Value, query: &str, limi
         .map(|(doc, key)| (doc.id.as_str(), key.as_str())).collect();
     let mut results = Vec::new();
     for doc in current {
+        if allowed_ids.as_ref().is_some_and(|ids| !ids.contains(&doc.id)) {
+            continue;
+        }
         let key = signature(&config, &doc.memory);
         if indexed.get(doc.id.as_str()).copied() != Some(key.as_str()) {
             continue;

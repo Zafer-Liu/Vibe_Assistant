@@ -10,6 +10,13 @@ export interface MemoryConfig {
 }
 
 /** get / search 返回的记忆条目 */
+export interface MemoryDomainItem {
+  id: string
+  name: string
+  description: string
+  memory_count: number
+}
+
 export interface MemoryItem {
   id: string
   memory: string
@@ -22,6 +29,8 @@ export interface MemoryItem {
   score?: number | null
   retrieval_source?: 'memory' | 'conversation' | 'local'
   retrieval_method?: 'semantic' | 'keyword' | 'local'
+  /** L1 主题标签，用于记忆总览筛选。 */
+  domains?: MemoryDomainItem[]
   session_id?: string
   source_agent?: string
   occurred_at?: string

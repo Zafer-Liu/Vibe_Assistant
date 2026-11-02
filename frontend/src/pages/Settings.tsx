@@ -1,7 +1,7 @@
 import { useTranslation } from 'react-i18next'
 import { invoke } from '@tauri-apps/api/core'
 import { save, open } from '@tauri-apps/plugin-dialog'
-import { Download, Upload, Loader2, CheckCircle2, AlertCircle, Brain, Info, DatabaseBackup, Cloud, Timer, PanelBottomClose, Search } from 'lucide-react'
+import { Download, Upload, Loader2, CheckCircle2, AlertCircle, Info, DatabaseBackup, Cloud, Timer, PanelBottomClose, Search } from 'lucide-react'
 import { useState, useCallback, useEffect, type ReactNode } from 'react'
 import { WindowBehaviorSettings } from '../features/desktop/WindowBehaviorSettings'
 import { LlmSettings } from './LlmSettings'
@@ -64,13 +64,9 @@ export function Settings({ section, onOpenOnboarding }: {
       </>)}
 
       {section === 'llm' && (
-      <SettingsSection
-        icon={<Brain size={15} className="text-[var(--app-accent)]" />}
-        title={t('settings.sectionLlm')}
-        desc={t('settings.sectionLlmHint')}
-      >
+        // No section header: the nav title already names this page, and
+        // LlmSettings renders its own peer-level section headers.
         <LlmSettings embedded />
-      </SettingsSection>
       )}
 
       {section === 'memory' && (<>

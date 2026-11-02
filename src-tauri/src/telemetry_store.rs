@@ -9,7 +9,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::Emitter;
@@ -50,6 +50,7 @@ pub(crate) use types::{
 pub use types::{
     CloudSyncConflict, ConversationSearchHit, L1MemoryCandidate, L1ResetResult, LocalMemory,
     LocalMemorySnapshot, LocalMemoryStats, McpAccessLog, McpCallCoverage, McpCallGroup,
+    MemoryDomain, MemoryDomainAssignment,
     McpCallObservation, McpCallRefresh, McpCallStats, McpDashboardStats, McpToolHealth, McpFailedCallPage, McpFailureCategoryCount,
     MemoryConversationDetail, MemoryImportance, MemoryImportanceCandidate,
     MemoryImportanceEvidence, MemoryInjectionStats, MemoryLayerDocument, MemoryMcpActivity,
@@ -58,6 +59,45 @@ pub use types::{
     TelemetryUsageHeatCell, TelemetryUsageRecord, TelemetryUsageRefresh, UsageDayAggregate,
 };
 use types::{TranscriptUsage, TranscriptUsageRecord};
+
+fn insert_memory_domain_assignments(
+    transaction: &Transaction,
+    memory_id: &str,
+    assignments: &[MemoryDomainAssignment],
+    source: &str,
+    now: &str,
+) -> Result<(), String> {
+    if assignments.is_empty() {
+        let has_unclassified = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memory_domains WHERE id = 'unclassified')",
+            [],
+            |row| row.get::<_, i64>(0),
+        ).map_err(|e| e.to_string())? != 0;
+        if has_unclassified {
+            transaction.execute(
+                "INSERT OR REPLACE INTO local_memory_domains
+                 (memory_id, domain_id, weight, source, created_at, updated_at)
+                 VALUES (?1, 'unclassified', 0, ?2, ?3, ?3)",
+                params![memory_id, source, now],
+            ).map_err(|e| e.to_string())?;
+        }
+        return Ok(());
+    }
+    for assignment in assignments.iter().take(3) {
+        let weight = if assignment.weight.is_finite() {
+            assignment.weight.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        transaction.execute(
+            "INSERT OR REPLACE INTO local_memory_domains
+             (memory_id, domain_id, weight, source, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![memory_id, assignment.domain_id, weight, source, now],
+        ).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
 
 impl TelemetryStore {
     pub fn new() -> Result<Self, String> {
@@ -777,6 +817,18 @@ impl TelemetryStore {
             )
             .map_err(|e| e.to_string())?;
         let mut written = 0usize;
+        // 用户已删除的 id（l1-auto 墓碑）不随重新提取复活——同一转录重扫
+        // 会算出同样的确定性 id，不挡的话删掉的条目每轮提取都长回来。
+        let tombstoned: std::collections::HashSet<String> = {
+            let mut statement = transaction
+                .prepare("SELECT memory_id FROM l1_deletion_tombstones")
+                .map_err(|e| e.to_string())?;
+            let ids = statement
+                .query_map([], |row| row.get(0))
+                .map_err(|e| e.to_string())?;
+            ids.collect::<Result<std::collections::HashSet<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
         for candidate in candidates {
             let filtered_content = strip_thinking_blocks(&candidate.content);
             let content = filtered_content.trim();
@@ -786,6 +838,9 @@ impl TelemetryStore {
             let ordinal = written;
             let digest = Sha256::digest(format!("{event_key}:{ordinal}").as_bytes());
             let id = format!("local-l1:{}", hex(&digest)[..24].to_string());
+            if tombstoned.contains(&id) {
+                continue;
+            }
             let memory_type = normalize_l1_memory_type(&candidate.memory_type);
             let durability = validate_l1_durability(&candidate.durability)?;
             transaction.execute(
@@ -794,6 +849,13 @@ impl TelemetryStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
                 params![id, event_key, ordinal as i64, content, memory_type, durability, source, session_id, event_time, now],
             ).map_err(|e| e.to_string())?;
+            insert_memory_domain_assignments(
+                &transaction,
+                &id,
+                &candidate.domains,
+                "auto",
+                &now,
+            )?;
             written += 1;
         }
         transaction
@@ -871,9 +933,198 @@ impl TelemetryStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'manual_import', ?7, ?8, ?8, ?8)",
                 params![id, import_key, ordinal as i64, content, memory_type, durability, folder, now],
             ).map_err(|e| e.to_string())?;
+            insert_memory_domain_assignments(
+                &transaction,
+                &id,
+                &candidate.domains,
+                "auto",
+                &now,
+            )?;
         }
         transaction.commit().map_err(|e| e.to_string())?;
         Ok(candidates.len())
+    }
+
+    pub fn memory_domains(&self) -> Result<Vec<MemoryDomain>, String> {
+        let conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned")?;
+        let mut statement = conn.prepare(
+            "SELECT d.id, d.name, d.kind, d.description, d.aliases_json, d.enabled,
+                    COUNT(DISTINCT md.memory_id) AS memory_count
+               FROM memory_domains d
+               LEFT JOIN local_memory_domains md ON md.domain_id = d.id
+              GROUP BY d.id, d.name, d.kind, d.description, d.aliases_json, d.enabled
+              ORDER BY CASE d.id WHEN 'general' THEN 0 WHEN 'work' THEN 1
+                                 WHEN 'study' THEN 2 WHEN 'job_search' THEN 3
+                                 WHEN 'life' THEN 4 ELSE 5 END, d.name",
+        ).map_err(|e| e.to_string())?;
+        let rows = statement.query_map([], |row| {
+            let aliases_json: String = row.get(4)?;
+            Ok(MemoryDomain {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                description: row.get(3)?,
+                aliases: serde_json::from_str(&aliases_json).unwrap_or_default(),
+                enabled: row.get::<_, i64>(5)? != 0,
+                memory_count: row.get(6)?,
+            })
+        }).map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    pub fn save_memory_domain(
+        &self,
+        id: Option<&str>,
+        name: &str,
+        description: &str,
+        aliases: &[String],
+        enabled: bool,
+    ) -> Result<MemoryDomain, String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let aliases_json = serde_json::to_string(aliases).map_err(|e| e.to_string())?;
+        let domain_id = id.map(str::to_string)
+            .unwrap_or_else(|| format!("custom:{}", uuid::Uuid::new_v4()));
+        let conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned")?;
+        if id.is_some() {
+            let changed = conn.execute(
+                "UPDATE memory_domains
+                    SET name = ?2, description = ?3, aliases_json = ?4, enabled = ?5, updated_at = ?6
+                  WHERE id = ?1",
+                params![domain_id, name, description, aliases_json, enabled, now],
+            ).map_err(|e| e.to_string())?;
+            if changed == 0 {
+                return Err("主题不存在，可能已被删除".into());
+            }
+        } else {
+            conn.execute(
+                "INSERT INTO memory_domains
+                 (id, name, kind, description, aliases_json, enabled, created_at, updated_at)
+                 VALUES (?1, ?2, 'custom', ?3, ?4, ?5, ?6, ?6)",
+                params![domain_id, name, description, aliases_json, enabled, now],
+            ).map_err(|e| e.to_string())?;
+        }
+        drop(conn);
+        self.memory_domains()?.into_iter().find(|domain| domain.id == domain_id)
+            .ok_or_else(|| "主题保存后读取失败".into())
+    }
+
+    /// Deleting a domain cascades only its associations. Durable L1 rows remain
+    /// and become eligible for classification with the current domain registry.
+    pub fn delete_memory_domain(&self, id: &str) -> Result<(), String> {
+        let changed = self.conn.lock().map_err(|_| "telemetry store lock poisoned")?
+            .execute("DELETE FROM memory_domains WHERE id = ?1", [id])
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err("主题不存在，可能已被删除".into());
+        }
+        Ok(())
+    }
+
+    pub fn memory_ids_for_domains(&self, domains: &[String]) -> Result<HashSet<String>, String> {
+        if domains.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let placeholders = (1..=domains.len()).map(|index| format!("?{index}")).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT DISTINCT memory_id FROM local_memory_domains WHERE domain_id IN ({placeholders})"
+        );
+        let conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned")?;
+        let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = statement.query_map(
+            rusqlite::params_from_iter(domains.iter()),
+            |row| row.get::<_, String>(0),
+        ).map_err(|e| e.to_string())?;
+        rows.collect::<Result<HashSet<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    /// A bounded classification page. `retag=true` intentionally revisits all
+    /// automatic/imported memories after domain definitions change; manual L1
+    /// and manual domain associations remain outside this operation.
+    pub fn l1_memories_for_domain_classification(
+        &self,
+        limit: u32,
+        retag: bool,
+    ) -> Result<Vec<LocalMemorySnapshot>, String> {
+        let membership_filter = if retag { "" } else {
+            "AND NOT EXISTS (
+                SELECT 1 FROM local_memory_domains md
+                 WHERE md.memory_id = local_memory_items.id
+            )"
+        };
+        let sql = format!(
+            "SELECT id, source_event_key, ordinal, memory, memory_type, durability, source,
+                    session_id, user_defined, event_time, created_at, updated_at
+               FROM local_memory_items
+              WHERE user_defined = 0 {membership_filter}
+              ORDER BY updated_at ASC LIMIT ?1"
+        );
+        let conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned")?;
+        let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = statement.query_map([limit.clamp(1, 200)], |row| {
+            Ok(LocalMemorySnapshot {
+                id: row.get(0)?, source_event_key: row.get(1)?, ordinal: row.get(2)?,
+                memory: row.get(3)?, memory_type: row.get(4)?, durability: row.get(5)?,
+                source: row.get(6)?, session_id: row.get(7)?,
+                user_defined: row.get::<_, i64>(8)? != 0, event_time: row.get(9)?,
+                created_at: row.get(10)?, updated_at: row.get(11)?,
+            })
+        }).map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    pub fn count_l1_memories_for_domain_classification(&self, retag: bool) -> Result<u32, String> {
+        let membership_filter = if retag { "" } else {
+            "AND NOT EXISTS (
+                SELECT 1 FROM local_memory_domains md
+                 WHERE md.memory_id = local_memory_items.id
+            )"
+        };
+        let sql = format!(
+            "SELECT COUNT(*) FROM local_memory_items
+              WHERE user_defined = 0 {membership_filter}"
+        );
+        self.conn.lock().map_err(|_| "telemetry store lock poisoned")?
+            .query_row(&sql, [], |row| row.get::<_, i64>(0))
+            .map(|count| count.max(0) as u32)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn clear_memory_domain_links(&self, memory_id: &str) -> Result<(), String> {
+        self.conn.lock().map_err(|_| "telemetry store lock poisoned")?
+            .execute(
+                "DELETE FROM local_memory_domains WHERE memory_id = ?1 AND source IN ('auto', 'backfill')",
+                [memory_id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn insert_memory_domain_links(
+        &self,
+        memory_id: &str,
+        assignments: &[MemoryDomainAssignment],
+    ) -> Result<(), String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned")?;
+        let transaction = conn.transaction().map_err(|e| e.to_string())?;
+        insert_memory_domain_assignments(&transaction, memory_id, assignments, "backfill", &now)?;
+        transaction.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn replace_backfill_memory_domains(
+        &self,
+        memory_id: &str,
+        assignments: &[MemoryDomainAssignment],
+    ) -> Result<(), String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned")?;
+        let transaction = conn.transaction().map_err(|e| e.to_string())?;
+        transaction.execute(
+            "DELETE FROM local_memory_domains WHERE memory_id = ?1 AND source IN ('auto', 'backfill')",
+            [memory_id],
+        ).map_err(|e| e.to_string())?;
+        insert_memory_domain_assignments(&transaction, memory_id, assignments, "backfill", &now)?;
+        transaction.commit().map_err(|e| e.to_string())
     }
 
     pub fn local_l1_memories(&self, limit: u32) -> Result<Vec<LocalMemory>, String> {
@@ -896,6 +1147,39 @@ impl TelemetryStore {
             .map_err(|e| e.to_string())?;
         let rows = statement
             .query_map([limit.min(500)], |row| {
+                Ok(LocalMemory {
+                    id: row.get(0)?,
+                    memory: row.get(1)?,
+                    memory_type: row.get(2)?,
+                    durability: row.get(3)?,
+                    user_defined: row.get::<_, i64>(4)? != 0,
+                    last_update_at: row.get(5)?,
+                    event_time: row.get(6)?,
+                    score: None,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// 全量 L1 记忆（不设上限）：供记忆清洗构建**全库**语义候选。本机
+    /// 提取、他机镜像与自定义行都在其中——清洗的裁决范围是所有设备的
+    /// 记忆；自定义行仍由巩固后端的 known_ids 兜底排除，不会被改写删除。
+    pub fn all_l1_memories_for_consolidation(&self) -> Result<Vec<LocalMemory>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "telemetry store lock poisoned".to_string())?;
+        let mut statement = conn
+            .prepare(
+                "SELECT id, memory, memory_type, durability, user_defined, updated_at, event_time
+                   FROM local_memory_items
+                  ORDER BY user_defined DESC, updated_at DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
                 Ok(LocalMemory {
                     id: row.get(0)?,
                     memory: row.get(1)?,
@@ -962,6 +1246,13 @@ impl TelemetryStore {
             .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM local_memory_items WHERE user_defined = 0", [])
             .map_err(|e| e.to_string())?;
+        // 镜像行也被清掉了：连带清 l1-auto-agg 的同步水位，否则下一轮
+        // 「远端哈希未变」的短路会让对端聚合不再镜像回来。
+        tx.execute(
+            "DELETE FROM cloud_sync_meta WHERE object_key LIKE 'l1-auto-agg:%'",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
         // 保留用户自定义条目的重要度记录，其余随被清理的记忆一并删除。
         tx.execute(
             "DELETE FROM memory_importance WHERE memory_id NOT IN (SELECT id FROM local_memory_items)",
@@ -1618,6 +1909,21 @@ impl TelemetryStore {
         query: &str,
         limit: u32,
     ) -> Result<Vec<LocalMemory>, String> {
+        self.search_local_l1_memories_scoped(query, limit, None)
+    }
+
+    /// Domain-scoped retrieval applies membership in SQLite before the bounded
+    /// prefilter. Filtering the final global Top-K would make valid domain hits
+    /// unreachable whenever other domains occupy the first page.
+    pub fn search_local_l1_memories_scoped(
+        &self,
+        query: &str,
+        limit: u32,
+        domains: Option<&[String]>,
+    ) -> Result<Vec<LocalMemory>, String> {
+        if domains.is_some_and(|items| items.is_empty()) {
+            return Ok(Vec::new());
+        }
         let terms = keyword_terms(query);
         if terms.is_empty() {
             return Ok(Vec::new());
@@ -1630,7 +1936,7 @@ impl TelemetryStore {
         filter_terms.sort();
         filter_terms.dedup();
         let mut memories = self
-            .keyword_prefilter_l1_memories(&filter_terms)?
+            .keyword_prefilter_l1_memories(&filter_terms, domains)?
             .into_iter()
             .filter_map(|mut memory| {
                 let score = keyword_score(&memory.memory, query, &terms);
@@ -1688,6 +1994,7 @@ impl TelemetryStore {
     fn keyword_prefilter_l1_memories(
         &self,
         terms: &[String],
+        domains: Option<&[String]>,
     ) -> Result<Vec<LocalMemory>, String> {
         if terms.is_empty() {
             return Ok(Vec::new());
@@ -1711,19 +2018,34 @@ impl TelemetryStore {
             ));
             patterns.push(format!("%{}%", like_escape(term)));
         }
+        let domain_filter = domains.map(|items| {
+            let placeholders = (0..items.len())
+                .map(|index| format!("?{}", patterns.len() + index + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                " AND EXISTS (SELECT 1 FROM local_memory_domains md
+                              WHERE md.memory_id = local_memory_items.id
+                                AND md.domain_id IN ({placeholders}))"
+            )
+        }).unwrap_or_default();
         let sql = format!(
             "SELECT id, memory, memory_type, durability, user_defined, updated_at, event_time
                FROM local_memory_items
-              WHERE user_defined = 1 OR ({conditions})
+              WHERE (user_defined = 1 OR ({conditions})){domain_filter}
               ORDER BY user_defined DESC, updated_at DESC
               LIMIT {cap}",
             conditions = conditions,
+            domain_filter = domain_filter,
             cap = Self::KEYWORD_PREFILTER_ROW_CAP
         );
+        let parameters = patterns.iter().cloned()
+            .chain(domains.into_iter().flatten().cloned())
+            .collect::<Vec<_>>();
         let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = statement
             .query_map(
-                rusqlite::params_from_iter(patterns.iter().map(String::as_str)),
+                rusqlite::params_from_iter(parameters.iter()),
                 |row| {
                 Ok(LocalMemory {
                     id: row.get(0)?,
@@ -1750,7 +2072,12 @@ impl TelemetryStore {
             .lock()
             .map_err(|_| "telemetry store lock poisoned".to_string())?
             .execute(
-                "UPDATE local_memory_items SET memory = ?1, updated_at = ?2 WHERE id = ?3",
+                // 编辑同时「晋升」镜像行为本机行（origin_device 置 NULL）：
+                // 用户或清洗改写了内容，本机即接管这条记忆；否则源设备
+                // 下一轮聚合会把旧文本刷回来，改写被静默回滚。
+                "UPDATE local_memory_items
+                    SET memory = ?1, updated_at = ?2, origin_device = NULL
+                  WHERE id = ?3",
                 params![content.trim(), chrono::Utc::now().to_rfc3339(), id],
             )
             .map_err(|e| e.to_string())?;
@@ -1760,17 +2087,96 @@ impl TelemetryStore {
         Ok(())
     }
 
+    /// 删除一条 L1 记忆。自定义记忆（user_defined=1）仅本地删除——跨设备
+    /// 传播由云同步的 `l1-user:` 墓碑负责。自动提取记忆（user_defined=0，
+    /// 含他机镜像）的删除是**用户决策**：本地删行之外还要落 `l1-auto:`
+    /// 墓碑，经云保险库传播到所有设备——无论各设备持有的是本机提取还是
+    /// 镜像副本，下一轮同步全部删除，重新提取/重新镜像都不复活。
+    /// 行不存在时若 id 属于提取线（local-l1: / local-import: / 镜像）仍落
+    /// 墓碑（删除意图对即将到来的镜像同样有效）。
     pub fn delete_local_l1_memory(&self, id: &str) -> Result<(), String> {
-        let changed = self
+        let conn = self
             .conn
             .lock()
-            .map_err(|_| "telemetry store lock poisoned".to_string())?
+            .map_err(|_| "telemetry store lock poisoned".to_string())?;
+        let user_defined: Option<i64> = conn
+            .query_row(
+                "SELECT user_defined FROM local_memory_items WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let deleted = conn
             .execute("DELETE FROM local_memory_items WHERE id = ?1", [id])
             .map_err(|e| e.to_string())?;
-        if changed == 0 {
+        if deleted == 0 && user_defined.is_none() {
+            let extracted_line = !id.starts_with("local-user");
+            if extracted_line {
+                let inserted = conn
+                    .execute(
+                        "INSERT OR IGNORE INTO l1_deletion_tombstones (memory_id, deleted_at)
+                         VALUES (?1, ?2)",
+                        params![id, chrono::Utc::now().to_rfc3339()],
+                    )
+                    .map_err(|e| e.to_string())?;
+                if inserted > 0 {
+                    return Ok(());
+                }
+            }
             return Err("未找到本地记忆".into());
         }
+        if user_defined == Some(0) {
+            conn.execute(
+                "INSERT OR IGNORE INTO l1_deletion_tombstones (memory_id, deleted_at)
+                 VALUES (?1, ?2)",
+                params![id, chrono::Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| e.to_string())?;
+        }
         Ok(())
+    }
+
+    /// 已墓碑（用户决策删除）的 L1 记忆 id 集合：提取写入与镜像应用都
+    /// 用它挡住复活。
+    pub fn tombstoned_l1_ids(&self) -> Result<std::collections::HashSet<String>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "telemetry store lock poisoned".to_string())?;
+        let mut statement = conn
+            .prepare("SELECT memory_id FROM l1_deletion_tombstones")
+            .map_err(|e| e.to_string())?;
+        let ids = statement
+            .query_map([], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        ids.collect::<Result<std::collections::HashSet<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// 应用一条远端 `l1-auto:` 墓碑：删本地行并记入本地墓碑表。已在
+    /// 墓碑表（此前已应用过，或本机就是发起方）则跳过。返回是否首次应用。
+    pub fn apply_l1_deletion_tombstone(&self, memory_id: &str) -> Result<bool, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "telemetry store lock poisoned".to_string())?;
+        let inserted = conn
+            .execute(
+                "INSERT OR IGNORE INTO l1_deletion_tombstones (memory_id, deleted_at)
+                 VALUES (?1, ?2)",
+                params![memory_id, chrono::Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| e.to_string())?;
+        if inserted == 0 {
+            return Ok(false);
+        }
+        conn.execute(
+            "DELETE FROM local_memory_items WHERE id = ?1 AND user_defined = 0",
+            [memory_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(true)
     }
 
     /// 用户手动添加的自定义 L1 记忆：固定 long_term，标记 user_defined，
@@ -1917,6 +2323,160 @@ impl TelemetryStore {
             )
             .map_err(|e| e.to_string())?;
         Ok(deleted > 0)
+    }
+
+    /// 云端记忆库：本机跨会话（短期 + 长期）的自动提取记忆，供
+    /// `l1-auto-agg:{device}` 聚合打包。仅含本机提取的行
+    /// （`origin_device IS NULL`）——从其他设备镜像来的行绝不能回传，
+    /// 否则 A 的记忆会经 B 的聚合二次广播，信封与对端镜像无限膨胀。
+    /// 「仅本会话」作用域绑定产生它的会话，不跨设备。
+    pub fn cross_session_extracted_l1_memories(
+        &self,
+    ) -> Result<Vec<LocalMemorySnapshot>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "telemetry store lock poisoned".to_string())?;
+        let mut statement = conn
+            .prepare(
+                "SELECT id, source_event_key, ordinal, memory, memory_type, durability, source, session_id, user_defined, event_time, created_at, updated_at
+                   FROM local_memory_items
+                  WHERE user_defined = 0
+                    AND lower(durability) IN ('short_term', 'long_term')
+                    AND origin_device IS NULL
+                  ORDER BY id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(LocalMemorySnapshot {
+                    id: row.get(0)?,
+                    source_event_key: row.get(1)?,
+                    ordinal: row.get(2)?,
+                    memory: row.get(3)?,
+                    memory_type: row.get(4)?,
+                    durability: row.get(5)?,
+                    source: row.get(6)?,
+                    session_id: row.get(7)?,
+                    user_defined: row.get::<_, i64>(8)? != 0,
+                    event_time: row.get(9)?,
+                    created_at: row.get(10)?,
+                    updated_at: row.get(11)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// 云端记忆库：把某台设备的提取记忆聚合镜像到本地（只读对端数据）。
+    /// · 新行按源 id 插入并标记 `origin_device`，参与本机的检索与注入；
+    /// · 已有镜像行仅刷新内容；与本地行撞 id 时（两台机器对同一份转录
+    ///   各自提取，id 是 event_key+ordinal 的确定性哈希）绝不覆盖本地行；
+    /// · 聚合中已消失的 id（对端删除或重整理）在本地同步修剪。
+    /// 返回 (刷新/落地的镜像条数, 修剪条数)。
+    pub fn sync_peer_extracted_l1(
+        &self,
+        origin_device: &str,
+        rows: &[LocalMemorySnapshot],
+    ) -> Result<(usize, usize), String> {
+        // 用户已删除的 id（l1-auto 墓碑）不随镜像复活；也不算修剪保护对象。
+        let tombstoned = self.tombstoned_l1_ids()?;
+        let rows: Vec<LocalMemorySnapshot> = rows
+            .iter()
+            .filter(|row| !tombstoned.contains(&row.id))
+            .cloned()
+            .collect();
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| "telemetry store lock poisoned".to_string())?;
+        let transaction = conn.transaction().map_err(|e| e.to_string())?;
+        let mut landed = 0usize;
+        for row in &rows {
+            // INSERT OR IGNORE 同时兜底 id 主键与 UNIQUE(source_event_key,
+            // ordinal) 两类冲突；随后的 UPDATE 只认 origin_device 匹配的
+            // 镜像行，本地提取与自定义行天然不可触碰。
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO local_memory_items
+                        (id, source_event_key, ordinal, memory, memory_type, durability, source, session_id, user_defined, origin_device, event_time, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12)",
+                    params![
+                        row.id,
+                        row.source_event_key,
+                        row.ordinal,
+                        row.memory,
+                        row.memory_type,
+                        row.durability,
+                        row.source,
+                        row.session_id,
+                        origin_device,
+                        row.event_time,
+                        row.created_at,
+                        row.updated_at
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            landed += transaction
+                .execute(
+                    "UPDATE local_memory_items
+                        SET memory = ?2, memory_type = ?3, durability = ?4, updated_at = ?5
+                      WHERE id = ?1 AND origin_device = ?6",
+                    params![
+                        row.id,
+                        row.memory,
+                        row.memory_type,
+                        row.durability,
+                        row.updated_at,
+                        origin_device
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        let mirrored: Vec<String> = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id FROM local_memory_items WHERE origin_device = ?1",
+                )
+                .map_err(|e| e.to_string())?;
+            let ids = statement
+                .query_map([origin_device], |row| row.get(0))
+                .map_err(|e| e.to_string())?;
+            ids.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        let incoming: std::collections::HashSet<&str> =
+            rows.iter().map(|row| row.id.as_str()).collect();
+        let mut pruned = 0usize;
+        for id in mirrored {
+            if !incoming.contains(id.as_str()) {
+                pruned += transaction
+                    .execute(
+                        "DELETE FROM local_memory_items WHERE id = ?1 AND origin_device = ?2",
+                        params![id, origin_device],
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok((landed, pruned))
+    }
+
+    /// 云端记忆库：清除 `l1-auto-agg:*` 对象的同步水位。L1 重提取会把
+    /// 镜像行（user_defined=0）一并清掉，水位若不清，下一轮会因
+    /// 「远端哈希未变」跳过应用，镜像就再也回不来了。
+    pub fn clear_l1_auto_agg_sync_meta(&self) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "telemetry store lock poisoned".to_string())?;
+        conn.execute(
+            "DELETE FROM cloud_sync_meta WHERE object_key LIKE 'l1-auto-agg:%'",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// 云端记忆库：删除某对象 key 的本地水位行（本地删除已推成墓碑后清理）。

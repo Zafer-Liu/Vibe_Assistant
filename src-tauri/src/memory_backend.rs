@@ -778,10 +778,17 @@ pub fn start_embedding_auto_build_scheduler(app: tauri::AppHandle) {
 /// separate executable and therefore cannot use the desktop process's Tauri
 /// state; configured embeddings use the native L1 ledger and a derived cache.
 /// Without that setting, retain the optional loopback MindMemOS route.
-pub fn search_semantic_l1_memories(query: &str, limit: u32) -> Result<Vec<SemanticMemory>, String> {
+pub fn search_semantic_l1_memories(
+    query: &str,
+    limit: u32,
+    domains: Option<&[String]>,
+) -> Result<Vec<SemanticMemory>, String> {
     let telemetry = crate::telemetry_store::TelemetryStore::new()?;
     if let Some(config) = semantic_config_read_raw(&telemetry)? {
-        return local_semantic::search(&telemetry, config, query, limit);
+        return local_semantic::search(&telemetry, config, query, limit, domains);
+    }
+    if domains.is_some() {
+        return Err("旧 MindMemOS 检索通道不支持域内候选过滤，请配置本地语义索引".into());
     }
     if !MemoryBackend::probe(API_PORT) {
         return Err("本地语义记忆服务未运行".into());

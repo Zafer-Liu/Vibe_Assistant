@@ -1125,7 +1125,29 @@ fn native_transcript_conversation_enters_the_same_l1_queue_without_a_hook() {
                 memory TEXT NOT NULL, memory_type TEXT NOT NULL, durability TEXT NOT NULL DEFAULT 'short_term', user_defined INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL,
                 session_id TEXT NOT NULL, event_time TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                 UNIQUE(source_event_key, ordinal)
-             );",
+             );
+             CREATE TABLE memory_domains (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('builtin', 'project', 'custom')),
+                description TEXT NOT NULL DEFAULT '',
+                aliases_json TEXT NOT NULL DEFAULT '[]',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE local_memory_domains (
+                memory_id TEXT NOT NULL REFERENCES local_memory_items(id) ON DELETE CASCADE,
+                domain_id TEXT NOT NULL REFERENCES memory_domains(id) ON DELETE CASCADE,
+                weight REAL NOT NULL CHECK(weight >= 0 AND weight <= 1),
+                source TEXT NOT NULL CHECK(source IN ('auto', 'manual', 'backfill')),
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                PRIMARY KEY(memory_id, domain_id, source)
+             );
+             CREATE TABLE l1_deletion_tombstones (
+                memory_id TEXT PRIMARY KEY, deleted_at TEXT NOT NULL
+             );
+             INSERT OR IGNORE INTO memory_domains
+               (id, name, kind, description, aliases_json, enabled, created_at, updated_at)
+               VALUES ('unclassified', '未分类', 'builtin', '', '[]', 1, datetime('now'), datetime('now'));",
         ).unwrap();
     let store = TelemetryStore::from_connection(conn);
     let transcript = std::env::temp_dir().join("qoder-session-1.jsonl");
@@ -1151,6 +1173,7 @@ fn native_transcript_conversation_enters_the_same_l1_queue_without_a_hook() {
                 content: "项目决定：使用 SQLite。".into(),
                 memory_type: "decision".into(),
                 durability: "short_term".into(),
+                domains: Vec::new(),
             }],
         )
         .unwrap();

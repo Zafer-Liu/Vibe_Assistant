@@ -1025,6 +1025,10 @@ fn apply_remote_objects(
             apply_remote_usage(store, rest.to_string(), vault_key_bytes, obj, report);
             continue;
         }
+        if let Some(rest) = obj.key.strip_prefix("l1-auto-agg:") {
+            apply_remote_extracted(store, rest.to_string(), vault_key_bytes, obj, report);
+            continue;
+        }
         let Some(layer) = obj.key.strip_suffix(":published").map(str::to_string) else {
             continue;
         };
@@ -1042,7 +1046,19 @@ fn apply_remote_objects(
         }
     }
     // 墓碑：其他设备删除的自定义 L1 在本地同步删除（仅 user_defined 条目）。
+    // `l1-auto:` 墓碑是用户对提取记忆的删除决策：对所有设备生效——本地行
+    // （无论本机提取还是他机镜像）删除并记入本地墓碑表，防重新提取/镜像。
     for tomb in tombstones.iter().cloned() {
+        if let Some(memory_id) = tomb.key.strip_prefix("l1-auto:") {
+            match store.apply_l1_deletion_tombstone(memory_id) {
+                Ok(true) => report.pulled += 1,
+                Ok(false) => {}
+                Err(e) => report
+                    .errors
+                    .push(format!("l1-auto 墓碑落地失败 {e}（{memory_id}）")),
+            }
+            continue;
+        }
         let Some(id) = tomb.key.strip_prefix("l1-user:") else {
             continue;
         };
@@ -1157,6 +1173,72 @@ fn apply_remote_usage(
             report
                 .errors
                 .push(format!("usage-agg: 落地失败 {e} ({})", obj.key));
+            return false;
+        }
+    }
+    true
+}
+
+/// 远端跨会话提取记忆聚合落地。己方对象只对齐水位（推送阶段保证本地为
+/// 源）；对端对象解密验哈希后按设备镜像：新行落成只读镜像
+/// （`origin_device` = 来源设备），已有镜像刷新内容，聚合中消失的 id
+/// 修剪——对端的删除/重整理随之传播。
+fn apply_remote_extracted(
+    store: &TelemetryStore,
+    device_suffix: String,
+    vault_key_bytes: &[u8; 32],
+    obj: RemoteObject,
+    report: &mut CloudSyncReport,
+) -> bool {
+    let device = device_id(store).replace(':', "-");
+    if device_suffix == device {
+        let _ = store.cloud_sync_meta_set(&obj.key, obj.revision, Some(&obj.content_hash), "clean");
+        report.skipped += 1;
+        return true;
+    }
+    let Some(blob) = b64_decode(&obj.payload) else {
+        report
+            .errors
+            .push(format!("l1-auto-agg: 远端 payload 编码损坏 ({})", obj.key));
+        return false;
+    };
+    let plain = match vault_decrypt(vault_key_bytes, &blob) {
+        Ok(plain) => plain,
+        Err(e) => {
+            report.errors.push(format!("l1-auto-agg: {e} ({})", obj.key));
+            return false;
+        }
+    };
+    if sha256_hex(&plain) != obj.content_hash {
+        report
+            .errors
+            .push(format!("l1-auto-agg: 远端哈希校验失败，已跳过 ({})", obj.key));
+        return false;
+    }
+    let rows: Vec<crate::telemetry_store::LocalMemorySnapshot> =
+        match serde_json::from_slice(&plain) {
+            Ok(rows) => rows,
+            Err(e) => {
+                report
+                    .errors
+                    .push(format!("l1-auto-agg: 载荷解析失败 {e} ({})", obj.key));
+                return false;
+            }
+        };
+    match store.sync_peer_extracted_l1(&device_suffix, &rows) {
+        Ok((landed, pruned)) => {
+            let _ =
+                store.cloud_sync_meta_set(&obj.key, obj.revision, Some(&obj.content_hash), "clean");
+            if landed > 0 || pruned > 0 {
+                report.pulled += 1;
+            } else {
+                report.skipped += 1;
+            }
+        }
+        Err(e) => {
+            report
+                .errors
+                .push(format!("l1-auto-agg: 落地失败 {e} ({})", obj.key));
             return false;
         }
     }
@@ -1643,6 +1725,29 @@ fn build_envelope(
         report.pushed += 1;
     }
 
+    // 本机记录的 `l1-auto:` 墓碑（用户删除决策）上云：远端还没有的补进
+    // 信封，让所有设备在下一轮应用。墓碑只增不减——删除的最终一致性
+    // 优先于信封体积；删除是低频操作，量级可控。
+    for memory_id in store
+        .tombstoned_l1_ids()
+        .map_err(|e| format!("读取 L1 删除墓碑失败 {e}"))?
+    {
+        let tomb_key = format!("l1-auto:{memory_id}");
+        if tombstones.contains_key(&tomb_key) {
+            continue;
+        }
+        revision += 1;
+        tombstones.insert(
+            tomb_key.clone(),
+            RemoteTombstone {
+                key: tomb_key,
+                revision,
+                deleted_at: now.clone(),
+            },
+        );
+        report.pushed += 1;
+    }
+
     // 用量总量：每台设备只写自己那一个对象，内容变了就整体覆盖。
     let usage_key = format!("usage-agg:{}", device.replace(':', "-"));
     let rows = store
@@ -1678,6 +1783,51 @@ fn build_envelope(
                 state: "clean",
             });
             report.pushed += 1;
+        }
+    }
+
+    // 跨会话提取记忆：每台设备只写自己的聚合 `l1-auto-agg:{device}`，对端
+    // 只读镜像（见 sync_peer_extracted_l1）。与 usage-agg 同一套单写者语义：
+    // 内容哈希变了才整体重推，不做逐条 CAS；「仅本会话」作用域不跨设备。
+    let agg_key = format!("l1-auto-agg:{}", device.replace(':', "-"));
+    let extracted = store
+        .cross_session_extracted_l1_memories()
+        .map_err(|e| format!("{agg_key}: 读取跨会话提取记忆失败 {e}"))?;
+    let agg_plain =
+        serde_json::to_vec(&extracted).map_err(|e| format!("{agg_key}: 序列化失败 {e}"))?;
+    if agg_plain.len() > 4 * 1024 * 1024 {
+        report.errors.push(format!(
+            "{agg_key}: 跨会话提取记忆聚合超过 4MB 上限（{} 字节），本轮已跳过；请整理记忆后重试",
+            agg_plain.len()
+        ));
+    } else {
+        let local_hash = sha256_hex(&agg_plain);
+        let remote_hash = objects.get(&agg_key).map(|obj| obj.content_hash.clone());
+        // 空聚合不凭空创建对象（没有提取记忆的设备保持信封干净）；但远端
+        // 已有本设备的聚合时必须推空版本，让对端把镜像修剪干净。
+        if !extracted.is_empty() || remote_hash.is_some() {
+            if remote_hash.as_deref() != Some(local_hash.as_str()) {
+                let sealed = b64_encode(&vault_encrypt(vault_key_bytes, &agg_plain)?);
+                revision += 1;
+                objects.insert(
+                    agg_key.clone(),
+                    RemoteObject {
+                        key: agg_key.clone(),
+                        revision,
+                        content_hash: local_hash.clone(),
+                        payload: sealed,
+                        updated_at: now.clone(),
+                        device_id: device.to_string(),
+                    },
+                );
+                pending.push(PendingWrite::Meta {
+                    key: agg_key,
+                    revision,
+                    hash: Some(local_hash),
+                    state: "clean",
+                });
+                report.pushed += 1;
+            }
         }
     }
 
@@ -2411,6 +2561,45 @@ mod tests {
             .map(|item| item.memory)
     }
 
+    /// 直接落一条本机提取的 L1（绕过会话锚点，模拟转录提取产物）。
+    fn add_extracted(store: &TelemetryStore, id: &str, memory: &str, durability: &str) {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO local_memory_items
+                (id, source_event_key, ordinal, memory, memory_type, durability, source, session_id, user_defined, event_time, created_at, updated_at)
+             VALUES (?1, ?2, 0, ?3, 'fact', ?4, 'claude_code', 'session-x', 0, NULL, '2026-11-02T00:00:00Z', '2026-11-02T00:00:00Z')",
+            rusqlite::params![id, format!("event-{id}"), memory, durability],
+        )
+        .expect("写入提取记忆");
+    }
+
+    /// (id, memory, origin_device) 全量清单：断言镜像状态的依据。
+    fn extracted_inventory(store: &TelemetryStore) -> Vec<(String, String, Option<String>)> {
+        let conn = store.conn.lock().unwrap();
+        let mut statement = conn
+            .prepare("SELECT id, memory, origin_device FROM local_memory_items ORDER BY id")
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// 解开某设备的 l1-auto-agg 聚合，返回其中的记忆 id 列表。
+    fn agg_entries(envelope: &VaultEnvelope, agg_key: &str) -> Vec<String> {
+        let obj = object(envelope, agg_key).unwrap_or_else(|| panic!("应有聚合对象 {agg_key}"));
+        let blob = b64_decode(&obj.payload).expect("payload 应是合法 base64");
+        let plain = vault_decrypt(&key(), &blob).expect("聚合应能解密");
+        let rows: Vec<crate::telemetry_store::LocalMemorySnapshot> =
+            serde_json::from_slice(&plain).expect("聚合应是合法 JSON");
+        rows.into_iter().map(|row| row.id).collect()
+    }
+
+    fn agg_key_of(store: &TelemetryStore) -> String {
+        format!("l1-auto-agg:{}", device_id(store).replace(':', "-"))
+    }
+
     fn remote_envelope(server: &fake_dav::Server) -> VaultEnvelope {
         let bytes = server.body(REMOTE_PATH).expect("远端应有信封文件");
         decode_envelope(&key(), &bytes).expect("信封应能用同步密码解开")
@@ -2793,6 +2982,192 @@ mod tests {
         let envelope = remote_envelope(&server);
         assert!(object(&envelope, "l1-user:alpha").is_some(), "A 的记忆还在");
         assert!(object(&envelope, "l1-user:beta").is_some(), "B 的记忆应已在远端");
+    }
+
+    /// 跨会话提取记忆按设备聚合同步：短期/长期到对端落为只读镜像，
+    /// 「仅本会话」不跨设备；撞 id 的本地行不被镜像覆盖；B 的聚合
+    /// 只含 B 自己的提取（对端镜像不二次广播）。
+    #[test]
+    fn extracted_memories_sync_as_per_device_mirror() {
+        let server = fake_dav::Server::start();
+        let a = paired(&server.url);
+        let b = paired(&server.url);
+
+        add_extracted(&a, "local-l1:a1", "A 的短期记忆", "short_term");
+        add_extracted(&a, "local-l1:a2", "A 的长期记忆", "long_term");
+        add_extracted(&a, "local-l1:a3", "A 的仅本会话", "session");
+        run_sync(&a).expect("A 首轮");
+
+        // B 预置一条与 A 撞 id 的本地提取行：镜像绝不能覆盖本地行。
+        add_extracted(&b, "local-l1:a1", "B 自己的同 id 记忆", "short_term");
+        let report = run_sync(&b).expect("B 首轮");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        let a_device = device_id(&a).replace(':', "-");
+        let by_id: std::collections::HashMap<String, (String, Option<String>)> =
+            extracted_inventory(&b)
+                .into_iter()
+                .map(|(id, memory, origin)| (id, (memory, origin)))
+                .collect();
+        // a1 撞 id 不镜像、a3 仅本会话不同步 → B 只有 a2 这一条镜像。
+        assert_eq!(
+            by_id.get("local-l1:a1"),
+            Some(&("B 自己的同 id 记忆".to_string(), None)),
+            "撞 id 时本地行原样保留：{by_id:?}"
+        );
+        assert_eq!(
+            by_id.get("local-l1:a2"),
+            Some(&("A 的长期记忆".to_string(), Some(a_device.clone()))),
+            "跨会话条目应落成 A 的只读镜像：{by_id:?}"
+        );
+        assert!(!by_id.contains_key("local-l1:a3"), "仅本会话不得跨设备");
+
+        // B 推送的聚合只含自己的 a1；A 的聚合仍含 a1/a2 两条。
+        let envelope = remote_envelope(&server);
+        assert_eq!(agg_entries(&envelope, &agg_key_of(&b)), vec!["local-l1:a1".to_string()]);
+        assert_eq!(agg_entries(&envelope, &agg_key_of(&a)).len(), 2);
+    }
+
+    /// 对端删除（或重整理后聚合变短）通过整体替换传播：B 修剪掉不再
+    /// 出现在 A 聚合里的镜像。
+    #[test]
+    fn extracted_memory_deletion_propagates_via_aggregate() {
+        let server = fake_dav::Server::start();
+        let a = paired(&server.url);
+        let b = paired(&server.url);
+        add_extracted(&a, "local-l1:keep", "保留这条", "short_term");
+        add_extracted(&a, "local-l1:drop", "会被删掉", "short_term");
+        run_sync(&a).expect("A 首轮");
+        run_sync(&b).expect("B 首轮");
+        assert_eq!(extracted_inventory(&b).len(), 2, "两条都镜像过来");
+
+        let conn = a.conn.lock().unwrap();
+        conn.execute("DELETE FROM local_memory_items WHERE id = 'local-l1:drop'", [])
+            .expect("A 本地删除");
+        drop(conn);
+        run_sync(&a).expect("A 推送变短的聚合");
+
+        let report = run_sync(&b).expect("B 修剪");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let inventory = extracted_inventory(&b);
+        assert_eq!(inventory.len(), 1, "被删的镜像应修剪：{inventory:?}");
+        assert_eq!(inventory[0].0, "local-l1:keep");
+    }
+
+    /// L1 重提取会清掉镜像行（user_defined=0）；水位一并清掉后，下一轮
+    /// 同步必须能把对端聚合重新镜像回来，而不是被「哈希未变」短路。
+    #[test]
+    fn l1_reset_reimports_peer_mirror_next_round() {
+        let server = fake_dav::Server::start();
+        let a = paired(&server.url);
+        let b = paired(&server.url);
+        add_extracted(&a, "local-l1:mirror-me", "值得共享的长期记忆", "long_term");
+        run_sync(&a).expect("A 首轮");
+        run_sync(&b).expect("B 首轮");
+        assert_eq!(extracted_inventory(&b).len(), 1);
+
+        b.reset_l1_for_reextraction().expect("B 重置");
+        assert_eq!(extracted_inventory(&b).len(), 0, "重置应清掉镜像");
+
+        let report = run_sync(&b).expect("B 重置后同步");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(extracted_inventory(&b).len(), 1, "水位已清，镜像应重新拉回");
+    }
+
+    /// 用户删除提取记忆是全局决策：A 删 → 墓碑上云 → B 的镜像删除；
+    /// 墓碑落表后，源聚合再带同 id 也不会镜像复活。
+    #[test]
+    fn user_delete_propagates_globally_and_blocks_resurrection() {
+        let server = fake_dav::Server::start();
+        let a = paired(&server.url);
+        let b = paired(&server.url);
+        add_extracted(&a, "local-l1:x1", "会被全局删除的记忆", "short_term");
+        run_sync(&a).expect("A 首轮");
+        run_sync(&b).expect("B 首轮");
+        assert_eq!(extracted_inventory(&b).len(), 1, "先镜像过来");
+
+        // 用户在 A 上删除：删行 + 落墓碑，下一轮同步把墓碑推上云。
+        a.delete_local_l1_memory("local-l1:x1").expect("A 删除");
+        run_sync(&a).expect("A 推送墓碑");
+        run_sync(&b).expect("B 应用墓碑");
+        assert!(extracted_inventory(&b).is_empty(), "B 的镜像应被删除");
+        assert!(b.tombstoned_l1_ids().unwrap().contains("local-l1:x1"));
+
+        // 源聚合还带着这条 id 时（源尚未应用墓碑的窗口），镜像也不复活。
+        let a_device = device_id(&a).replace(':', "-");
+        let snapshot = crate::telemetry_store::LocalMemorySnapshot {
+            id: "local-l1:x1".to_string(),
+            source_event_key: "event-x1".to_string(),
+            ordinal: 0,
+            memory: "会被全局删除的记忆".to_string(),
+            memory_type: "fact".to_string(),
+            durability: "short_term".to_string(),
+            source: "claude_code".to_string(),
+            session_id: "session-x".to_string(),
+            user_defined: false,
+            event_time: None,
+            created_at: "2026-11-02T00:00:00Z".to_string(),
+            updated_at: "2026-11-02T00:00:00Z".to_string(),
+        };
+        let (landed, pruned) = b
+            .sync_peer_extracted_l1(&a_device, std::slice::from_ref(&snapshot))
+            .expect("镜像应用");
+        assert_eq!((landed, pruned), (0, 0), "墓碑挡住复活");
+        assert!(extracted_inventory(&b).is_empty());
+    }
+
+    /// 在**接收方**删除他机镜像同样全局生效：B 删 A 的镜像 → 墓碑上云 →
+    /// A 应用墓碑，把 A 自己的本地提取行也删掉——一台删除，所有设备删。
+    #[test]
+    fn deleting_mirror_on_receiver_propagates_back_to_source() {
+        let server = fake_dav::Server::start();
+        let a = paired(&server.url);
+        let b = paired(&server.url);
+        add_extracted(&a, "local-l1:mine", "A 的原始记忆", "short_term");
+        run_sync(&a).expect("A 首轮");
+        run_sync(&b).expect("B 镜像");
+        assert_eq!(extracted_inventory(&b).len(), 1);
+
+        // 用户在 B 上删掉这条（它只是 A 的镜像）。
+        b.delete_local_l1_memory("local-l1:mine").expect("B 删镜像");
+        run_sync(&b).expect("B 推送墓碑");
+        run_sync(&a).expect("A 应用墓碑");
+        assert!(
+            extracted_inventory(&a).is_empty(),
+            "A 自己的本地行也应被删除：{:?}",
+            extracted_inventory(&a)
+        );
+        assert!(a.tombstoned_l1_ids().unwrap().contains("local-l1:mine"));
+    }
+
+    /// 清洗合并把保留项改写为镜像行时「晋升」为本机行：源设备下一轮聚合
+    /// 推来旧文本，不能把合并结果刷回去。
+    #[test]
+    fn edited_mirror_is_promoted_and_survives_source_push() {
+        let server = fake_dav::Server::start();
+        let a = paired(&server.url);
+        let b = paired(&server.url);
+        add_extracted(&a, "local-l1:merge", "原始版本", "short_term");
+        run_sync(&a).expect("A 首轮");
+        run_sync(&b).expect("B 镜像");
+
+        // B 上清洗合并：保留项是镜像行，内容被改写。
+        b.update_local_l1_memory("local-l1:merge", "合并后的版本")
+            .expect("改写镜像");
+        // A 侧内容未变，聚合哈希未变，不会重推；但构造 A 重推的场景：
+        // A 改了别的记忆触发整包重发，聚合里仍带旧文本。
+        add_extracted(&a, "local-l1:other", "另一条", "short_term");
+        run_sync(&a).expect("A 重推聚合");
+        let report = run_sync(&b).expect("B 应用");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        let inventory = extracted_inventory(&b);
+        let merged = inventory
+            .iter()
+            .find(|(id, _, _)| id == "local-l1:merge")
+            .expect("合并行还在");
+        assert_eq!(merged.1, "合并后的版本", "晋升后不被源聚合回滚：{inventory:?}");
+        assert_eq!(merged.2, None, "晋升为本机行（origin 置空）");
     }
 
     /// 用量统计是「每台设备只写自己那一个对象」：本机变了就重写自己的，

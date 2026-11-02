@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
@@ -11,7 +11,7 @@ import { useMemoryFields } from '../store/memoryStore'
 import { useTelemetryFields } from '../store/telemetryStore'
 import { useVisiblePolling } from '../hooks/useVisiblePolling'
 import { ErrorRecovery } from '../components/ErrorRecovery'
-import type { ConsolidationResult, HookStatus, MemoryImportance, MemoryImportResult, MemoryItem, MemoryLayerDocument } from '../types/memory'
+import type { ConsolidationResult, HookStatus, MemoryDomainItem, MemoryImportance, MemoryImportResult, MemoryItem, MemoryLayerDocument } from '../types/memory'
 import { normalizeL2Document } from '../lib/thinking'
 import { MemoryMarkdown } from '../components/MemoryMarkdown'
 import { CloudVaultCard } from '../components/CloudVaultCard'
@@ -116,8 +116,9 @@ const MemoryCard = memo(function MemoryCard({ memory: m, ranking, onPin, onEdit,
       </div>
       <div className="mt-0.5 flex flex-wrap items-center gap-2">
         {m.user_defined && <span className="text-xs px-1.5 rounded bg-violet-600/15 font-medium text-violet-700 dark:text-violet-300" title={t('memory.userDefinedPlaceholder')}>{t('memory.userDefinedBadge')}</span>}
-        {m.memory_type && <span className="text-xs px-1.5 rounded bg-violet-500/10 text-violet-600 dark:text-violet-400">{m.memory_type}</span>}
+        {m.memory_type && <span className="text-xs px-1.5 rounded bg-violet-500/10 text-violet-600 dark:text-violet-400">{t(`memory.type.${m.memory_type}`, { defaultValue: m.memory_type })}</span>}
         {m.durability && <span className={`text-xs px-1.5 rounded ${m.durability === 'long_term' ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300' : m.durability === 'short_term' ? 'bg-sky-500/10 text-sky-700 dark:text-sky-300' : 'bg-gray-200 text-gray-600 dark:bg-gray-600 dark:text-gray-200'}`}>{t(`memory.durability${m.durability === 'long_term' ? 'LongTerm' : m.durability === 'short_term' ? 'ShortTerm' : 'Session'}`)}</span>}
+        {(m.domains ?? []).map((domain) => <span key={domain.id} className="text-xs px-1.5 rounded bg-indigo-500/10 text-indigo-700 dark:text-indigo-300" title={domain.description || domain.name}>{domain.name}</span>)}
         {level && <span className={`text-xs px-1.5 rounded ${level === 'high' ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300' : level === 'medium' ? 'bg-sky-500/10 text-sky-700 dark:text-sky-300' : 'bg-gray-200 text-gray-600 dark:bg-gray-600 dark:text-gray-200'}`}>{t(`memory.importance${level[0].toUpperCase()}${level.slice(1)}`, { score: ranking.score })}</span>}
         {ranking && <span className="text-xs text-gray-500">{t('memory.importanceEvidence', { sessions: ranking.supporting_sessions, agents: ranking.supporting_agents, recalls: ranking.recall_count })}</span>}
         {(m.event_time || m.last_update_at) && <span className="text-xs text-gray-500" title={m.event_time ? t('memory.eventTimeTitle') : t('memory.memoryOrganizeTime')}>{localTime(m.event_time || m.last_update_at || '')}</span>}
@@ -128,7 +129,7 @@ const MemoryCard = memo(function MemoryCard({ memory: m, ranking, onPin, onEdit,
 
 export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPending, onOpenOrganized, onOpenCapture, onOpenInjection, active = true }: { onOpenUsage?: () => void; onOpenPending?: () => void; onOpenOrganized?: () => void; onOpenCapture?: () => void; onOpenInjection?: () => void; active?: boolean }) {
   const { t } = useTranslation()
-  const { engineOnline, memories, importance, loading, lastSearchResults, lastSearchQuery, memoryCacheReady, localMemoryStats, ingestStatus, l2Documents, l3Documents, checkIngest, loadMemoryLayers, consolidateShortTermMemory, draftLongTermProfile, publishLongTermProfile, updatePublishedMemoryDocument, deleteLongTermProfileDraft, organizeConversations, cancelOrganize, importMemoryFolder, checkEngine, stopEngine, search, listMemories, resetL1ForReextraction, updateMemory, deleteMemory, addUserMemory, dreaming, restoreConsolidation, refreshImportance, setMemoryPinned, hookStatus, qoderHookStatus, codexHookStatus, workbuddyHookStatus, agentSources, loadAgentSources } = useMemoryFields('engineOnline', 'memories', 'importance', 'loading', 'lastSearchResults', 'lastSearchQuery', 'memoryCacheReady', 'localMemoryStats', 'ingestStatus', 'l2Documents', 'l3Documents', 'checkIngest', 'loadMemoryLayers', 'consolidateShortTermMemory', 'draftLongTermProfile', 'publishLongTermProfile', 'updatePublishedMemoryDocument', 'deleteLongTermProfileDraft', 'organizeConversations', 'cancelOrganize', 'importMemoryFolder', 'checkEngine', 'stopEngine', 'search', 'listMemories', 'resetL1ForReextraction', 'updateMemory', 'deleteMemory', 'addUserMemory', 'dreaming', 'restoreConsolidation', 'refreshImportance', 'setMemoryPinned', 'hookStatus', 'qoderHookStatus', 'codexHookStatus', 'workbuddyHookStatus', 'agentSources', 'loadAgentSources')
+  const { engineOnline, memories, memoryDomains, selectedMemoryDomainId, importance, loading, lastSearchResults, lastSearchQuery, memoryCacheReady, localMemoryStats, ingestStatus, l2Documents, l3Documents, checkIngest, loadMemoryLayers, consolidateShortTermMemory, draftLongTermProfile, publishLongTermProfile, updatePublishedMemoryDocument, deleteLongTermProfileDraft, organizeConversations, cancelOrganize, importMemoryFolder, checkEngine, stopEngine, search, listMemories, loadMemoryDomains, setSelectedMemoryDomain, resetL1ForReextraction, updateMemory, deleteMemory, addUserMemory, dreaming, restoreConsolidation, refreshImportance, setMemoryPinned, hookStatus, qoderHookStatus, codexHookStatus, workbuddyHookStatus, agentSources, loadAgentSources } = useMemoryFields('engineOnline', 'memories', 'memoryDomains', 'selectedMemoryDomainId', 'importance', 'loading', 'lastSearchResults', 'lastSearchQuery', 'memoryCacheReady', 'localMemoryStats', 'ingestStatus', 'l2Documents', 'l3Documents', 'checkIngest', 'loadMemoryLayers', 'consolidateShortTermMemory', 'draftLongTermProfile', 'publishLongTermProfile', 'updatePublishedMemoryDocument', 'deleteLongTermProfileDraft', 'organizeConversations', 'cancelOrganize', 'importMemoryFolder', 'checkEngine', 'stopEngine', 'search', 'listMemories', 'loadMemoryDomains', 'setSelectedMemoryDomain', 'resetL1ForReextraction', 'updateMemory', 'deleteMemory', 'addUserMemory', 'dreaming', 'restoreConsolidation', 'refreshImportance', 'setMemoryPinned', 'hookStatus', 'qoderHookStatus', 'codexHookStatus', 'workbuddyHookStatus', 'agentSources', 'loadAgentSources')
   const { telemetrySummary, telemetryLiveStatus, checkTelemetry } = useTelemetryFields('telemetrySummary', 'telemetryLiveStatus', 'checkTelemetry')
 
   const [query, setQuery] = useState('')
@@ -137,6 +138,16 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
   const [editing, setEditing] = useState<MemoryItem | null>(null)
   const [editContent, setEditContent] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<MemoryItem | null>(null)
+  const [deleteDontAsk, setDeleteDontAsk] = useState(false)
+  // 「不再提醒」的直删路径要调用组件后部声明的 confirmDelete：用
+  // latest-ref 桥接（函数声明提升，渲染时即可赋值），保持 handleDelete
+  // 的稳定引用。
+  const confirmDeleteRef = useRef<((item: MemoryItem) => Promise<void>) | null>(null)
+  // latest-ref 桥接：每次渲染提交后同步组件后部声明的 confirmDelete，
+  // 供「不再提醒」的直删路径调用（函数声明提升，回调执行时已定义）。
+  useEffect(() => {
+    confirmDeleteRef.current = confirmDelete
+  })
   const [refreshing, setRefreshing] = useState(false)
   const [organizingConversations, setOrganizingConversations] = useState(false)
   const [importingMemories, setImportingMemories] = useState(false)
@@ -178,6 +189,31 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
   // The page is unmounted when navigating away.  Keep the loading decision in
   // the shared store so revisiting it in this app session paints immediately.
   const [booting, setBooting] = useState(() => !memoryCacheReady)
+  // Native L1 extraction stores conversation summaries as `conversation`.
+  // They are factual, searchable records—not user preferences. Only the
+  // profile-oriented kinds belong to the preference total.
+  const isPreference = useCallback((memory: MemoryItem) => ['preference', 'profile', 'constraint'].includes((memory.memory_type ?? '').toLowerCase()), [])
+  const visibleMemories = useMemo(() => {
+    if (selectedMemoryDomainId === 'all') return memories
+    return memories.filter((memory) => (memory.domains ?? []).some((domain) => domain.id === selectedMemoryDomainId))
+  }, [memories, selectedMemoryDomainId])
+  const visibleSearchResults = useMemo(() => {
+    if (selectedMemoryDomainId === 'all') return lastSearchResults
+    return lastSearchResults.filter((memory) => (memory.domains ?? []).some((domain) => domain.id === selectedMemoryDomainId))
+  }, [lastSearchResults, selectedMemoryDomainId])
+  const visibleStats = useMemo(() => {
+    if (selectedMemoryDomainId === 'all') return null
+    return {
+      total: visibleMemories.length,
+      facts: visibleMemories.filter((memory) => !isPreference(memory)).length,
+      preferences: visibleMemories.filter(isPreference).length,
+      session_only: visibleMemories.filter((memory) => memory.durability === 'session').length,
+      short_term: visibleMemories.filter((memory) => memory.durability === 'short_term').length,
+      long_term: visibleMemories.filter((memory) => memory.durability === 'long_term').length,
+    }
+  }, [selectedMemoryDomainId, visibleMemories, isPreference])
+  const factCount = useMemo(() => memories.filter((memory) => !isPreference(memory)).length, [memories, isPreference])
+  const prefCount = useMemo(() => memories.filter(isPreference).length, [memories, isPreference])
   const visibleL3Documents = l3Documents.filter((document) => !isInvalidL3Draft(document.content))
   const invalidL3Drafts = l3Documents.filter((document) => document.state === 'draft' && isInvalidL3Draft(document.content))
 
@@ -185,7 +221,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
     let mounted = true
     // Render a bounded loading state while the local ledger opens. Semantic
     // and MCP checks remain deferred so the first paint never waits on CLIs.
-    void Promise.allSettled([listMemories(), loadMemoryLayers()]).finally(() => {
+    void Promise.allSettled([listMemories(), loadMemoryLayers(), loadMemoryDomains()]).finally(() => {
       if (mounted) setBooting(false)
     })
     void checkEngine().then((online) => { if (online) void listMemories(true) })
@@ -234,6 +270,13 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
   }, [])
 
   const handleDelete = useCallback((item: MemoryItem) => {
+    // 「不再提醒」后直接执行：删除会经云保险库墓碑同步到所有设备。
+    if (localStorage.getItem('memory.deleteSkipConfirm') === '1') {
+      setDeleteTarget(item)
+      void confirmDeleteRef.current?.(item)
+      return
+    }
+    setDeleteDontAsk(false)
     setDeleteTarget(item)
   }, [])
 
@@ -287,6 +330,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
     setRefreshing(true)
     const results = await Promise.allSettled([
       checkEngine(),
+      loadMemoryDomains(),
       listMemories(true),
       checkIngest(),
       checkTelemetry({ backfill: true, refreshUsage: true, limit: 50 }),
@@ -468,10 +512,12 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
     } finally { setAddingUserMemory(false) }
   }
 
-  async function confirmDelete() {
-    if (!deleteTarget) return
+  async function confirmDelete(item?: MemoryItem) {
+    const target = item ?? deleteTarget
+    if (!target) return
     try {
-      await deleteMemory(deleteTarget.id)
+      await deleteMemory(target.id)
+      if (deleteDontAsk) localStorage.setItem('memory.deleteSkipConfirm', '1')
       flash('ok', t('memory.deleted'))
     } catch (e) {
       flash('err', `${t('common.failed')}: ${String(e)}`)
@@ -521,12 +567,6 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
     }
   }
 
-  // Native L1 extraction stores conversation summaries as `conversation`.
-  // They are factual, searchable records—not user preferences.  Only the
-  // profile-oriented kinds belong to the preference total.
-  const isPreference = (memory: MemoryItem) => ['preference', 'profile', 'constraint'].includes((memory.memory_type ?? '').toLowerCase())
-  const factCount = memories.filter((memory) => !isPreference(memory)).length
-  const prefCount = memories.filter(isPreference).length
   const engineState = engineOnline === null ? 'unknown' : engineOnline ? 'online' : 'offline'
 
   // 记忆注入入口卡只显示已开启/已关闭：任一座椅注入 Hook 事件齐备即视为已开启，
@@ -859,15 +899,24 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
 
       {/* 可检索记忆（L1） */}
       <section className="order-20 rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-4 space-y-3">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-200">{t('memory.storageTitle')}</h2>
-          <div className="ml-auto flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
-            <span>{t('memory.total')}: <b className="text-gray-700 dark:text-gray-200">{localMemoryStats?.total ?? memories.length}</b></span>
-            <span className="text-violet-600 dark:text-violet-400">{t('memory.fact')}: {localMemoryStats?.facts ?? factCount}</span>
-            <span className="text-amber-600 dark:text-amber-400">{t('memory.pref')}: {localMemoryStats?.preferences ?? prefCount}</span>
-            <span className="rounded bg-gray-100 px-1.5 py-0.5 text-gray-600 dark:bg-gray-700 dark:text-gray-200">{t('memory.durabilitySession')}: {localMemoryStats?.session_only ?? memories.filter((memory) => memory.durability === 'session').length}</span>
-            <span className="rounded bg-sky-500/10 px-1.5 py-0.5 text-sky-700 dark:text-sky-300">{t('memory.durabilityShortTerm')}: {localMemoryStats?.short_term ?? memories.filter((memory) => memory.durability === 'short_term').length}</span>
-            <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-emerald-700 dark:text-emerald-300">{t('memory.durabilityLongTerm')}: {localMemoryStats?.long_term ?? memories.filter((memory) => memory.durability === 'long_term').length}</span>
+          <select
+            value={selectedMemoryDomainId}
+            onChange={(event) => { void setSelectedMemoryDomain(event.target.value) }}
+            className="rounded-md border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-200"
+            title={t('memory.domainFilterTitle')}
+          >
+            <option value="all">{t('memory.domainAll')}</option>
+            {memoryDomains.map((domain: MemoryDomainItem) => <option key={domain.id} value={domain.id}>{domain.name}</option>)}
+          </select>
+          <div className="ml-auto flex flex-wrap items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+            <span>{t('memory.total')}: <b className="text-gray-700 dark:text-gray-200">{visibleStats?.total ?? localMemoryStats?.total ?? memories.length}</b></span>
+            <span className="text-violet-600 dark:text-violet-400">{t('memory.fact')}: {visibleStats?.facts ?? localMemoryStats?.facts ?? factCount}</span>
+            <span className="text-amber-600 dark:text-amber-400">{t('memory.pref')}: {visibleStats?.preferences ?? localMemoryStats?.preferences ?? prefCount}</span>
+            <span className="rounded bg-gray-100 px-1.5 py-0.5 text-gray-600 dark:bg-gray-700 dark:text-gray-200">{t('memory.durabilitySession')}: {visibleStats?.session_only ?? localMemoryStats?.session_only ?? memories.filter((memory) => memory.durability === 'session').length}</span>
+            <span className="rounded bg-sky-500/10 px-1.5 py-0.5 text-sky-700 dark:text-sky-300">{t('memory.durabilityShortTerm')}: {visibleStats?.short_term ?? localMemoryStats?.short_term ?? memories.filter((memory) => memory.durability === 'short_term').length}</span>
+            <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-emerald-700 dark:text-emerald-300">{t('memory.durabilityLongTerm')}: {visibleStats?.long_term ?? localMemoryStats?.long_term ?? memories.filter((memory) => memory.durability === 'long_term').length}</span>
             <button
               onClick={() => { void handleRefreshImportance() }}
               disabled={refreshingImportance || memories.length === 0}
@@ -923,19 +972,20 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
             {t('memory.search')}
           </button>
         </div>
-        {lastSearchResults.length > 0 && (
+        {visibleSearchResults.length > 0 && (
           <div className="space-y-1.5">
             <p className="text-xs text-gray-500 dark:text-gray-400">
               {t('memory.resultsFor')}「{lastSearchQuery}」
             </p>
-            {lastSearchResults.map((m, i) => (
+            {visibleSearchResults.map((m, i) => (
               <div key={m.id} className="rounded-md bg-gray-50 dark:bg-gray-700/50 border border-gray-200 dark:border-gray-600 px-3 py-2">
                 <div className="flex flex-wrap items-center gap-2 mb-1">
                   <span className="text-xs font-mono text-gray-500">#{i + 1}</span>
                   {m.score != null && (
                     <span className="text-xs font-mono text-amber-600 dark:text-amber-400">score {Number(m.score).toFixed(3)}</span>
                   )}
-                  {m.memory_type && <span className="text-xs px-1.5 rounded bg-violet-500/10 text-violet-600 dark:text-violet-400">{m.memory_type}</span>}
+                  {m.memory_type && <span className="text-xs px-1.5 rounded bg-violet-500/10 text-violet-600 dark:text-violet-400">{t(`memory.type.${m.memory_type}`, { defaultValue: m.memory_type })}</span>}
+                  {(m.domains ?? []).map((domain) => <span key={domain.id} className="text-xs px-1.5 rounded bg-indigo-500/10 text-indigo-700 dark:text-indigo-300" title={domain.description || domain.name}>{domain.name}</span>)}
                   {m.durability && <span className={`text-xs px-1.5 rounded ${m.durability === 'long_term' ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300' : m.durability === 'short_term' ? 'bg-sky-500/10 text-sky-700 dark:text-sky-300' : 'bg-gray-200 text-gray-600 dark:bg-gray-600 dark:text-gray-200'}`}>{t(`memory.durability${m.durability === 'long_term' ? 'LongTerm' : m.durability === 'short_term' ? 'ShortTerm' : 'Session'}`)}</span>}
                   {m.retrieval_source === 'conversation' && <span className="text-xs px-1.5 rounded bg-emerald-500/10 text-emerald-700 dark:text-emerald-300">{t('memory.searchSourceConversation')}</span>}
                   {m.retrieval_source === 'memory' && <span className="text-xs px-1.5 rounded bg-sky-500/10 text-sky-700 dark:text-sky-300">{t('memory.searchSourceMemory')}</span>}
@@ -946,15 +996,15 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
             ))}
           </div>
         )}
-        {lastSearchResults.length === 0 && lastSearchQuery && !loading && (
+        {visibleSearchResults.length === 0 && lastSearchQuery && !loading && (
           <p className="text-sm text-gray-500 text-center py-4">{t('memory.noResults')}</p>
         )}
 
-        {memories.length === 0 ? (
-          <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-6">{t('memory.empty')}</p>
+        {visibleMemories.length === 0 ? (
+          <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-6">{selectedMemoryDomainId === 'all' ? t('memory.empty') : t('memory.domainEmpty')}</p>
         ) : (
           <div className="space-y-1.5 max-h-[420px] overflow-y-auto pr-1">
-            {memories.map((m) => (
+            {visibleMemories.map((m) => (
               <MemoryCard key={m.id} memory={m} ranking={importance[m.id]} onPin={handlePinMemory} onEdit={openEdit} onDelete={handleDelete} />
             ))}
           </div>
@@ -1051,6 +1101,16 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
               <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('memory.deleteConfirm')}</h3>
             </div>
             <p className="text-sm text-gray-600 dark:text-gray-300 line-clamp-3 break-all">{deleteTarget.memory}</p>
+            <p className="text-xs text-amber-600 dark:text-amber-400">{t('memory.deleteGlobalHint')}</p>
+            <label className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400 select-none">
+              <input
+                type="checkbox"
+                checked={deleteDontAsk}
+                onChange={(event) => setDeleteDontAsk(event.target.checked)}
+                className="rounded border-gray-300 dark:border-gray-600"
+              />
+              {t('memory.deleteDontAsk')}
+            </label>
             <div className="flex justify-end gap-2">
               <button onClick={() => setDeleteTarget(null)} className="px-3 py-1.5 rounded-md border border-gray-300 dark:border-gray-600 text-sm text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700">
                 {t('common.cancel')}

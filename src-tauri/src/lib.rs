@@ -22,6 +22,7 @@ mod mcp_registry;
 mod mcp_stdio_relay;
 mod mcp_tool_discovery;
 mod memory_backend;
+mod memory_domain;
 mod memory_ingest;
 mod memory_mcp;
 mod network_info;
@@ -176,6 +177,15 @@ pub fn run() {
             memory_backend::memory_semantic_index_build,
             memory_backend::memory_embedding_auto_build_get,
             memory_backend::memory_embedding_auto_build_set,
+            memory_domain::memory_domain_config_get,
+            memory_domain::memory_domain_config_set,
+            memory_domain::memory_domain_config_test,
+            memory_domain::memory_domain_backfill,
+            memory_domain::memory_domain_list,
+            memory_domain::memory_domain_upsert,
+            memory_domain::memory_domain_delete,
+            memory_domain::memory_domain_links,
+            memory_domain::memory_domain_classify_snapshot_ids,
             memory_backend::memory_consolidate,
             memory_backend::memory_consolidation_restore,
             memory_backend::memory_importance_refresh,
@@ -196,6 +206,7 @@ pub fn run() {
             memory_ingest::memory_l1_conversation_detail,
             memory_ingest::memory_import_folder,
             memory_ingest::local_memory_list,
+            memory_ingest::local_memory_list_all,
             memory_ingest::local_memory_stats,
             memory_ingest::local_memory_reset_for_reextraction,
             memory_ingest::local_memory_search,

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { invoke } from '@tauri-apps/api/core'
 import { Plus, Trash2, CheckCircle, XCircle, Loader2, Eye, EyeOff, AlertCircle, Brain, ExternalLink, ChevronDown } from 'lucide-react'
+import { DomainRoutingSettings } from '../features/memory/DomainRoutingSettings'
 
 const SPONSOR_PROVIDER_ID = '88api'
 const SPONSOR_CREDITS_URL = 'https://88api.ai/sign-up?aff=VNNV'
@@ -48,10 +49,11 @@ const EMPTY_CUSTOM: LlmProvider = {
   context_window: 128000, max_output_tokens: 16384,
 }
 
-export function LlmSettings({ embedded = false, onBusyChange, onReadinessChange }: {
+export function LlmSettings({ embedded = false, onBusyChange, onReadinessChange, includeDecision = true }: {
   embedded?: boolean
   onBusyChange?: (busy: boolean) => void
   onReadinessChange?: (ready: boolean) => void
+  includeDecision?: boolean
 }) {
   const { t } = useTranslation()
   const [loading, setLoading] = useState(true)
@@ -213,18 +215,22 @@ export function LlmSettings({ embedded = false, onBusyChange, onReadinessChange 
         <p className="text-xs text-gray-500 mt-0.5">{t('llm.subtitle')}</p>
       </div>}
 
-      <section className="rounded-lg border border-gray-200 bg-white p-4 space-y-2 dark:border-gray-700 dark:bg-gray-900">
-        <div className="flex items-center gap-2"><Brain size={15} className="text-violet-600 dark:text-violet-400" /><h3 className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('llm.memoryModelTitle')}</h3></div>
-        <p className="text-xs leading-5 text-gray-600 dark:text-gray-300">{t('llm.memoryModelHint')}</p>
+      <section className="space-y-3 rounded-lg border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-900">
+        <div className="flex items-center gap-2">
+          <Brain size={15} className="text-violet-600 dark:text-violet-400" />
+          <div className="min-w-0 flex-1">
+            <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('llm.memoryModelTitle')}</h3>
+            <p className="mt-0.5 text-xs leading-5 text-gray-600 dark:text-gray-300">{t('llm.memoryModelHint')}</p>
+          </div>
+          {memoryConfig.provider_id && <span className="shrink-0 text-xs text-green-700 dark:text-green-400">{t('llm.memoryModelReady')}</span>}
+          {savingMemoryConfig && <Loader2 size={14} className="shrink-0 animate-spin text-violet-600" />}
+        </div>
         <div className="flex flex-wrap items-center gap-2">
           <select aria-label={t('llm.memoryModelTitle')} value={memoryConfig.provider_id ?? ''} onChange={(event) => { void saveMemoryConfig(event.target.value) }} disabled={savingMemoryConfig} className="min-w-60 rounded-md border border-gray-300 bg-white px-2.5 py-1.5 text-sm text-gray-800 outline-none focus:border-violet-500 disabled:opacity-50 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100">
             <option value="">{t('llm.memoryModelNone')}</option>
             {providers.filter((provider) => provider.enabled && provider.has_api_key && provider.model.trim()).map((provider) => <option key={provider.id} value={provider.id}>{provider.name} · {provider.model}</option>)}
           </select>
-          {savingMemoryConfig && <Loader2 size={14} className="animate-spin text-violet-600" />}
-          {memoryConfig.provider_id && <span className="text-xs text-green-700 dark:text-green-400">{t('llm.memoryModelReady')}</span>}
         </div>
-      </section>
 
       {hasErrors && (
         <div role="alert" className="flex items-center gap-2 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-600 dark:bg-red-900/20 dark:text-red-400">
@@ -236,9 +242,7 @@ export function LlmSettings({ embedded = false, onBusyChange, onReadinessChange 
         </div>
       )}
 
-      {/* Built-in providers */}
-      <div className="space-y-3">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500">{t('llm.builtin')}</h3>
+      {builtins.length > 0 && <div className="divide-y divide-gray-100 dark:divide-gray-700">
         {builtins.map(p => (
           <BuiltinCard
             key={p.id}
@@ -254,15 +258,12 @@ export function LlmSettings({ embedded = false, onBusyChange, onReadinessChange 
             onReadinessChange={onBuiltinReadinessChange}
           />
         ))}
-      </div>
+      </div>}
 
-      {/* Ollama local models */}
       <OllamaPanel providers={providers} onChanged={load} onBusyChange={setOllamaBusy} onReadinessChange={setOllamaReady} />
 
-      {/* Custom providers */}
-      <div className="space-y-3">
-        <div className="flex items-center justify-between">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500">{t('llm.custom')}</h3>
+      <div className="space-y-3 border-t border-gray-100 pt-3 dark:border-gray-700">
+        <div className="flex items-center justify-end">
           <button
             onClick={() => { setForm({ ...EMPTY_CUSTOM }); setEditingCustom(null); setShowCustomForm(true) }}
             disabled={showCustomForm}
@@ -367,6 +368,9 @@ export function LlmSettings({ embedded = false, onBusyChange, onReadinessChange 
           </div>
         </div>
       )}
+      </section>
+
+      {includeDecision && <DomainRoutingSettings />}
     </fieldset>
   )
 }
@@ -433,7 +437,7 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
   }
 
   return (
-    <div className="rounded-lg border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-900 space-y-3">
+    <div className="space-y-3 py-3">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           {isSponsor && <img src="/88api.png" alt="88API" className="h-8 w-8 rounded-lg object-cover" />}
@@ -676,9 +680,7 @@ function OllamaPanel({ providers, onChanged, onBusyChange, onReadinessChange }: 
   }
 
   return (
-    <div className="space-y-3">
-      <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500">{t('llm.ollamaTitle')}</h3>
-      <div className="rounded-lg border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-900 space-y-3">
+    <div className="space-y-3 border-t border-gray-100 py-3 dark:border-gray-700">
         <div className="flex flex-wrap items-end gap-2">
           <Field label={t('llm.ollamaBaseUrl')} className="flex-1">
             {id => <input id={id} value={baseUrl} onChange={e => { setDraftBaseUrl(e.target.value); setReport(null); setResult(null) }}
@@ -731,7 +733,6 @@ function OllamaPanel({ providers, onChanged, onBusyChange, onReadinessChange }: 
         {report && report.models.length === 0 && (
           <p className="text-xs text-gray-500">{t('llm.ollamaNoModels')}</p>
         )}
-      </div>
     </div>
   )
 }

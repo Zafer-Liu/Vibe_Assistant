@@ -267,7 +267,7 @@ Aggregates real input / output / cache usage from local transcripts across Agent
 
 ### ☁️ Cloud Memory Vault (optional)
 
-Sync published L2/L3 documents and custom memories across machines — one brain everywhere:
+Sync published L2/L3 documents, custom memories, and usage stats across machines — one brain everywhere. Cross-session extracted memories (short/long-term) are shared as **per-device read-only mirrors**: each machine writes only its own aggregate, deletions and re-organization propagate along, session-scoped memories never leave the device.
 
 - **AES-256-GCM end-to-end encryption**: keys derived from your sync password, never stored; the server only ever sees ciphertext
 - CAS conflict detection, incremental pulls, tombstone deletions; local SQLite stays authoritative, offline sync failures never block injection
@@ -332,7 +332,7 @@ No CLI import or process launch is required.
 
 ## 🤖 LLM Configuration
 
-MCP parsing and memory extraction need an LLM. Add one under **Settings → LLM and memory extraction**:
+MCP parsing and memory extraction need an LLM. Add one under **Settings → Memory Extraction**:
 
 | Field | Meaning | Example |
 |-------|---------|---------|
@@ -429,7 +429,7 @@ Standard endpoint: `POST http://127.0.0.1:<hook-port>/telemetry/events/{codex|wo
 
 Check in order:
 
-1. Memory extraction needs an LLM: confirm at least one provider passes **Test Connection** in **Settings → LLM and memory extraction** (or an Ollama model is attached)
+1. Memory extraction needs an LLM: confirm at least one provider passes **Test Connection** in **Settings → Memory Extraction** (or an Ollama model is attached)
 2. Open **Memory Center → Pending Memories** — is the session queued? What is the failure reason? (Failures quote the model's raw output for diagnosis.)
 3. Confirm the Agent's capture hook is installed, or its transcript directory is configured correctly
 4. Failed sessions can be re-run from the panel
