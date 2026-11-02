@@ -808,7 +808,9 @@ mod tests {
         assert_eq!(first["status"], "recorded");
         assert_eq!(first["record_id"], second["record_id"]);
         // 同 body 重发：INSERT OR REPLACE 幂等，仅一行明细；裸 uuid 归一成
-        // 扫描器口径的目录名；origin 固定 dsh_plugin。
+        // 扫描器口径的目录名；origin 固定 dsh_plugin。input 列为输入合计
+        // （1200 未命中 + 300 缓存命中），与转录扫描及计价口径一致，见
+        // telemetry_store::tests 的 dsh_plugin_usage 断言。
         let conn = store.conn.lock().unwrap();
         let count: i64 = conn
             .query_row(
@@ -839,7 +841,7 @@ mod tests {
             (
                 format!("session-{DSH_SESSION_UUID}"),
                 "dsh_plugin".to_string(),
-                1200,
+                1500,
                 80,
                 300
             )
