@@ -96,7 +96,7 @@ pub mod fake_dav {
         write_len(stream, status, extra, body.len(), body);
     }
 
-    /// HEAD 只回头部：真写了 body 会让 keep-alive 上的下一个响应错位。
+    /// HEAD 只回头部：HEAD 响应在 HTTP 语义上本就没有 body。
     fn write_head(stream: &mut TcpStream, status: &str, extra: &str, len: usize) {
         write_len(stream, status, extra, len, &[]);
     }
@@ -108,7 +108,13 @@ pub mod fake_dav {
         len: usize,
         body: &[u8],
     ) {
-        let head = format!("HTTP/1.1 {status}\r\nContent-Length: {len}\r\n{extra}\r\n");
+        // 一连接一请求（handle 返回即关流），必须声明 Connection: close：
+        // 不声明的话客户端按 HTTP/1.1 默认把连接放回池里复用，下一个请求
+        // 撞上刚到的 FIN/RST 会以「连接失败」硬报错（Linux CI 上偶发，
+        // Windows 本地几乎不现）。坚果云真身每个响应也带这个头。
+        let head = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {len}\r\nConnection: close\r\n{extra}\r\n"
+        );
         let _ = stream.write_all(head.as_bytes());
         let _ = stream.write_all(body);
         let _ = stream.flush();
