@@ -1115,7 +1115,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
               <button onClick={() => setDeleteTarget(null)} className="px-3 py-1.5 rounded-md border border-gray-300 dark:border-gray-600 text-sm text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700">
                 {t('common.cancel')}
               </button>
-              <button onClick={confirmDelete} className="px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-500 text-white text-sm font-medium">
+              <button onClick={() => { void confirmDelete() }} className="px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-500 text-white text-sm font-medium">
                 {t('common.delete')}
               </button>
             </div>
