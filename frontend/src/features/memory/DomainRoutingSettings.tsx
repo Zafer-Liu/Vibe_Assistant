@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { useTranslation } from 'react-i18next'
-import { Brain, CheckCircle2, Loader2, Pencil, Plus, RefreshCw, Trash2, X } from 'lucide-react'
+import { Brain, CheckCircle2, Loader2, Pencil, Plus, Trash2, X } from 'lucide-react'
 
 type DecisionProvider = 'jev' | 'ollama'
 
