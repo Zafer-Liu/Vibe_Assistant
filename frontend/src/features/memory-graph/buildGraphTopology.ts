@@ -32,7 +32,7 @@ function measureLabel(label: string, size: number, weight: number, ctx: CanvasRe
     ctx.font = `${weight} ${size}px ${FONT_FAMILY}`
     return Math.ceil(ctx.measureText(label).width) + 12
   }
-  return Array.from(label).reduce((sum, letter) => sum + (/[^\x00-\xff]/.test(letter) ? size : size * 0.7), 12)
+  return Array.from(label).reduce((sum, letter) => sum + (letter.charCodeAt(0) > 0xff ? size : size * 0.7), 12)
 }
 
 function memoryPreview(text: string): string {
