@@ -11,11 +11,12 @@ import { displayFullTime } from '../components/ConversationDialog'
 import { MemoryBreadcrumb } from '../components/MemoryBreadcrumb'
 import { isInjectionReady } from '../lib/memoryAgentStatus'
 
-type HookAgentType = 'claude' | 'qoder' | 'codex' | 'workbuddy' | 'dsh'
+type HookAgentType = 'claude' | 'qoder' | 'codex' | 'workbuddy' | 'dsh' | 'gemini' | 'antigravity'
 const HOOK_AGENTS: { id: HookAgentType; label: string }[] = [
   { id: 'codex', label: 'Codex' }, { id: 'claude', label: 'Claude Code' },
   { id: 'qoder', label: 'Qoder' }, { id: 'workbuddy', label: 'WorkBuddy' },
   { id: 'dsh', label: 'DeepSeek Harness' },
+  { id: 'gemini', label: 'Gemini CLI' }, { id: 'antigravity', label: 'Antigravity' },
 ]
 function formatLogDetail(detail: string) {
   try { return JSON.stringify(JSON.parse(detail), null, 2) } catch { return detail }
@@ -23,7 +24,7 @@ function formatLogDetail(detail: string) {
 
 export const MemoryInjection = memo(function MemoryInjection({ onBack, onOpenCapture, active = true }: { onBack: () => void; onOpenCapture: () => void; active?: boolean }) {
   const { t } = useTranslation()
-  const { hookStatus, qoderHookStatus, codexHookStatus, workbuddyHookStatus, dshHookStatus, agentSources, memoryInjectionLogs, memoryInjectionStats, checkIngest, installHook, loadAgentSources, loadMemoryInjectionLogs, loadInjectionStats, setAgentSourceScanEnabled } = useMemoryFields('hookStatus', 'qoderHookStatus', 'codexHookStatus', 'workbuddyHookStatus', 'dshHookStatus', 'agentSources', 'memoryInjectionLogs', 'memoryInjectionStats', 'checkIngest', 'installHook', 'loadAgentSources', 'loadMemoryInjectionLogs', 'loadInjectionStats', 'setAgentSourceScanEnabled')
+  const { hookStatus, qoderHookStatus, codexHookStatus, workbuddyHookStatus, dshHookStatus, geminiHookStatus, antigravityHookStatus, agentSources, memoryInjectionLogs, memoryInjectionStats, checkIngest, installHook, loadAgentSources, loadMemoryInjectionLogs, loadInjectionStats, setAgentSourceScanEnabled } = useMemoryFields('hookStatus', 'qoderHookStatus', 'codexHookStatus', 'workbuddyHookStatus', 'dshHookStatus', 'geminiHookStatus', 'antigravityHookStatus', 'agentSources', 'memoryInjectionLogs', 'memoryInjectionStats', 'checkIngest', 'installHook', 'loadAgentSources', 'loadMemoryInjectionLogs', 'loadInjectionStats', 'setAgentSourceScanEnabled')
   const { memoryMcp, checkMemoryMcp, installMemoryMcp, uninstallMemoryMcp, dshBridge, loadDshBridge, setDshBridge } = useMcpFields('memoryMcp', 'checkMemoryMcp', 'installMemoryMcp', 'uninstallMemoryMcp', 'dshBridge', 'loadDshBridge', 'setDshBridge')
   const [hookAction, setHookAction] = useState<string | null>(null)
   const [mcpAction, setMcpAction] = useState<string | null>(null)
@@ -54,16 +55,19 @@ export const MemoryInjection = memo(function MemoryInjection({ onBack, onOpenCap
   const hookStatusByAgent: Record<string, HookStatus | null> = {
     codex: codexHookStatus, claude: hookStatus, qoder: qoderHookStatus, workbuddy: workbuddyHookStatus,
     dsh: dshHookStatus,
+    gemini: geminiHookStatus, antigravity: antigravityHookStatus,
   }
   // agentSources 的 id 与共享记忆 MCP 的目标 id 并不一致，按来源映射。
   // Claude 的 CLI 与 Desktop 是两份独立配置，分别显示；Codex 两端共用 config.toml，只显示一个真实状态。
   const mcpTargetsBySource: Record<string, string[]> = {
     codex: ['codex_cli'], claude: ['claude_cli', 'claude_desktop'], qoder: ['qoder'], workbuddy: ['workbuddy'],
     minimax: ['minimax'], kimi: ['kimi'], zcode: ['zcode'], dsh: ['dsh'],
+    gemini: ['gemini'], antigravity: ['antigravity'],
   }
   const mcpTargetLabel: Record<string, string> = {
     claude_cli: 'Claude Code', claude_desktop: 'Claude Desktop', codex_cli: 'Codex',
     qoder: 'Qoder', workbuddy: 'WorkBuddy', minimax: 'MiniMax Code', kimi: 'Kimi', zcode: 'ZCode', dsh: 'DeepSeek Harness',
+    gemini: 'Gemini CLI', antigravity: 'Antigravity',
   }
   const hookLogs = memoryInjectionLogs.filter(log => log.tool_name === 'session_start_inject' || log.tool_name === 'prompt_inject')
   const mcpLogs = memoryInjectionLogs.filter(log => log.tool_name !== 'session_start_inject' && log.tool_name !== 'prompt_inject')

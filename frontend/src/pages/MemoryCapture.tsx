@@ -12,13 +12,15 @@ import { MemoryBreadcrumb } from '../components/MemoryBreadcrumb'
 import { displayFullTime } from '../components/ConversationDialog'
 import { isCaptureReady, isInjectionReady } from '../lib/memoryAgentStatus'
 
-type HookAgentType = 'claude' | 'qoder' | 'codex' | 'workbuddy' | 'dsh'
-const COLLECT_EVENTS = ['UserPromptSubmit', 'PostToolUse', 'Stop']
+type HookAgentType = 'claude' | 'qoder' | 'codex' | 'workbuddy' | 'dsh' | 'gemini' | 'antigravity'
+// Gemini CLI 的 BeforeAgent / Antigravity 的 PreInvocation 与 UserPromptSubmit
+// 同为“每轮提问”采集事件。
+const COLLECT_EVENTS = ['UserPromptSubmit', 'PostToolUse', 'Stop', 'BeforeAgent', 'PreInvocation']
 const collectEventCount = (hook: HookStatus | null) => hook?.events.filter(event => COLLECT_EVENTS.includes(event)).length ?? 0
 
 export const MemoryCapture = memo(function MemoryCapture({ onBack, onOpenInjection, active = true }: { onBack: () => void; onOpenInjection: () => void; active?: boolean }) {
   const { t } = useTranslation()
-  const { hookStatus, qoderHookStatus, codexHookStatus, workbuddyHookStatus, dshHookStatus, ingestStatus, agentSources, checkIngest, installHook, uninstallHook, setIngestEnabled, loadAgentSources, setAgentSourceOverride, setAgentSourceScanEnabled } = useMemoryFields('hookStatus', 'qoderHookStatus', 'codexHookStatus', 'workbuddyHookStatus', 'dshHookStatus', 'ingestStatus', 'agentSources', 'checkIngest', 'installHook', 'uninstallHook', 'setIngestEnabled', 'loadAgentSources', 'setAgentSourceOverride', 'setAgentSourceScanEnabled')
+  const { hookStatus, qoderHookStatus, codexHookStatus, workbuddyHookStatus, dshHookStatus, geminiHookStatus, antigravityHookStatus, ingestStatus, agentSources, checkIngest, installHook, uninstallHook, setIngestEnabled, loadAgentSources, setAgentSourceOverride, setAgentSourceScanEnabled } = useMemoryFields('hookStatus', 'qoderHookStatus', 'codexHookStatus', 'workbuddyHookStatus', 'dshHookStatus', 'geminiHookStatus', 'antigravityHookStatus', 'ingestStatus', 'agentSources', 'checkIngest', 'installHook', 'uninstallHook', 'setIngestEnabled', 'loadAgentSources', 'setAgentSourceOverride', 'setAgentSourceScanEnabled')
   // dsh 的采集/注入由独立桥接插件接管，状态与操作走 dsh_bridge 命令。
   const { dshBridge, loadDshBridge, setDshBridge } = useMcpFields('dshBridge', 'loadDshBridge', 'setDshBridge')
   const { telemetryEvents, checkTelemetry } = useTelemetryFields('telemetryEvents', 'checkTelemetry')
@@ -63,6 +65,8 @@ export const MemoryCapture = memo(function MemoryCapture({ onBack, onOpenInjecti
     dsh: dshBridge
       ? { agent_type: 'dsh', installed: dshBridge.installed, events: dshBridge.installed && (dshBridge.features.injection ?? true) ? ['agent/pre-step'] : [] }
       : dshHookStatus,
+    gemini: geminiHookStatus,
+    antigravity: antigravityHookStatus,
   }
   const readyCount = agentSources.filter(source => isCaptureReady(source, hookStatusByAgent[source.id])).length
 

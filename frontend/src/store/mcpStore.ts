@@ -58,9 +58,9 @@ interface McpStore {
 }
 
 export const useMcpStore = create<McpStore>((set, get) => ({
-  memoryMcp: { codex_cli: null, claude_cli: null, codex_desktop: null, claude_desktop: null, qoder: null, workbuddy: null, minimax: null, kimi: null, zcode: null, dsh: null },
+  memoryMcp: { codex_cli: null, claude_cli: null, codex_desktop: null, claude_desktop: null, qoder: null, workbuddy: null, minimax: null, kimi: null, zcode: null, dsh: null, gemini: null, antigravity: null },
 
-  memoryMcpRuntime: { codex_cli: null, claude_cli: null, codex_desktop: null, claude_desktop: null, qoder: null, workbuddy: null, minimax: null, kimi: null, zcode: null, dsh: null },
+  memoryMcpRuntime: { codex_cli: null, claude_cli: null, codex_desktop: null, claude_desktop: null, qoder: null, workbuddy: null, minimax: null, kimi: null, zcode: null, dsh: null, gemini: null, antigravity: null },
 
   memoryMcpRuntimeError: '',
 
@@ -93,7 +93,7 @@ export const useMcpStore = create<McpStore>((set, get) => ({
   mcpProfilesError: '',
 
   async checkMemoryMcp() {
-    const targets: MemoryMcpTarget[] = ['codex_cli', 'claude_cli', 'codex_desktop', 'claude_desktop', 'qoder', 'workbuddy', 'minimax', 'kimi', 'zcode', 'dsh']
+    const targets: MemoryMcpTarget[] = ['codex_cli', 'claude_cli', 'codex_desktop', 'claude_desktop', 'qoder', 'workbuddy', 'minimax', 'kimi', 'zcode', 'dsh', 'gemini', 'antigravity']
     const results = await Promise.allSettled(targets.map((agentType) => mcpApi.memoryMcpStatus({ agentType })))
     set((state) => {
       const next = { ...state.memoryMcp }

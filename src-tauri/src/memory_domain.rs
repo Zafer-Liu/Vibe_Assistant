@@ -20,7 +20,7 @@ fn default_provider() -> String { "jev".into() }
 fn default_endpoint() -> String { DEFAULT_ENDPOINT.into() }
 fn default_model() -> String { "jev-latest".into() }
 fn default_timeout() -> u64 { 8_000 }
-fn default_tag_threshold() -> f64 { 0.70 }
+fn default_tag_threshold() -> f64 { 0.60 }
 fn default_route_threshold() -> f64 { 0.60 }
 fn default_second_threshold() -> f64 { 0.55 }
 
@@ -749,15 +749,12 @@ async fn memory_domain_backfill_inner(max_items: u32, retag: bool) -> Result<Mem
     let total = items.len() as u32;
     let mut processed = 0u32;
     let mut tagged = 0u32;
-    for chunk in items.chunks(8) {
-        let store_clone = store.clone();
-        let chunk_owned = chunk.to_vec();
-        let assignments = classify_memory_batch_async(&store_clone, &chunk_owned).await?;
-        for (item, domains) in chunk.iter().zip(assignments) {
-            tagged += if domains.is_empty() { 0 } else { 1 };
-            store.replace_backfill_memory_domains(&item.id, &domains)?;
-            processed += 1;
-        }
+    for item in &items {
+        let mut batch = classify_memory_batch_async(&store, std::slice::from_ref(item)).await?;
+        let domains = batch.pop().ok_or("分类结果缺少当前记忆")?;
+        save_classification_async(&store, item, &domains).await?;
+        tagged += if domains.is_empty() { 0 } else { 1 };
+        processed += 1;
     }
     let remaining = if retag {
         total_candidates.saturating_sub(processed)
@@ -828,14 +825,65 @@ pub struct MemoryDomainClassifyBatchResult {
     pub processed: u32,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MemoryDomainClassificationStatus {
+    pub total: u32,
+    pub processed: u32,
+    pub pending_ids: Vec<String>,
+}
+
+fn classification_status_with_store(store: &TelemetryStore) -> Result<MemoryDomainClassificationStatus, String> {
+    let completed = store.completed_memory_domain_classification_ids()?;
+    let items = store.local_l1_memory_snapshot()?.into_iter()
+        .filter(|item| !item.user_defined)
+        .collect::<Vec<_>>();
+    let pending_ids = items.iter()
+        .filter(|item| !completed.contains(&item.id))
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    Ok(MemoryDomainClassificationStatus {
+        total: items.len() as u32,
+        processed: (items.len() - pending_ids.len()) as u32,
+        pending_ids,
+    })
+}
+
+/// Read persisted progress without calling the decision model. The page can
+/// reconstruct its queue after an interruption, including partially saved batches.
+#[tauri::command]
+pub fn memory_domain_classification_status() -> Result<MemoryDomainClassificationStatus, String> {
+    classification_status_with_store(&domain_store()?)
+}
+
+// SQLite's busy timeout and bounded retries may wait for an independent MCP
+// writer. Keep that blocking wait off Tauri's async worker threads.
+async fn save_classification_async(
+    store: &TelemetryStore,
+    item: &LocalMemorySnapshot,
+    assignments: &[MemoryDomainAssignment],
+) -> Result<(), String> {
+    let store = store.clone();
+    let item = item.clone();
+    let assignments = assignments.to_vec();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.save_memory_domain_classification(&item, &assignments)
+    }).await.map_err(|error| format!("分类保存任务执行失败：{error}"))?
+}
+
 async fn tag_one_batch_with_store(store: &TelemetryStore, items: &[LocalMemorySnapshot]) -> Result<usize, String> {
+    let completed = store.completed_memory_domain_classification_ids()?;
+    let mut processed = 0;
     for item in items {
+        if completed.contains(&item.id) {
+            continue;
+        }
         let mut batch = classify_memory_batch_async(store, std::slice::from_ref(item)).await?;
         let assignments = batch.pop().ok_or("分类结果缺少当前记忆")?;
-        store.clear_memory_domain_links(&item.id)?;
-        store.insert_memory_domain_links(&item.id, &assignments)?;
+        save_classification_async(store, item, &assignments).await?;
+        processed += 1;
     }
-    Ok(items.len())
+    Ok(processed)
 }
 
 /// Classify exactly one bounded set of L1 memories. The caller owns batching
@@ -852,8 +900,6 @@ pub async fn memory_domain_classify_batch(
         return Err("memory_ids 最多一次处理 200 条".into());
     }
     let store = domain_store()?;
-    let config = load_config(&store)?;
-    DecisionClient::new(config)?;
     let durable = store.local_l1_memory_snapshot()?.into_iter()
         .filter(|item| !item.user_defined)
         .collect::<Vec<_>>();
@@ -876,7 +922,7 @@ pub async fn memory_domain_classify_batch(
         .map(|item| (*item).clone())
         .collect::<Vec<_>>();
     let processed = tag_one_batch_with_store(&store, &items).await? as u32;
-    Ok(MemoryDomainClassifyBatchResult { total: processed, processed })
+    Ok(MemoryDomainClassifyBatchResult { total: items.len() as u32, processed })
 }
 
 #[tauri::command]
@@ -917,6 +963,28 @@ pub fn memory_domain_links(
         })
     }).map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn memory_domain_links_map(
+    store: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
+) -> Result<HashMap<String, Vec<String>>, String> {
+    let conn = store.conn.lock().map_err(|_| "telemetry store lock poisoned".to_string())?;
+    let mut statement = conn.prepare(
+        "SELECT memory_id, domain_id FROM local_memory_domains ORDER BY memory_id, weight DESC",
+    ).map_err(|e| e.to_string())?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }).map_err(|e| e.to_string())?;
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for row in rows {
+        let (memory_id, domain_id) = row.map_err(|e| e.to_string())?;
+        let entry = map.entry(memory_id).or_default();
+        if !entry.contains(&domain_id) {
+            entry.push(domain_id);
+        }
+    }
+    Ok(map)
 }
 
 #[tauri::command]
@@ -977,6 +1045,97 @@ mod tests {
         assert_eq!(hits[0].id, "job");
         assert!(tauri::async_runtime::block_on(route_query_async(&store, "任意查询", None, "off", None))
             .unwrap().active_domains.is_empty());
+    }
+
+    fn classification_test_store() -> TelemetryStore {
+        let store = TelemetryStore::in_memory();
+        for id in ["first", "second", "third"] {
+            store.conn.lock().unwrap().execute(
+                "INSERT INTO local_memory_items
+                 (id, source_event_key, ordinal, memory, memory_type, durability, source,
+                  session_id, user_defined, created_at, updated_at)
+                 VALUES (?1, ?1, 0, ?1, 'fact', 'short_term', 'test', 'test', 0,
+                         '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+                [id],
+            ).unwrap();
+        }
+        store
+    }
+
+    fn classification_test_item(store: &TelemetryStore, id: &str) -> LocalMemorySnapshot {
+        store.local_l1_memory_snapshot().unwrap().into_iter()
+            .find(|item| item.id == id).unwrap()
+    }
+
+    #[test]
+    fn classification_progress_reuses_legacy_results_but_not_extraction_labels() {
+        let store = classification_test_store();
+        store.replace_backfill_memory_domains("first", &[MemoryDomainAssignment {
+            domain_id: "work".into(), weight: 0.9,
+        }]).unwrap();
+        // An empty decision result is completed work too (unclassified backfill).
+        store.replace_backfill_memory_domains("second", &[]).unwrap();
+        store.conn.lock().unwrap().execute(
+            "INSERT INTO local_memory_domains
+             (memory_id, domain_id, weight, source, created_at, updated_at)
+             VALUES ('third', 'unclassified', 0, 'auto', '2020-01-01', '2020-01-01')",
+            [],
+        ).unwrap();
+        let status = classification_status_with_store(&store).unwrap();
+        assert_eq!((status.total, status.processed), (3, 2));
+        assert_eq!(status.pending_ids, vec!["third"]);
+        assert_eq!(store.count_l1_memories_for_domain_classification(false).unwrap(), 1);
+        assert_eq!(store.count_l1_memories_for_domain_classification(true).unwrap(), 3);
+    }
+
+    #[test]
+    fn interrupted_classification_resumes_without_repeating_saved_items() {
+        let store = classification_test_store();
+        let first = classification_test_item(&store, "first");
+        let second = classification_test_item(&store, "second");
+        store.save_memory_domain_classification(&first, &[]).unwrap();
+        // Model configuration is disabled in this store. A saved item must skip
+        // the model entirely; a following unfinished item fails without undoing it.
+        assert_eq!(tauri::async_runtime::block_on(tag_one_batch_with_store(
+            &store, std::slice::from_ref(&first),
+        )).unwrap(), 0);
+        assert!(tauri::async_runtime::block_on(tag_one_batch_with_store(
+            &store, &[first, second],
+        )).is_err());
+        let status = classification_status_with_store(&store.clone()).unwrap();
+        assert_eq!((status.total, status.processed), (3, 1));
+        assert!(!status.pending_ids.contains(&"first".into()));
+        assert!(status.pending_ids.contains(&"second".into()));
+    }
+
+    #[test]
+    fn classification_checkpoint_survives_zero_labels_and_invalidates_on_edit() {
+        let store = classification_test_store();
+        let item = classification_test_item(&store, "first");
+        store.delete_memory_domain("unclassified").unwrap();
+        store.save_memory_domain_classification(&item, &[]).unwrap();
+        assert!(store.completed_memory_domain_classification_ids().unwrap().contains("first"));
+        store.update_local_l1_memory("first", "Edited while classification was in flight").unwrap();
+        assert!(!store.completed_memory_domain_classification_ids().unwrap().contains("first"));
+        // The old response cannot mark the new text as complete.
+        assert!(store.save_memory_domain_classification(&item, &[]).is_err());
+        assert!(!store.completed_memory_domain_classification_ids().unwrap().contains("first"));
+    }
+
+    #[test]
+    fn failed_classification_save_preserves_old_labels_and_checkpoint() {
+        let store = classification_test_store();
+        let item = classification_test_item(&store, "first");
+        store.save_memory_domain_classification(&item, &[MemoryDomainAssignment {
+            domain_id: "study".into(), weight: 0.9,
+        }]).unwrap();
+        // An invalid domain trips the FK after DELETE, exercising the rollback
+        // boundary between removing old labels and inserting the new checkpoint.
+        assert!(store.save_memory_domain_classification(&item, &[MemoryDomainAssignment {
+            domain_id: "domain-that-does-not-exist".into(), weight: 0.9,
+        }]).is_err());
+        assert!(store.memory_ids_for_domains(&["study".into()]).unwrap().contains("first"));
+        assert!(store.completed_memory_domain_classification_ids().unwrap().contains("first"));
     }
 
     #[test]

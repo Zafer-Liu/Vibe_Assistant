@@ -593,8 +593,73 @@ pub(super) fn read_transcript_usage_records(
         "minimax" => read_minimax_usage_records(session_id, path),
         "kimi" => read_kimi_usage_records(session_id, path),
         "dsh" => read_dsh_usage_records(session_id, path),
+        "gemini" | "antigravity" => read_gemini_usage_records(source, session_id, path),
         _ => Vec::new(),
     }
+}
+
+/// Gemini CLI（及同构的 Antigravity 转录）在 `type == "gemini"` 的助手消息上
+/// 携带 `tokens`：input（promptTokenCount，已含缓存命中）、output、cached，
+/// 因此 `cached <= input` 恒成立。同一消息会先落一条无 tokens 的记录、随后
+/// 补写带 tokens 的同 id 记录，这里按消息 id 去重并保留最后一次快照。
+pub(super) fn read_gemini_usage_records(
+    source: &str,
+    session_id: &str,
+    path: &Path,
+) -> Vec<TranscriptUsageRecord> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut order: Vec<String> = Vec::new();
+    let mut latest: HashMap<String, TranscriptUsageRecord> = HashMap::new();
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let Ok(line) = line else { break };
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if entry.get("type").and_then(Value::as_str) != Some("gemini") {
+            continue;
+        }
+        let Some(tokens) = entry.get("tokens") else {
+            continue;
+        };
+        let input = get_i64(tokens, &["input"]);
+        let output = get_i64(tokens, &["output"]);
+        if input.is_none() && output.is_none() {
+            continue;
+        }
+        let cached = get_i64(tokens, &["cached"]).unwrap_or(0);
+        let key = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("line-{index}"));
+        let identity = format!("{key}:{}:{}:{}", input.unwrap_or(0), output.unwrap_or(0), cached);
+        if !latest.contains_key(&key) {
+            order.push(key.clone());
+        }
+        latest.insert(
+            key,
+            TranscriptUsageRecord {
+                record_id: usage_record_id(source, session_id, "message", &identity),
+                occurred_at: get_str(&entry, &["timestamp"]).map(str::to_string),
+                model: get_str(&entry, &["model"]).map(str::to_string),
+                input_tokens: input.unwrap_or(0),
+                output_tokens: output.unwrap_or(0),
+                cached_tokens: cached,
+            },
+        );
+    }
+    order
+        .into_iter()
+        .filter_map(|key| latest.remove(&key))
+        .collect()
+}
+
+/// 会话级兜底总量：与逐条明细共用同一解析器（summarize 口径一致）。
+pub(super) fn read_gemini_transcript_usage(path: &Path) -> Option<TranscriptUsage> {
+    let records = read_gemini_usage_records("gemini", "session", path);
+    (!records.is_empty()).then(|| summarize_usage_records(&records))
 }
 
 pub(super) fn read_codex_usage_records(

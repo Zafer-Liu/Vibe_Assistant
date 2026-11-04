@@ -17,6 +17,7 @@ import { OrganizedConversations } from './pages/OrganizedConversations'
 import { MemoryInjection } from './pages/MemoryInjection'
 import { MemoryCapture } from './pages/MemoryCapture'
 import { MemoryHelp } from './pages/MemoryHelp'
+import { MemoryBrainGraph } from './pages/MemoryBrainGraph'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { RecoveryNavigationContext, type RecoveryTarget } from './components/ErrorRecovery'
 import { useDocumentVisible } from './hooks/useVisiblePolling'
@@ -31,9 +32,9 @@ import { Sun, Moon, Settings2, Brain, BookOpenText, Plug, Wrench, ChevronRight, 
 import logoUrl from '/logo.png'
 import { CloseBehaviorDialog } from './features/desktop/CloseBehaviorDialog'
 
-type NavPage = 'ports' | 'network' | 'env-vars' | 'settings' | 'settings-general' | 'settings-llm' | 'settings-memory' | 'settings-cloud' | 'memory' | 'skills' | 'published-skills' | 'skill-marketplace' | 'mcp-library' | 'mcp-tools' | 'mcp-calls' | 'mcp-errors' | 'mcp-help' | 'usage' | 'pending-memories' | 'organized-conversations' | 'memory-capture' | 'memory-injection' | 'memory-help'
+type NavPage = 'ports' | 'network' | 'env-vars' | 'settings' | 'settings-general' | 'settings-llm' | 'settings-memory' | 'settings-cloud' | 'memory' | 'memory-graph' | 'skills' | 'published-skills' | 'skill-marketplace' | 'mcp-library' | 'mcp-tools' | 'mcp-calls' | 'mcp-errors' | 'mcp-help' | 'usage' | 'pending-memories' | 'organized-conversations' | 'memory-capture' | 'memory-injection' | 'memory-help'
 
-const MEMORY_PAGES = ['memory', 'memory-capture', 'memory-injection', 'memory-help', 'pending-memories', 'organized-conversations'] as const
+const MEMORY_PAGES = ['memory', 'memory-graph', 'memory-capture', 'memory-injection', 'memory-help', 'pending-memories', 'organized-conversations'] as const
 // Skill 库两页同样「访问过即保持挂载」：重进保留筛选/勾选状态，也免去整树重挂载。
 const SKILL_PAGES = ['skills', 'published-skills', 'skill-marketplace'] as const
 const MCP_PAGES = ['mcp-library', 'mcp-tools', 'mcp-calls', 'mcp-errors', 'mcp-help'] as const
@@ -99,6 +100,7 @@ export default function App() {
 
   // Stable callbacks preserve mounted memory and skill page state.
   const openMemory = useCallback(() => setPage('memory'), [])
+  const openMemoryGraph = useCallback(() => setPage('memory-graph'), [])
   const openUsage = useCallback(() => setPage('usage'), [])
   const openPendingMemories = useCallback(() => setPage('pending-memories'), [])
   const openOrganizedConversations = useCallback(() => setPage('organized-conversations'), [])
@@ -146,7 +148,7 @@ export default function App() {
   useEffect(() => { if (page === 'settings') setPage('settings-general') }, [page])
 
   const navigationFamilies: Array<{ group: string; icon: ReactNode; pages: Array<[NavPage, string]> }> = [
-    { group: t('nav.memory'), icon: <Brain size={17} />, pages: [['memory', 'nav.memoryOverview'], ['memory-capture', 'nav.memoryCapture'], ['memory-injection', 'nav.memoryInjection'], ['pending-memories', 'nav.memoryPending'], ['organized-conversations', 'nav.memoryOrganized'], ['memory-help', 'nav.memoryHelp']] },
+    { group: t('nav.memory'), icon: <Brain size={17} />, pages: [['memory', 'nav.memoryOverview'], ['memory-graph', 'nav.memoryGraph'], ['memory-capture', 'nav.memoryCapture'], ['memory-injection', 'nav.memoryInjection'], ['pending-memories', 'nav.memoryPending'], ['organized-conversations', 'nav.memoryOrganized'], ['memory-help', 'nav.memoryHelp']] },
     { group: t('nav.skills'), icon: <BookOpenText size={17} />, pages: [['skills', 'nav.skillsLocal'], ['published-skills', 'nav.skillsPublished'], ['skill-marketplace', 'nav.skillsMarketplace']] },
     { group: t('nav.mcpLibrary'), icon: <Plug size={17} />, pages: [['mcp-library', 'nav.mcpServices'], ['mcp-tools', 'nav.mcpTools'], ['mcp-calls', 'nav.mcpCalls'], ['mcp-errors', 'nav.mcpErrors'], ['mcp-help', 'nav.mcpHelp']] },
     { group: t('nav.usage'), icon: <BarChart3 size={17} />, pages: [['usage', 'nav.usage']] },
@@ -185,6 +187,7 @@ export default function App() {
           >
             {([
               { id: 'memory' as NavPage, label: t('nav.memoryOverview'), onClick: openMemory },
+              { id: 'memory-graph' as NavPage, label: t('nav.memoryGraph'), onClick: openMemoryGraph },
               { id: 'memory-capture' as NavPage, label: t('nav.memoryCapture'), onClick: openMemoryCapture },
               { id: 'memory-injection' as NavPage, label: t('nav.memoryInjection'), onClick: openMemoryInjection },
               { id: 'pending-memories' as NavPage, label: t('nav.memoryPending'), onClick: openPendingMemories },
@@ -303,7 +306,14 @@ export default function App() {
         {keptPages.has('memory') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'memory' ? '' : 'hidden'}`}>
             <ErrorBoundary>
-              <MemoryCenter onOpenUsage={openUsage} onOpenPending={openPendingMemories} onOpenOrganized={openOrganizedConversations} onOpenCapture={openMemoryCapture} onOpenInjection={openMemoryInjection} active={page === 'memory' && documentVisible} />
+              <MemoryCenter onOpenUsage={openUsage} onOpenGraph={openMemoryGraph} onOpenPending={openPendingMemories} onOpenOrganized={openOrganizedConversations} onOpenCapture={openMemoryCapture} onOpenInjection={openMemoryInjection} active={page === 'memory' && documentVisible} />
+            </ErrorBoundary>
+          </div>
+        )}
+        {keptPages.has('memory-graph') && (
+          <div className={`flex flex-1 flex-col overflow-hidden ${page === 'memory-graph' ? '' : 'hidden'}`}>
+            <ErrorBoundary>
+              <MemoryBrainGraph onBack={openMemory} active={page === 'memory-graph' && documentVisible} />
             </ErrorBoundary>
           </div>
         )}

@@ -60,6 +60,14 @@ pub use types::{
 };
 use types::{TranscriptUsage, TranscriptUsageRecord};
 
+// The decision model consumes these three fields. Content changes invalidate a
+// checkpoint; pin/recall counters and unrelated timestamps do not.
+fn memory_domain_content_hash(memory: &str, memory_type: &str, durability: &str) -> String {
+    let payload = serde_json::to_vec(&(memory, memory_type, durability))
+        .expect("memory classification input serializes");
+    hex(&Sha256::digest(&payload))
+}
+
 fn insert_memory_domain_assignments(
     transaction: &Transaction,
     memory_id: &str,
@@ -1037,78 +1045,135 @@ impl TelemetryStore {
         rows.collect::<Result<HashSet<_>, _>>().map_err(|e| e.to_string())
     }
 
-    /// A bounded classification page. `retag=true` intentionally revisits all
-    /// automatic/imported memories after domain definitions change; manual L1
-    /// and manual domain associations remain outside this operation.
+    /// Completed decision-model work survives page changes and app restarts.
+    /// Extraction-time `auto` labels alone are not a decision-model checkpoint.
+    /// Older builds already persisted `backfill` labels: recognize those when
+    /// they are at least as recent as the memory, including an unclassified result.
+    pub fn completed_memory_domain_classification_ids(&self) -> Result<HashSet<String>, String> {
+        let conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned")?;
+        let mut statement = conn.prepare(
+            "SELECT m.id, m.memory, m.memory_type, m.durability, s.content_hash,
+                    EXISTS(SELECT 1 FROM local_memory_domains md
+                            WHERE md.memory_id = m.id AND md.source = 'backfill'
+                              AND julianday(md.updated_at) >= julianday(m.updated_at))
+               FROM local_memory_items m
+               LEFT JOIN memory_domain_classification_state s ON s.memory_id = m.id
+              WHERE m.user_defined = 0",
+        ).map_err(|e| e.to_string())?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?, row.get::<_, bool>(5)?,
+            ))
+        }).map_err(|e| e.to_string())?;
+        let mut completed = HashSet::new();
+        for row in rows {
+            let (id, memory, memory_type, durability, saved_hash, legacy_completed) =
+                row.map_err(|e| e.to_string())?;
+            let matches = match saved_hash {
+                Some(hash) => hash == memory_domain_content_hash(&memory, &memory_type, &durability),
+                None => legacy_completed,
+            };
+            if matches {
+                completed.insert(id);
+            }
+        }
+        Ok(completed)
+    }
+
+    /// A bounded page of unfinished work. Explicit retagging still revisits all
+    /// automatic/imported memories; manual L1 stays outside this operation.
     pub fn l1_memories_for_domain_classification(
         &self,
         limit: u32,
         retag: bool,
     ) -> Result<Vec<LocalMemorySnapshot>, String> {
-        let membership_filter = if retag { "" } else {
-            "AND NOT EXISTS (
-                SELECT 1 FROM local_memory_domains md
-                 WHERE md.memory_id = local_memory_items.id
-            )"
+        let completed = if retag { HashSet::new() } else {
+            self.completed_memory_domain_classification_ids()?
         };
-        let sql = format!(
-            "SELECT id, source_event_key, ordinal, memory, memory_type, durability, source,
-                    session_id, user_defined, event_time, created_at, updated_at
-               FROM local_memory_items
-              WHERE user_defined = 0 {membership_filter}
-              ORDER BY updated_at ASC LIMIT ?1"
-        );
-        let conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned")?;
-        let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
-        let rows = statement.query_map([limit.clamp(1, 200)], |row| {
-            Ok(LocalMemorySnapshot {
-                id: row.get(0)?, source_event_key: row.get(1)?, ordinal: row.get(2)?,
-                memory: row.get(3)?, memory_type: row.get(4)?, durability: row.get(5)?,
-                source: row.get(6)?, session_id: row.get(7)?,
-                user_defined: row.get::<_, i64>(8)? != 0, event_time: row.get(9)?,
-                created_at: row.get(10)?, updated_at: row.get(11)?,
-            })
-        }).map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        Ok(self.local_l1_memory_snapshot()?.into_iter()
+            .filter(|item| !item.user_defined && !completed.contains(&item.id))
+            .take(limit.clamp(1, 200) as usize)
+            .collect())
     }
 
     pub fn count_l1_memories_for_domain_classification(&self, retag: bool) -> Result<u32, String> {
-        let membership_filter = if retag { "" } else {
-            "AND NOT EXISTS (
-                SELECT 1 FROM local_memory_domains md
-                 WHERE md.memory_id = local_memory_items.id
-            )"
+        let completed = if retag { HashSet::new() } else {
+            self.completed_memory_domain_classification_ids()?
         };
-        let sql = format!(
-            "SELECT COUNT(*) FROM local_memory_items
-              WHERE user_defined = 0 {membership_filter}"
-        );
-        self.conn.lock().map_err(|_| "telemetry store lock poisoned")?
-            .query_row(&sql, [], |row| row.get::<_, i64>(0))
-            .map(|count| count.max(0) as u32)
-            .map_err(|e| e.to_string())
+        Ok(self.local_l1_memory_snapshot()?.iter()
+            .filter(|item| !item.user_defined && !completed.contains(&item.id))
+            .count() as u32)
     }
 
-    pub fn clear_memory_domain_links(&self, memory_id: &str) -> Result<(), String> {
-        self.conn.lock().map_err(|_| "telemetry store lock poisoned")?
-            .execute(
-                "DELETE FROM local_memory_domains WHERE memory_id = ?1 AND source IN ('auto', 'backfill')",
-                [memory_id],
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    pub fn insert_memory_domain_links(
+    /// Commit labels and the completion checkpoint together, once per response.
+    /// A failed insert rolls back the old labels too. If an edit/deletion happened
+    /// while the model was running, leave that memory pending instead of marking
+    /// a stale response as complete.
+    pub fn save_memory_domain_classification(
         &self,
-        memory_id: &str,
+        item: &LocalMemorySnapshot,
         assignments: &[MemoryDomainAssignment],
     ) -> Result<(), String> {
+        let content_hash = memory_domain_content_hash(&item.memory, &item.memory_type, &item.durability);
         let now = chrono::Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned")?;
-        let transaction = conn.transaction().map_err(|e| e.to_string())?;
-        insert_memory_domain_assignments(&transaction, memory_id, assignments, "backfill", &now)?;
-        transaction.commit().map_err(|e| e.to_string())
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_lock_error = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                // Sleep outside the connection mutex; retry only the cached
+                // classification result, never the model request.
+                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt)));
+            }
+            let mut conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned")?;
+            // Acquire the writer slot BEFORE SELECT. A DEFERRED read snapshot
+            // can fail to upgrade with SQLITE_BUSY(_SNAPSHOT), bypassing the
+            // busy timeout when another connection writes during classification.
+            let transaction = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    let contended = matches!(
+                        &error,
+                        rusqlite::Error::SqliteFailure(code, _)
+                            if matches!(code.code,
+                                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                    );
+                    if contended {
+                        last_lock_error = Some(error);
+                        continue;
+                    }
+                    return Err(format!("开始分类保存事务失败：{error}"));
+                }
+            };
+            let current = transaction.query_row(
+                "SELECT memory, memory_type, durability FROM local_memory_items
+                  WHERE id = ?1 AND user_defined = 0",
+                [&item.id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            ).optional().map_err(|e| e.to_string())?;
+            let Some((memory, memory_type, durability)) = current else {
+                return Err(format!("记忆已删除或不再可分类：{}", item.id));
+            };
+            if content_hash != memory_domain_content_hash(&memory, &memory_type, &durability) {
+                return Err(format!("记忆在分类期间已修改，已保留待分类状态：{}", item.id));
+            }
+            transaction.execute(
+                "DELETE FROM local_memory_domains WHERE memory_id = ?1 AND source IN ('auto', 'backfill')",
+                [&item.id],
+            ).map_err(|e| e.to_string())?;
+            insert_memory_domain_assignments(&transaction, &item.id, assignments, "backfill", &now)?;
+            transaction.execute(
+                "INSERT INTO memory_domain_classification_state (memory_id, content_hash, classified_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(memory_id) DO UPDATE
+                    SET content_hash = excluded.content_hash, classified_at = excluded.classified_at",
+                params![item.id, content_hash, now],
+            ).map_err(|e| e.to_string())?;
+            return transaction.commit().map_err(|e| e.to_string());
+        }
+        let detail = last_lock_error.map(|error| format!("{error} ({error:?})")).unwrap_or_default();
+        Err(format!("分类保存经过 {MAX_ATTEMPTS} 次写锁尝试后数据库仍被占用；已保存进度不受影响：{detail}"))
     }
 
     pub fn replace_backfill_memory_domains(
@@ -3723,6 +3788,8 @@ impl TelemetryStore {
                         "kimi" => read_kimi_transcript_usage(path)
                             .map(|usage| (usage, "native_transcript")),
                         "dsh" => read_dsh_transcript_usage(path)
+                            .map(|usage| (usage, "native_transcript")),
+                        "gemini" | "antigravity" => read_gemini_transcript_usage(path)
                             .map(|usage| (usage, "native_transcript")),
                         _ => None,
                     })

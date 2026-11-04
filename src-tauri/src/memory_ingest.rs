@@ -208,6 +208,8 @@ impl IngestStore {
             .unwrap_or("");
         let session_id = parsed
             .get("session_id")
+            // Antigravity 的 hook payload 是 protojson 驼峰（conversationId）。
+            .or_else(|| parsed.get("conversationId"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
@@ -228,6 +230,21 @@ impl IngestStore {
                     .unwrap_or("")
                     .to_string();
                 self.push_message(&session_id, &agent_id, source, "user", &prompt);
+            }
+            // Gemini CLI 的 BeforeAgent 与 Antigravity 的 PreInvocation 是
+            // UserPromptSubmit 的等价事件；payload 字段分别是 prompt / lastUserInput。
+            "BeforeAgent" | "PreInvocation" => {
+                let prompt = parsed
+                    .get("prompt")
+                    .or_else(|| parsed.get("lastUserInput"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if prompt.is_empty() {
+                    self.touch_session(&session_id, &agent_id, source);
+                } else {
+                    self.push_message(&session_id, &agent_id, source, "user", &prompt);
+                }
             }
             // 工具轨迹属于同一段对话上下文。保留一个有大小上限的摘要，
             // 但绝不在此处提取，统一等待会话 Stop。
@@ -1086,6 +1103,8 @@ fn read_native_session(source: &str, path: &Path) -> Result<Vec<(String, String)
         "minimax" => read_minimax_session(path),
         "kimi" => read_kimi_session(path),
         "dsh" => read_dsh_session(path),
+        "gemini" => read_gemini_session(path),
+        "antigravity" => read_antigravity_session(path),
         _ => Ok(Vec::new()),
     }
 }
@@ -1247,6 +1266,90 @@ fn read_dsh_session(path: &Path) -> Result<Vec<(String, String)>, String> {
             }
             _ => {}
         }
+    }
+    Ok(messages)
+}
+
+/// Gemini CLI 会话是 `<home>/.gemini/tmp/<hash>/chats/session-*.jsonl`。
+/// 每行为一条记录：`type == "user"` 为用户消息，`type == "gemini"` 为助手消息。
+/// 工具载荷在 `toolCalls`、思考在 `thoughts`，均由 qoder_transcript_text 过滤。
+fn read_gemini_session(path: &Path) -> Result<Vec<(String, String)>, String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    if metadata.len() > 16 * 1024 * 1024 {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut messages = Vec::new();
+    let mut total_chars = 0usize;
+    for line in BufReader::new(file).lines() {
+        if messages.len() >= NATIVE_SESSION_MAX_MESSAGES || total_chars >= NATIVE_SESSION_MAX_CHARS {
+            break;
+        }
+        let line = line.map_err(|error| error.to_string())?;
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let msg_type = entry.get("type").and_then(Value::as_str);
+        let role = match msg_type {
+            Some("user") => "user",
+            Some("gemini") | Some("model") | Some("assistant") => "assistant",
+            _ => continue,
+        };
+        let text = qoder_transcript_text(entry.get("content"));
+        if text.is_empty() {
+            continue;
+        }
+        append_native_message(&mut messages, &mut total_chars, role, text);
+    }
+    Ok(messages)
+}
+
+/// Google Antigravity 会话转录（`transcript.jsonl` 或会话 JSON 文件）。
+fn read_antigravity_session(path: &Path) -> Result<Vec<(String, String)>, String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    if metadata.len() > 16 * 1024 * 1024 {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut messages = Vec::new();
+    let mut total_chars = 0usize;
+    for line in BufReader::new(file).lines() {
+        if messages.len() >= NATIVE_SESSION_MAX_MESSAGES || total_chars >= NATIVE_SESSION_MAX_CHARS {
+            break;
+        }
+        let line = line.map_err(|error| error.to_string())?;
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let (role, content) = if let Some(msg) = entry.get("message") {
+            let role = match msg.get("role").and_then(Value::as_str) {
+                Some("user") => "user",
+                Some("assistant") | Some("model") | Some("gemini") => "assistant",
+                _ => continue,
+            };
+            (role, msg.get("content"))
+        } else if let Some(role_str) = entry.get("role").and_then(Value::as_str) {
+            let role = match role_str {
+                "user" => "user",
+                "assistant" | "model" | "gemini" => "assistant",
+                _ => continue,
+            };
+            (role, entry.get("content"))
+        } else if let Some(msg_type) = entry.get("type").and_then(Value::as_str) {
+            let role = match msg_type {
+                "user" => "user",
+                "gemini" | "model" | "assistant" | "agent" => "assistant",
+                _ => continue,
+            };
+            (role, entry.get("content"))
+        } else {
+            continue;
+        };
+        let text = qoder_transcript_text(content);
+        if text.is_empty() {
+            continue;
+        }
+        append_native_message(&mut messages, &mut total_chars, role, text);
     }
     Ok(messages)
 }
@@ -2757,6 +2860,10 @@ const HOOK_MARKER: &str = "X-Agent-Manager-Hook";
 const CLAUDE_SETTINGS: &str = ".claude/settings.json";
 const CODEX_HOOKS: &str = ".codex/hooks.json";
 const WORKBUDDY_SETTINGS: &str = ".workbuddy/settings.json";
+const GEMINI_SETTINGS: &str = ".gemini/settings.json";
+const ANTIGRAVITY_HOOKS: &str = ".gemini/config/hooks.json";
+/// Antigravity hooks.json 按命名 hook 分组；我们占用一个稳定键，卸载只删该键。
+const ANTIGRAVITY_HOOK_KEY: &str = "vibe-assistant-memory";
 
 fn agent_settings_path(agent_type: &str) -> Option<PathBuf> {
     if agent_type == "qoder" {
@@ -2768,9 +2875,24 @@ fn agent_settings_path(agent_type: &str) -> Option<PathBuf> {
         "claude" => CLAUDE_SETTINGS,
         "codex" => CODEX_HOOKS,
         "workbuddy" => WORKBUDDY_SETTINGS,
+        // Gemini CLI 的 hooks 与 mcpServers 同住 ~/.gemini/settings.json。
+        "gemini" => GEMINI_SETTINGS,
+        // Antigravity 的全局生命周期钩子在 ~/.gemini/config/hooks.json。
+        "antigravity" => ANTIGRAVITY_HOOKS,
         _ => return None,
     };
     dirs_next::home_dir().map(|h| h.join(relative))
+}
+
+/// 各 Agent 的“每轮提问”hook 事件名。Claude 系是 UserPromptSubmit；
+/// Gemini CLI 在模型介入前触发 BeforeAgent；Antigravity 在每次调用前触发
+/// PreInvocation。三者共用同一注入端点，仅事件名与响应信封不同。
+fn per_turn_hook_event(agent_type: &str) -> &'static str {
+    match agent_type {
+        "gemini" => "BeforeAgent",
+        "antigravity" => "PreInvocation",
+        _ => "UserPromptSubmit",
+    }
 }
 
 fn hook_command(agent_type: &str) -> Result<String, String> {
@@ -2807,13 +2929,15 @@ fn hook_inject_command(agent_type: &str) -> String {
     }
 }
 
-/// UserPromptSubmit 由同一 POST 完成记忆沉淀与 L3 注入，避免 stdin 被第一
-/// 条命令消费后丢失 session_id。端点按会话和内容指纹门控；写出成功后才
-/// 更新门控和 Hook 账本。应用未运行时 curl 失败，不阻断提问。
+/// 每轮提问注入 hook：与 UserPromptSubmit 等价的事件（见 per_turn_hook_event）
+/// 由同一 POST 完成记忆沉淀与 L3 注入，避免 stdin 被第一条命令消费后丢失
+/// session_id。端点按会话和内容指纹门控；写出成功后才更新门控和 Hook 账本。
+/// 应用未运行时 curl 失败，不阻断提问。
 fn hook_prompt_command(agent_type: &str) -> Result<String, String> {
     let inject_url = format!(
-        "http://127.0.0.1:{}/memory/context?source={agent_type}&event=UserPromptSubmit",
-        crate::agent_http::AGENT_HTTP_PORT
+        "http://127.0.0.1:{}/memory/context?source={agent_type}&event={}",
+        crate::agent_http::AGENT_HTTP_PORT,
+        per_turn_hook_event(agent_type),
     );
     let marker = format!(r#" -H "{HOOK_MARKER}: 1""#);
     if cfg!(windows) {
@@ -2829,10 +2953,28 @@ fn hook_prompt_command(agent_type: &str) -> Result<String, String> {
 #[tauri::command]
 pub fn memory_hook_install(agent_type: String) -> Result<Vec<String>, String> {
     match agent_type.as_str() {
-        "claude" | "qoder" | "codex" | "workbuddy" => install_command_hooks(&agent_type),
+        "claude" | "qoder" | "codex" | "workbuddy" | "gemini" => install_command_hooks(&agent_type),
         // DSH 无命令式 Hook：注入由 cordis pre-step 插件承载（见 dsh_injection）。
         "dsh" => crate::dsh_injection::install(),
+        // Antigravity 的 hooks.json 是“命名 hook → 扁平 handler 数组”形状，
+        // 与 Claude 系的事件分组结构不同，走独立安装器。
+        "antigravity" => install_antigravity_hooks(),
         other => Err(format!("暂不支持的 Agent 类型: {other}")),
+    }
+}
+
+/// 某 Agent 需要登记的 hook 事件集：(事件, 是否注入类命令)。Claude 系用
+/// 四事件全集；Gemini CLI 无 Stop/PostToolUse 等价物，采集由转录扫描负责，
+/// 只装 SessionStart（会话启动注入）与 BeforeAgent（每轮注入 + 沉淀）。
+fn command_hook_events(agent_type: &str) -> Vec<(&'static str, bool)> {
+    match agent_type {
+        "gemini" => vec![("BeforeAgent", true), ("SessionStart", true)],
+        _ => vec![
+            (per_turn_hook_event(agent_type), true),
+            ("PostToolUse", false),
+            ("Stop", false),
+            ("SessionStart", true),
+        ],
     }
 }
 
@@ -2853,20 +2995,23 @@ fn install_command_hooks(agent_type: &str) -> Result<Vec<String>, String> {
     let inject_command = hook_inject_command(agent_type);
     let prompt_command = hook_prompt_command(agent_type)?;
     let mut installed = Vec::new();
-    // SessionStart 注入 L3+L2；UserPromptSubmit 单次 POST 完成沉淀与 L3
-    // 更新。两者均传递事件 JSON，以便端点按 session_id 独立门控。
-    for (event, command) in [
-        ("UserPromptSubmit", &prompt_command),
-        ("PostToolUse", &command),
-        ("Stop", &command),
-        ("SessionStart", &inject_command),
-    ] {
+    // SessionStart 注入 L3+L2；每轮提问事件（per_turn_hook_event）单次 POST
+    // 完成沉淀与 L3 更新。两者均传递事件 JSON，以便端点按 session_id 独立门控。
+    let per_turn = per_turn_hook_event(agent_type);
+    for (event, is_inject) in command_hook_events(agent_type) {
+        let hook_command_for_event = if event == "SessionStart" {
+            &inject_command
+        } else if event == per_turn {
+            &prompt_command
+        } else {
+            &command
+        };
         // 已有的该事件配置保留；若未包含我们的 hook 则追加
         let existing = hooks.get(event).cloned().unwrap_or_else(|| json!([]));
         let contains_ours = serde_json::to_string(&existing)
             .map(|s| s.contains(HOOK_MARKER))
             .unwrap_or(false);
-        if contains_ours && event != "SessionStart" && event != "UserPromptSubmit" {
+        if contains_ours && !is_inject {
             continue;
         }
         let mut arr = if existing.is_array() {
@@ -2875,9 +3020,8 @@ fn install_command_hooks(agent_type: &str) -> Result<Vec<String>, String> {
             vec![]
         };
         // 注入命令可能随版本演进（例如补充 source 标识、升级为每轮注入）；
-        // 始终把我们旧版的 SessionStart / UserPromptSubmit hook 替换为最新命令，
-        // 其余事件的已有配置保持不动。
-        if event == "SessionStart" || event == "UserPromptSubmit" {
+        // 始终把我们旧版的注入 hook 替换为最新命令，其余事件的已有配置保持不动。
+        if is_inject {
             arr.retain(|item| {
                 serde_json::to_string(item)
                     .map(|s| !s.contains(HOOK_MARKER))
@@ -2885,7 +3029,7 @@ fn install_command_hooks(agent_type: &str) -> Result<Vec<String>, String> {
             });
         }
         arr.push(json!({
-            "hooks": [{"type": "command", "command": command}]
+            "hooks": [{"type": "command", "command": hook_command_for_event}]
         }));
         hooks[event] = Value::Array(arr);
         installed.push(event.to_string());
@@ -2903,15 +3047,64 @@ fn install_command_hooks(agent_type: &str) -> Result<Vec<String>, String> {
     Ok(installed)
 }
 
+/// Antigravity hooks.json：顶层是「命名 hook → 事件 → 扁平 handler 数组」，
+/// SessionStart / PreInvocation 等生命周期事件不使用 matcher/hooks 分组。
+/// 我们独占 `vibe-assistant-memory` 一个命名 hook，重装即覆盖，卸载只删该键，
+/// 用户其余命名 hook 原样保留。
+fn install_antigravity_hooks() -> Result<Vec<String>, String> {
+    let path = agent_settings_path("antigravity").ok_or("无法定位用户主目录")?;
+    let mut settings: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    if !settings.is_object() {
+        return Err(format!("{} 不是 JSON 对象，未修改文件", path.display()));
+    }
+    let inject_command = hook_inject_command("antigravity");
+    let prompt_command = hook_prompt_command("antigravity")?;
+    settings[ANTIGRAVITY_HOOK_KEY] = json!({
+        "SessionStart": [{"type": "command", "command": inject_command}],
+        "PreInvocation": [{"type": "command", "command": prompt_command}],
+    });
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("写入 {} 失败: {e}", path.display()))?;
+    Ok(vec!["SessionStart".into(), "PreInvocation".into()])
+}
+
 /// 卸载本工具注入的 hook 回调（只移除包含 memory/hook 的命令，保留其他配置）。
 #[tauri::command]
 pub fn memory_hook_uninstall(agent_type: String) -> Result<(), String> {
     if agent_type == "dsh" {
         return crate::dsh_injection::uninstall();
     }
+    // Antigravity：只移除自己的命名 hook 键。
+    if agent_type == "antigravity" {
+        let path = agent_settings_path("antigravity").ok_or("无法定位用户主目录")?;
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Ok(());
+        };
+        let Ok(mut settings) = serde_json::from_str::<Value>(&text) else {
+            return Ok(());
+        };
+        if let Some(object) = settings.as_object_mut() {
+            object.remove(ANTIGRAVITY_HOOK_KEY);
+        }
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("写入 {} 失败: {e}", path.display()))?;
+        return Ok(());
+    }
     if !matches!(
         agent_type.as_str(),
-        "claude" | "qoder" | "codex" | "workbuddy"
+        "claude" | "qoder" | "codex" | "workbuddy" | "gemini"
     ) {
         return Ok(());
     }
@@ -2928,7 +3121,11 @@ pub fn memory_hook_uninstall(agent_type: String) -> Result<(), String> {
     if !hooks.is_object() {
         return Ok(());
     }
-    for event in ["UserPromptSubmit", "PostToolUse", "Stop", "SessionStart"] {
+    let watched: Vec<&str> = command_hook_events(&agent_type)
+        .into_iter()
+        .map(|(event, _)| event)
+        .collect();
+    for event in watched {
         if let Some(arr) = hooks.get_mut(event) {
             if let Some(list) = arr.as_array_mut() {
                 list.retain(|item| {
@@ -2966,39 +3163,28 @@ pub async fn memory_hook_status(agent_type: String) -> Result<HookStatus, String
             events,
         });
     }
-    if matches!(
-        agent_type.as_str(),
-        "claude" | "qoder" | "codex" | "workbuddy"
-    ) {
-        if let Some(path) = agent_settings_path(&agent_type) {
+    // Antigravity：状态在命名 hook 键下，事件名即 SessionStart / PreInvocation。
+    if agent_type == "antigravity" {
+        if let Some(path) = agent_settings_path("antigravity") {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 let Ok(settings) = serde_json::from_str::<Value>(&text) else {
-                    return Ok(HookStatus {
-                        installed: false,
-                        agent_type,
-                        events: vec![],
-                    });
+                    return Ok(HookStatus { installed: false, agent_type, events: vec![] });
                 };
-                let events = ["UserPromptSubmit", "PostToolUse", "Stop", "SessionStart"]
+                let named = settings.get(ANTIGRAVITY_HOOK_KEY).unwrap_or(&Value::Null);
+                let events = ["SessionStart", "PreInvocation"]
                     .iter()
-                    .filter(|e| {
-                        settings
-                            .get("hooks")
-                            .and_then(|hooks| hooks.get(**e))
+                    .filter(|event| {
+                        named
+                            .get(*event)
                             .and_then(Value::as_array)
                             .map(|items| {
                                 items.iter().any(|item| {
                                     serde_json::to_string(item)
                                         .map(|item| {
                                             item.contains(HOOK_MARKER)
-                                                // 旧版注入命令不带 source 标识，无法计入
-                                                // 记忆注入摘要；旧版 UserPromptSubmit 只
-                                                // 沉淀不注入。两者均视为未启用以引导升级。
-                                                && ((**e != "SessionStart"
-                                                    && **e != "UserPromptSubmit")
-                                                    || (item.contains("memory/context?source=")
-                                                        && item.contains("-X POST")
-                                                        && item.contains("--data-binary")))
+                                                && item.contains("memory/context?source=")
+                                                && item.contains("-X POST")
+                                                && item.contains("--data-binary")
                                         })
                                         .unwrap_or(false)
                                 })
@@ -3009,7 +3195,62 @@ pub async fn memory_hook_status(agent_type: String) -> Result<HookStatus, String
                     .collect::<Vec<_>>();
                 return Ok(HookStatus {
                     installed: events.iter().any(|event| event == "SessionStart")
-                        && events.iter().any(|event| event == "UserPromptSubmit"),
+                        && events.iter().any(|event| event == "PreInvocation"),
+                    agent_type,
+                    events,
+                });
+            }
+        }
+        return Ok(HookStatus { installed: false, agent_type, events: vec![] });
+    }
+    if matches!(
+        agent_type.as_str(),
+        "claude" | "qoder" | "codex" | "workbuddy" | "gemini"
+    ) {
+        if let Some(path) = agent_settings_path(&agent_type) {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let Ok(settings) = serde_json::from_str::<Value>(&text) else {
+                    return Ok(HookStatus {
+                        installed: false,
+                        agent_type,
+                        events: vec![],
+                    });
+                };
+                // 注入类事件（SessionStart / 每轮提问事件）还要求命令是新版
+                // 注入形态；旧版命令不计入，引导升级。
+                let inject_events: Vec<&str> = command_hook_events(&agent_type)
+                    .into_iter()
+                    .filter(|(_, is_inject)| *is_inject)
+                    .map(|(event, _)| event)
+                    .collect();
+                let events = command_hook_events(&agent_type)
+                    .into_iter()
+                    .filter(|(e, is_inject)| {
+                        settings
+                            .get("hooks")
+                            .and_then(|hooks| hooks.get(*e))
+                            .and_then(Value::as_array)
+                            .map(|items| {
+                                items.iter().any(|item| {
+                                    serde_json::to_string(item)
+                                        .map(|item| {
+                                            item.contains(HOOK_MARKER)
+                                                && (!is_inject
+                                                    || (item.contains("memory/context?source=")
+                                                        && item.contains("-X POST")
+                                                        && item.contains("--data-binary")))
+                                        })
+                                        .unwrap_or(false)
+                                })
+                            })
+                            .unwrap_or(false)
+                    })
+                    .map(|(event, _)| event.to_string())
+                    .collect::<Vec<_>>();
+                return Ok(HookStatus {
+                    installed: inject_events
+                        .iter()
+                        .all(|event| events.iter().any(|installed| installed == event)),
                     agent_type,
                     events,
                 });
@@ -4191,6 +4432,70 @@ mod tests {
             vec![
                 ("user".into(), "记住本项目使用 SQLite".into()),
                 ("assistant".into(), "已记录并会写入本地账本。".into()),
+            ]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn gemini_native_reader_extracts_dialogue_only() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-manager-gemini-transcript-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let rows = [
+            // 首行是会话元数据，不是消息。
+            serde_json::json!({"sessionId":"s-1", "projectHash":"h-1"}),
+            serde_json::json!({"id":"u-1", "type":"user", "content":[{"text":"记住本项目使用 pnpm"}]}),
+            serde_json::json!({"id":"g-1", "type":"gemini", "content":[{"text":"已记录。"}], "toolCalls":[{"name":"run_shell_command"}], "thoughts":[]}),
+            // $set / $patch 类控制记录没有 type 字段，直接跳过。
+            serde_json::json!({"$set": {"lastUpdated": "2026-11-03T00:00:00Z"}}),
+        ];
+        std::fs::write(
+            &path,
+            rows.iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            read_gemini_session(&path).unwrap(),
+            vec![
+                ("user".into(), "记住本项目使用 pnpm".into()),
+                ("assistant".into(), "已记录。".into()),
+            ]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn antigravity_native_reader_reads_role_and_type_shapes() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-manager-antigravity-transcript-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let rows = [
+            // message.role 形态。
+            serde_json::json!({"message": {"role": "user", "content": [{"text": "整理这个仓库"}]}}),
+            // 顶层 type 形态（与 Gemini 转录同构）。
+            serde_json::json!({"type": "gemini", "content": [{"text": "开始整理。"}]}),
+            // 工具轨迹不进入记忆。
+            serde_json::json!({"message": {"role": "assistant", "content": [{"type": "tool_use", "text": "secret"}]}}),
+        ];
+        std::fs::write(
+            &path,
+            rows.iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            read_antigravity_session(&path).unwrap(),
+            vec![
+                ("user".into(), "整理这个仓库".into()),
+                ("assistant".into(), "开始整理。".into()),
             ]
         );
         let _ = std::fs::remove_file(path);

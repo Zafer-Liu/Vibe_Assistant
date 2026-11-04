@@ -91,7 +91,7 @@ pub struct MemoryMcpRuntimeStatus {
     pub detail: String,
 }
 
-const MEMORY_MCP_TARGETS: [&str; 10] = [
+const MEMORY_MCP_TARGETS: [&str; 12] = [
     "codex_cli",
     "claude_cli",
     "codex_desktop",
@@ -102,6 +102,8 @@ const MEMORY_MCP_TARGETS: [&str; 10] = [
     "kimi",
     "zcode",
     "dsh",
+    "gemini",
+    "antigravity",
 ];
 
 fn normalized_mcp_client_name(name: &str) -> String {
@@ -124,6 +126,9 @@ fn agent_type_for_mcp_client(name: &str) -> Option<&'static str> {
         "zcode" => Some("zcode"),
         // dsh-mcp-client 的 SDK clientInfo name 为 "dsh-mcp-client"。
         "dsh" | "dshmcpclient" | "deepseekharness" | "deepseekharnessdesktop" => Some("dsh"),
+        // Gemini CLI / Antigravity 的 MCP 客户端上报名。
+        "gemini" | "geminicli" | "geminiopensource" => Some("gemini"),
+        "antigravity" | "agy" | "antigravitycli" | "googleantigravity" => Some("antigravity"),
         _ => None,
     }
 }
@@ -149,6 +154,8 @@ fn supported_agent(agent_type: &str) -> bool {
             | "kimi"
             | "zcode"
             | "dsh"
+            | "gemini"
+            | "antigravity"
     )
 }
 
@@ -533,7 +540,9 @@ pub(crate) fn desktop_config_path(agent_type: &str) -> Result<Option<PathBuf>, S
 /// 文件型 MCP 配置的入口。MiniMax Code 的 mcp.json 使用带 type/enabled 的
 /// 服务器定义；Kimi、Qoder、WorkBuddy 使用标准 command/args 形态。
 /// ZCode 的服务器映射嵌套在 mcp.servers，schema 未文档化扩展键，按用户
-/// 手工配置验证过的最小 command/args 形状写入。
+/// 手工配置验证过的最小 command/args 形状写入。Gemini 的 mcpServers 在
+/// ~/.gemini/settings.json、Antigravity 在 ~/.gemini/config/mcp_config.json，
+/// 两者 schema 同样未文档化 description，均写最小 command/args 形状。
 pub(crate) fn file_server_entry(agent_type: &str, executable: &str) -> Value {
     if agent_type == "minimax" {
         json!({
@@ -543,7 +552,7 @@ pub(crate) fn file_server_entry(agent_type: &str, executable: &str) -> Value {
             "enabled": true,
             "description": "Vibe Assistant shared memory and published Skills"
         })
-    } else if agent_type == "zcode" {
+    } else if matches!(agent_type, "zcode" | "gemini" | "antigravity") {
         json!({
             "command": executable,
             "args": ["--mcp-memory"],
@@ -561,6 +570,7 @@ fn is_file_config_agent(agent_type: &str) -> bool {
     matches!(
         agent_type,
         "claude_desktop" | "qoder" | "workbuddy" | "minimax" | "kimi" | "zcode"
+            | "gemini" | "antigravity"
     )
 }
 

@@ -135,9 +135,10 @@ pub struct McpArbitrationResult {
     pub errors: Vec<McpImportIssue>,
 }
 
-const MCP_TARGETS: [&str; 10] = [
+const MCP_TARGETS: [&str; 12] = [
     "claude_cli", "claude_desktop", "codex_cli", "codex_desktop",
     "qoder", "workbuddy", "minimax", "kimi", "zcode", "dsh",
+    "gemini", "antigravity",
 ];
 
 // ── 目标与 transport 能力 ─────────────────────────────────────────────────────
@@ -155,6 +156,8 @@ fn is_mcp_target(agent: &str) -> bool {
             | "kimi"
             | "zcode"
             | "dsh"
+            | "gemini"
+            | "antigravity"
     )
 }
 
@@ -162,6 +165,8 @@ fn is_mcp_target(agent: &str) -> bool {
 /// 远程 MCP 格式未文档化，v1 不冒险写入；zcode 同理，仅 stdio）。
 /// DeepSeek Harness 例外：dsh-mcp-client 原生支持 Streamable HTTP
 /// （registry 的 "http"），不支持 sse。
+/// Gemini CLI 与 Antigravity 的远程形态（httpUrl / url）与中央目录的
+/// {type,url} 形状不一致，v1 同 zcode 一样仅开放 stdio。
 fn supports_transport(agent: &str, transport: &str) -> bool {
     match transport {
         "stdio" => is_mcp_target(agent),
@@ -408,10 +413,13 @@ fn save_assignment(name: &str, agent: &str, equipped: bool) -> Result<McpCatalog
 // ── 各 Agent 配置的读写 ──────────────────────────────────────────────────────
 
 /// 文件型 JSON 配置的位置。claude_desktop/qoder/... 复用 memory_mcp 的解析
-/// （含跨设备目录覆盖）；claude_cli 的 user scope 存在 `~/.claude.json`。
+/// （含跨设备目录覆盖）；claude_cli 的 user scope 存在 `~/.claude.json`；
+/// gemini 的 mcpServers 在 ~/.gemini/settings.json，antigravity 在
+/// ~/.gemini/config/mcp_config.json（均经 agent_sources 统一解析）。
 fn json_config_path(agent: &str) -> Result<Option<PathBuf>, String> {
     match agent {
-        "claude_desktop" | "qoder" | "workbuddy" | "minimax" | "kimi" | "zcode" => {
+        "claude_desktop" | "qoder" | "workbuddy" | "minimax" | "kimi" | "zcode"
+        | "gemini" | "antigravity" => {
             desktop_config_path(agent)
         }
         "claude_cli" => Ok(dirs_next::home_dir().map(|home| home.join(".claude.json"))),
@@ -493,9 +501,12 @@ fn agent_entry_value(agent: &str, entry: &McpCatalogEntry) -> Value {
             value["enabled"] = json!(true);
         }
     }
-    if !entry.description.is_empty() && agent != "zcode" && agent != "dsh" {
-        // zcode 与 dsh-mcp-client 的服务器 schema 均未文档化 description
-        // 扩展键，保持最小形状。
+    if !entry.description.is_empty()
+        && !matches!(agent, "zcode" | "dsh" | "gemini" | "antigravity")
+    {
+        // zcode / dsh-mcp-client / Gemini settings.json / Antigravity
+        // mcp_config.json 的服务器 schema 均未文档化 description 扩展键，
+        // 保持最小形状。
         value["description"] = json!(entry.description);
     }
     value
@@ -728,10 +739,13 @@ fn collect_agent_statuses(
                             && manifest.agent == physical_target(agent)
                             && observation_matches_entry(manifest, entry, configured));
                         let matches = observed_match || entry_matches_config(agent, entry, configured);
-                        let fields = if matches { Vec::new() } else {
+                        let proxy_needs_recovery = !matches && is_observation_proxy_node(configured);
+                        let fields = if matches || proxy_needs_recovery { Vec::new() } else {
                             configuration_differences(&agent_entry_value(agent, entry), configured)
                         };
-                        (if matches { "installed" } else { "differs" }, fields, None)
+                        let error = proxy_needs_recovery.then(||
+                            "观测代理需要恢复；上游配置差异尚未确认。请在对比与仲裁中关闭观测并重新读取。".into());
+                        (if matches { "installed" } else { "differs" }, fields, error)
                     }
                 },
             };
@@ -921,7 +935,7 @@ fn apply_unequip(agent: &str, name: &str) -> Result<(), String> {
 /// The relay receives only an opaque id. Its original command and environment
 /// come from the catalog after checking the pinned fingerprint; the manifest
 /// therefore never duplicates credentials in a separate, less protected file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ObservationManifest {
     id: String,
     name: String,
@@ -979,7 +993,7 @@ fn observation_root() -> Result<PathBuf, String> {
 /// Restore only orphaned shared-memory relays installed by this application's launcher.
 /// A live assignment stays untouched, as does any relay whose provenance is unclear.
 pub(crate) fn repair_orphaned_memory_relay(agent: &str, launcher: &str) -> Result<(), String> {
-    if !matches!(agent, "claude_desktop" | "kimi" | "qoder" | "workbuddy" | "minimax" | "zcode") {
+    if !matches!(agent, "claude_desktop" | "kimi" | "qoder" | "workbuddy" | "minimax" | "zcode" | "gemini" | "antigravity") {
         return Ok(());
     }
     let _guard = observation_lock().lock().map_err(|_| "MCP observation 锁不可用")?;
@@ -1109,6 +1123,13 @@ fn proxy_entry(manifest: &ObservationManifest) -> Value {
         value["enabled"] = json!(true);
     }
     value
+}
+
+fn previous_observation_endpoint(manifest: &ObservationManifest) -> Option<ObservationManifest> {
+    let mut previous = manifest.clone();
+    previous.proxy_command = manifest.previous_proxy_command.clone()?;
+    previous.relay_command = manifest.previous_relay_command.clone();
+    Some(previous)
 }
 
 fn is_observation_proxy_node(value: &Value) -> bool {
@@ -1353,7 +1374,9 @@ fn guarded_observation(name: &str, agent: Option<&str>) -> Result<std::sync::Mut
 }
 
 fn upgrade_observation(manifest: &ObservationManifest, catalog: &[McpCatalogEntry]) -> Result<ObservationManifest, String> {
-    if manifest.phase != "active" { return Ok(manifest.clone()); }
+    // Keep one full generation until explicit disable/enable. Polling must not
+    // discard rollback evidence or immediately retry an upgrade just rolled back.
+    if manifest.phase != "active" || manifest.previous_proxy_command.is_some() { return Ok(manifest.clone()); }
     // Refresh only between connections. A live relay still validates its pinned
     // executable against this manifest; leave it intact until the next idle retry.
     // Unknown telemetry is not evidence that switching is safe.
@@ -1361,7 +1384,9 @@ fn upgrade_observation(manifest: &ObservationManifest, catalog: &[McpCatalogEntr
         .and_then(|store| store.proxy_active_connections(&manifest.id).ok()) else {
         return Ok(manifest.clone());
     };
-    if active > 0 || fallback_connections(&manifest.id) > 0 { return Ok(manifest.clone()); }
+    if require_idle_observation(Some(active), checked_fallback_connections(&manifest.id)).is_err() {
+        return Ok(manifest.clone());
+    }
     let entry = catalog.iter().find(|entry| entry.name == manifest.name)
         .ok_or("MCP 原始配置缺失")?;
     if !manifest.config_path.is_absolute() { return Err("MCP 配置路径必须是绝对路径".into()); }
@@ -1377,7 +1402,10 @@ fn upgrade_observation(manifest: &ObservationManifest, catalog: &[McpCatalogEntr
     }
     let launcher = crate::mcp_launcher_installation::launcher_executable()?;
     let relay = crate::mcp_launcher_installation::relay_executable()?;
-    upgrade_observation_node(manifest, launcher, relay, save_observation)
+    upgrade_observation_node(manifest, launcher, relay, |state| {
+        ensure_observation_idle(&manifest.id)?;
+        save_observation(state)
+    })
 }
 
 fn upgrade_observation_node(
@@ -1387,6 +1415,7 @@ fn upgrade_observation_node(
     if manifest.proxy_command == launcher && manifest.relay_command.as_ref() == Some(&relay) {
         return Ok(manifest.clone());
     }
+    if manifest.previous_proxy_command.is_some() { return Ok(manifest.clone()); }
     let old = proxy_entry(manifest);
     let mut next = manifest.clone();
     next.proxy_command = launcher;
@@ -1405,58 +1434,255 @@ fn upgrade_observation_node(
         return Err(error);
     }
     next.phase = "active".into();
-    next.previous_proxy_command = None;
-    next.previous_relay_command = None;
     save(&next)?;
-    Ok(next)
+    // A client may write its cached old node after our initial verified patch.
+    // Retain the pair even after commit so later status refreshes can reconcile it.
+    let installed = read_observation_node(&next.agent, &next.config_path, &next.name)?;
+    let reconciled = recover_upgrade_node(&next, installed.as_ref())?;
+    if reconciled != next { save(&reconciled)?; }
+    Ok(reconciled)
 }
 
-fn recover_upgrade(manifest: &ObservationManifest) -> Result<ObservationManifest, String> {
-    if manifest.phase != "preparing" || manifest.previous_proxy_command.is_none() || manifest.relay_command.is_none() {
+fn recover_upgrade(manifest: &ObservationManifest, catalog: &[McpCatalogEntry]) -> Result<ObservationManifest, String> {
+    if !matches!(manifest.phase.as_str(), "preparing" | "active") {
         return Ok(manifest.clone());
     }
-    if manifest.config_path != observation_config_path(&manifest.agent)? {
-        return Err("MCP 配置路径已变化，无法恢复代理升级".into());
+    if manifest.previous_proxy_command.is_none() {
+        return recover_drifted_proxy(manifest, catalog);
+    }
+    let entry = find_entry(catalog, &manifest.name)?;
+    if manifest.fingerprint != observation_fingerprint(&manifest.agent, &entry)
+        || normalize_transport(&entry.transport) != "stdio"
+        || !entry.assigned_agents.iter().any(|agent| physical_target(agent) == manifest.agent)
+        || !manifest.config_path.is_absolute()
+        || manifest.config_path != observation_config_path(&manifest.agent)? {
+        return Err("MCP 原始配置已变化，无法恢复代理升级".into());
     }
     let current = read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name)?;
-    let recovered = recover_upgrade_node(manifest, current.as_ref())?;
-    save_observation(&recovered)?;
+    // Direct configurations belong to explicit retry/disable, not auto-recovery.
+    if current.as_ref() == Some(&canonical_for_manifest(manifest, &entry)) { return Ok(manifest.clone()); }
+    let recovered = match recover_upgrade_node(manifest, current.as_ref()) {
+        Ok(recovered) => recovered,
+        // Neither endpoint matches: the client may have written back an even
+        // older generation of the same assignment. Try converging forward.
+        Err(_) => return recover_drifted_proxy(manifest, catalog),
+    };
+    if &recovered != manifest {
+        ensure_observation_idle(&manifest.id)?;
+        save_observation(&recovered)?;
+    }
     Ok(recovered)
+}
+
+/// A stale client can write back a proxy node from an older generation of
+/// the same assignment UUID — including generations this manifest never
+/// recorded (fresh assignments keep no previous pair). The node is still
+/// provably application-owned (exact shape, managed hash-named launcher),
+/// so converge it forward to the current endpoints instead of leaving the
+/// assignment permanently unresolvable. The old launcher itself is never
+/// adopted: its generation's relay pairing is unknown.
+fn recover_drifted_proxy(manifest: &ObservationManifest, catalog: &[McpCatalogEntry]) -> Result<ObservationManifest, String> {
+    if manifest.phase != "active"
+        || manifest.relay_command.as_ref().is_none_or(|command| command.is_empty()) {
+        return Ok(manifest.clone());
+    }
+    let entry = match find_entry(catalog, &manifest.name) {
+        Ok(entry) => entry,
+        Err(_) => return Ok(manifest.clone()),
+    };
+    if manifest.fingerprint != observation_fingerprint(&manifest.agent, &entry)
+        || normalize_transport(&entry.transport) != "stdio"
+        || !entry.assigned_agents.iter().any(|agent| physical_target(agent) == manifest.agent)
+        || !manifest.config_path.is_absolute()
+        || manifest.config_path != observation_config_path(&manifest.agent)? {
+        return Ok(manifest.clone());
+    }
+    let current = read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name)?;
+    let Some(current) = current else { return Ok(manifest.clone()) };
+    if proxy_matches(&current, manifest) { return Ok(manifest.clone()); }
+    // Direct configurations and custom nodes belong to explicit retry/disable;
+    // only an application-owned proxy of this very assignment converges.
+    if current == canonical_for_manifest(manifest, &entry) || !is_observation_proxy_node(&current) {
+        return Ok(manifest.clone());
+    }
+    let launchers = observation_root()?
+        .parent().ok_or("MCP observation 目录无效")?
+        .join("mcp-launchers");
+    let owned = match owned_observation_proxy(&manifest.agent, &entry, &manifest.config_path, &current, &launchers) {
+        Ok(owned) => owned,
+        Err(_) => return Ok(manifest.clone()),
+    };
+    if owned.id != manifest.id { return Ok(manifest.clone()); }
+    ensure_observation_idle(&manifest.id)?;
+    patch_observation_node(manifest, &current, &proxy_entry(manifest))?;
+    Ok(manifest.clone())
 }
 
 fn recover_upgrade_node(manifest: &ObservationManifest, current: Option<&Value>) -> Result<ObservationManifest, String> {
     let mut active = manifest.clone();
     active.phase = "active".into();
-    active.previous_proxy_command = None;
-    active.previous_relay_command = None;
-    // Prefer the installed endpoint when both launcher paths are identical:
-    // a relay-only refresh has no distinct config switch to roll back.
-    if current == Some(&proxy_entry(manifest)) {
-        return Ok(active);
-    }
-    let mut old = active;
-    old.proxy_command = manifest.previous_proxy_command.clone().unwrap_or_default();
-    old.relay_command = manifest.previous_relay_command.clone();
-    if current == Some(&proxy_entry(&old)) {
-        return Ok(old);
+    // Relay-only upgrades have identical proxy nodes: prefer the new relay.
+    if current == Some(&proxy_entry(manifest)) { return Ok(active); }
+    if let Some(mut previous) = previous_observation_endpoint(manifest) {
+        if current == Some(&proxy_entry(&previous)) {
+            previous.phase = "active".into();
+            previous.previous_proxy_command = Some(manifest.proxy_command.clone());
+            previous.previous_relay_command = manifest.relay_command.clone();
+            return Ok(previous);
+        }
     }
     Err("MCP 配置已漂移，无法恢复代理升级".into())
 }
 
+fn require_idle_observation(active: Option<i64>, fallback: Result<i64, String>) -> Result<(), String> {
+    if active != Some(0) || fallback? != 0 {
+        return Err("MCP 仍有活动连接或连接状态未知，请断开后重试".into());
+    }
+    Ok(())
+}
+
+fn ensure_observation_idle(assignment_id: &str) -> Result<(), String> {
+    let active = crate::telemetry_store::shared_store()
+        .and_then(|store| store.proxy_active_connections(assignment_id).ok());
+    require_idle_observation(active, checked_fallback_connections(assignment_id))
+}
+
 fn fallback_connections(assignment_id: &str) -> i64 {
+    checked_fallback_connections(assignment_id).unwrap_or(0)
+}
+
+fn checked_fallback_connections(assignment_id: &str) -> Result<i64, String> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "MCP fallback 时钟不可用")?.as_millis();
+    fallback_connections_at(&observation_root()?.join("fallback").join(assignment_id), assignment_id, now)
+}
+
+fn fallback_connections_at(root: &Path, assignment_id: &str, now: u128) -> Result<i64, String> {
     #[derive(Deserialize)]
     struct Heartbeat { assignment_id: String, pid: u32, last_seen_unix_ms: u64 }
-    let Ok(root) = observation_root() else { return 0; };
-    let Ok(files) = std::fs::read_dir(root.join("fallback").join(assignment_id)) else { return 0; };
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map(|value| value.as_millis()).unwrap_or_default();
-    files.filter_map(Result::ok).filter(|file| {
-        if !file.file_type().ok().is_some_and(|kind| kind.is_file()) { return false; }
-        let Some(pid) = file.path().file_stem().and_then(|name| name.to_str()).and_then(|name| name.parse::<u32>().ok()) else { return false; };
-        let Some(state) = std::fs::read(file.path()).ok().and_then(|bytes| serde_json::from_slice::<Heartbeat>(&bytes).ok()) else { return false; };
-        state.assignment_id == assignment_id && state.pid == pid && state.last_seen_unix_ms > 0
-            && now >= u128::from(state.last_seen_unix_ms) && now - u128::from(state.last_seen_unix_ms) <= 10_000
-    }).count() as i64
+    let files = match std::fs::read_dir(root) {
+        Ok(files) => files,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(_) => return Err("MCP fallback 连接状态不可读".into()),
+    };
+    let mut active = 0;
+    for file in files {
+        let file = file.map_err(|_| "MCP fallback 连接状态不可读")?;
+        let path = file.path();
+        // Ignore atomic-write temporary files, not malformed heartbeat records.
+        if path.extension().is_none_or(|extension| extension != "json") { continue; }
+        let pid = path.file_stem().and_then(|name| name.to_str()).and_then(|name| name.parse::<u32>().ok())
+            .ok_or("MCP fallback 连接状态无效")?;
+        if !file.file_type().map_err(|_| "MCP fallback 连接状态不可读")?.is_file() {
+            return Err("MCP fallback 连接状态路径无效".into());
+        }
+        let bytes = std::fs::read(&path).map_err(|_| "MCP fallback 连接状态不可读")?;
+        let state: Heartbeat = serde_json::from_slice(&bytes).map_err(|_| "MCP fallback 连接状态无效")?;
+        if state.assignment_id != assignment_id || state.pid != pid || state.last_seen_unix_ms == 0 {
+            return Err("MCP fallback 连接状态无效".into());
+        }
+        if now < u128::from(state.last_seen_unix_ms) { return Err("MCP fallback 时钟状态无效".into()); }
+        if now - u128::from(state.last_seen_unix_ms) <= 10_000 { active += 1; }
+    }
+    Ok(active)
+}
+
+/// Recognize only exact, application-owned orphan proxies. The descriptor is
+/// recovery-only: the lost relay identity is never inferred or made launchable.
+fn owned_observation_proxy(
+    agent: &str, entry: &McpCatalogEntry, path: &Path, current: &Value, launchers: &Path,
+) -> Result<ObservationManifest, String> {
+    validate_configuration(entry)?;
+    let command = current.get("command").and_then(Value::as_str).ok_or("MCP 孤儿代理命令无效")?;
+    let args = current.get("args").and_then(Value::as_array).ok_or("MCP 孤儿代理参数无效")?;
+    if args.len() != 2 || args[0] != "--mcp-relay" { return Err("MCP 孤儿代理参数无效".into()); }
+    let id = args[1].as_str().ok_or("MCP 孤儿代理 id 无效")?;
+    let uuid = uuid::Uuid::parse_str(id).map_err(|_| "MCP 孤儿代理 id 无效")?;
+    if uuid.to_string() != id || !path.is_absolute()
+        || normalize_transport(&entry.transport) != "stdio"
+        || !entry.assigned_agents.iter().any(|assigned| physical_target(assigned) == agent)
+        || is_observation_proxy_node(&observation_canonical(agent, entry)) {
+        return Err("MCP 孤儿代理与资源库装备关系不一致".into());
+    }
+    let manifest = ObservationManifest {
+        id: id.into(), name: entry.name.clone(), agent: agent.into(), config_path: path.into(),
+        fingerprint: observation_fingerprint(agent, entry), proxy_command: command.into(),
+        relay_command: None, previous_proxy_command: None, previous_relay_command: None,
+        omitted_args: false, phase: "recovery".into(),
+    };
+    if current != &proxy_entry(&manifest) { return Err("MCP 代理包含自定义配置，未覆盖用户修改".into()); }
+    let executable = Path::new(command);
+    let parent = executable.parent().ok_or("MCP launcher 路径无效")?;
+    if !executable.is_absolute()
+        || parent.canonicalize().map_err(|_| "MCP launcher 目录不可读")?
+            != launchers.canonicalize().map_err(|_| "MCP launcher 目录不可读")? {
+        return Err("MCP 代理不属于本应用，未覆盖配置".into());
+    }
+    let name = executable.file_name().and_then(|name| name.to_str()).ok_or("MCP launcher 文件名无效")?;
+    let stem = if cfg!(windows) { name.strip_suffix(".exe").ok_or("MCP launcher 文件名无效")? } else { name };
+    let digest = stem.strip_prefix("mcp-launcher-").ok_or("MCP launcher 文件名无效")?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+        return Err("MCP launcher 文件名无效".into());
+    }
+    match std::fs::symlink_metadata(executable) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            let bytes = std::fs::read(executable).map_err(|_| "MCP launcher 不可读")?;
+            if format!("{:x}", Sha256::digest(bytes)) != digest { return Err("MCP launcher 文件校验失败".into()); }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        _ => return Err("MCP launcher 路径无效".into()),
+    }
+    Ok(manifest)
+}
+
+fn orphaned_observation(
+    agent: &str, entry: &McpCatalogEntry, path: &Path, current: &Value,
+    manifests: &[ObservationManifest], launchers: &Path,
+) -> Result<ObservationManifest, String> {
+    let manifest = owned_observation_proxy(agent, entry, path, current, launchers)?;
+    if manifests.iter().any(|existing| existing.id == manifest.id || (existing.name == entry.name && existing.agent == agent)) {
+        return Err("MCP assignment 已存在，请刷新状态后重试".into());
+    }
+    let assignment = launchers.parent().ok_or("MCP launcher 目录无效")?
+        .join("mcp-observation").join(format!("{}.json", manifest.id));
+    match std::fs::symlink_metadata(assignment) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        _ => return Err("MCP assignment 已存在或状态不可读".into()),
+    }
+    Ok(manifest)
+}
+
+/// Explicit disable may restore a displaced, owned launcher for the same UUID.
+/// It never re-authorizes that launcher or infers its missing relay identity.
+fn displaced_observation(
+    manifest: &ObservationManifest, entry: &McpCatalogEntry, current: &Value, launchers: &Path,
+) -> Result<ObservationManifest, String> {
+    if manifest.name != entry.name || manifest.fingerprint != observation_fingerprint(&manifest.agent, entry) {
+        return Err("MCP 原始配置已变化，未恢复代理".into());
+    }
+    let recovery = owned_observation_proxy(&manifest.agent, entry, &manifest.config_path, current, launchers)?;
+    if recovery.id != manifest.id { return Err("MCP assignment 已变化，未覆盖配置".into()); }
+    Ok(recovery)
+}
+
+fn restore_observation_node(
+    manifest: &ObservationManifest, entry: &McpCatalogEntry,
+    mut save: impl FnMut(&ObservationManifest) -> Result<(), String>,
+) -> Result<(), String> {
+    validate_configuration(entry)?;
+    if manifest.fingerprint != observation_fingerprint(&manifest.agent, entry) {
+        return Err("MCP 原始配置已漂移，未覆盖用户修改".into());
+    }
+    let current = read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name)?;
+    let canonical = canonical_for_manifest(manifest, entry);
+    if current.as_ref() == Some(&canonical) { return Ok(()); }
+    let proxy = current.as_ref().is_some_and(|node| proxy_matches(node, manifest)
+        || previous_observation_endpoint(manifest).is_some_and(|previous| proxy_matches(node, &previous)));
+    if !proxy { return Err("MCP 配置已漂移，未覆盖用户修改".into()); }
+    let mut recovery = manifest.clone();
+    recovery.phase = "recovery".into();
+    save(&recovery)?;
+    patch_observation_node(&recovery, current.as_ref().unwrap(), &canonical)
 }
 
 /// A detached manifest can be retired without touching the Agent file. Keep
@@ -1469,11 +1695,7 @@ fn detached_observation(
     if active != Some(0) || fallback != 0 { return false; }
     let Some(current) = current else { return true; };
     if proxy_matches(current, manifest) { return false; }
-    if let Some(command) = &manifest.previous_proxy_command {
-        let mut previous = manifest.clone();
-        previous.proxy_command = command.clone();
-        if proxy_matches(current, &previous) { return false; }
-    }
+    if previous_observation_endpoint(manifest).is_some_and(|previous| proxy_matches(current, &previous)) { return false; }
     // A relay-shaped node must never become an adoptable direct source.
     if is_observation_proxy_node(current) { return false; }
     entry.is_some_and(|entry| entry_matches_config(&manifest.agent, entry, current))
@@ -1539,7 +1761,7 @@ pub async fn mcp_observation_status_all() -> Result<Vec<McpObservationStatus>, S
     let manifests = observation_manifests()?;
     let mut statuses = Vec::with_capacity(manifests.len());
     for manifest in &manifests {
-        let recovered = recover_upgrade(manifest).unwrap_or_else(|_| manifest.clone());
+        let recovered = recover_upgrade(manifest, &catalog).unwrap_or_else(|_| manifest.clone());
         let current = upgrade_observation(&recovered, &catalog).unwrap_or(recovered);
         statuses.push(observation_status(&current, &catalog));
     }
@@ -1550,7 +1772,10 @@ pub async fn mcp_observation_status_all() -> Result<Vec<McpObservationStatus>, S
             statuses.push(McpObservationStatus {
                 name: entry.name.clone(), agent: physical.to_string(),
                 state: if normalize_transport(&entry.transport) == "stdio" && is_mcp_target(agent) && agent != "dsh" {
-                    "off"
+                    let proxy = observation_config_path(physical).ok()
+                        .and_then(|path| read_observation_node(physical, &path, &entry.name).ok().flatten())
+                        .is_some_and(|node| is_observation_proxy_node(&node));
+                    if proxy { "drifted" } else { "off" }
                 } else { "unsupported" }.into(),
                 active_connections: 0,
             });
@@ -1580,11 +1805,45 @@ pub async fn mcp_observation_set(name: String, agent: String, enabled: bool) -> 
         return Err("此 MCP 尚未装备到该 Agent".into());
     }
     retire_detached_observations(&catalog)?;
-    let existing = observation_manifests()?.into_iter()
-        .find(|manifest| manifest.name == name && manifest.agent == physical);
+    let manifests = observation_manifests()?;
+    let mut existing = manifests.iter().find(|manifest| manifest.name == name && manifest.agent == physical).cloned();
+    if existing.is_none() {
+        let path = observation_config_path(&physical)?;
+        let current = match std::fs::metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err("MCP 配置不可读，未恢复代理".into()),
+            Ok(_) => read_observation_node(&physical, &path, &name)?,
+        };
+        if let Some(current) = current {
+            if is_observation_proxy_node(&current) {
+                if catalog.iter().filter(|entry| entry.name == name).count() != 1 {
+                    return Err("MCP 资源库条目不唯一，未恢复代理".into());
+                }
+                let root = observation_root()?;
+                let launchers = root.parent().ok_or("MCP observation 目录无效")?.join("mcp-launchers");
+                let orphan = orphaned_observation(&physical, &entry, &path, &current, &manifests, &launchers)?;
+                ensure_observation_idle(&orphan.id)?;
+                // Never make a guessed relay active. Persist only a recovery
+                // descriptor before replacing the exact orphan with catalog data.
+                save_observation(&orphan)?;
+                existing = Some(orphan);
+            }
+        }
+    }
+    if enabled && existing.as_ref().is_some_and(|manifest|
+        manifest.phase == "recovery" && manifest.relay_command.is_none() && manifest.previous_proxy_command.is_none()) {
+        let recovery = existing.as_ref().unwrap();
+        if recovery.config_path != observation_config_path(&physical)? {
+            return Err("MCP 配置路径已变化，未恢复代理".into());
+        }
+        ensure_observation_idle(&recovery.id)?;
+        restore_observation_node(recovery, &entry, save_observation)?;
+        remove_observation(recovery)?;
+        existing = None;
+    }
     if enabled {
         if let Some(manifest) = existing {
-            let recovered = recover_upgrade(&manifest)?;
+            let recovered = recover_upgrade(&manifest, &catalog)?;
             let current = upgrade_observation(&recovered, &catalog)?;
             if current.phase != "active" || current.config_path != observation_config_path(&physical)?
                 || current.fingerprint != observation_fingerprint(&physical, &entry)
@@ -1639,20 +1898,20 @@ pub async fn mcp_observation_set(name: String, agent: String, enabled: bool) -> 
         save_observation(&ready)?;
         Ok(observation_status(&ready, &catalog))
     } else if let Some(manifest) = existing {
-        let mut manifest = recover_upgrade(&manifest)?;
-        if manifest.fingerprint != observation_fingerprint(&manifest.agent, &entry)
-            || manifest.config_path != observation_config_path(&manifest.agent)? {
-            return Err("MCP 原始配置已漂移，未覆盖用户修改".into());
+        if manifest.config_path != observation_config_path(&manifest.agent)? {
+            return Err("MCP 配置路径已变化，未覆盖用户修改".into());
         }
-        let current = read_observation_node(&manifest.agent, &manifest.config_path, &name)?;
-        let canonical = canonical_for_manifest(&manifest, &entry);
-        if current.as_ref().is_some_and(|node| proxy_matches(node, &manifest)) {
-            manifest.phase = "recovery".into();
-            save_observation(&manifest)?;
-            patch_observation_node(&manifest, current.as_ref().unwrap(), &canonical)?;
-        } else if current.as_ref() != Some(&canonical) {
-            return Err("MCP 配置已漂移，未覆盖用户修改".into());
-        }
+        let current = read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name)?;
+        let displaced = current.as_ref().is_some_and(|node| is_observation_proxy_node(node)
+            && !proxy_matches(node, &manifest)
+            && !previous_observation_endpoint(&manifest).is_some_and(|previous| proxy_matches(node, &previous)));
+        let manifest = if displaced {
+            ensure_observation_idle(&manifest.id)?;
+            let root = observation_root()?;
+            let launchers = root.parent().ok_or("MCP observation 目录无效")?.join("mcp-launchers");
+            displaced_observation(&manifest, &entry, current.as_ref().unwrap(), &launchers)?
+        } else { manifest };
+        restore_observation_node(&manifest, &entry, save_observation)?;
         remove_observation(&manifest)?;
         Ok(McpObservationStatus { name, agent: physical, state: "off".into(), active_connections: 0 })
     } else {
@@ -1914,7 +2173,7 @@ fn configuration_comparison(
         sources.push(source);
     }
     let blocked_reason = observation.iter().any(|manifest| manifest.name == name)
-        .then(|| "此服务正在观察或等待恢复，请先在服务管理中关闭观察，再重新读取对比。".into());
+        .then(|| "此服务存在观测或恢复记录。可先选择可读取的版本；应用前请关闭观测并重新读取对比。".into());
     Ok(McpConfigurationComparison { name: name.into(), catalog, sources, revision, blocked_reason })
 }
 
@@ -2363,7 +2622,10 @@ mod tests {
         let entry = McpCatalogEntry { name: "demo".into(), command: "changed".into(),
             assigned_agents: vec!["claude_desktop".into()], ..Default::default() };
         let sources = snapshots(&[("claude_desktop", json!({"demo": proxy_entry(&manifest)}))]);
-        assert_eq!(collect_agent_statuses(&[entry.clone()], &sources, &[manifest.clone()])[0].state, "differs");
+        let status = collect_agent_statuses(&[entry.clone()], &sources, &[manifest.clone()]);
+        assert_eq!(status[0].state, "differs");
+        assert!(status[0].differing_fields.is_empty(), "proxy fields are not upstream evidence");
+        assert!(status[0].error.as_ref().unwrap().contains("观测代理需要恢复"));
         let comparison = configuration_comparison("demo", Some(entry), &sources, &[manifest]).unwrap();
         let source = comparison.sources.iter().find(|source| source.agent == "claude_desktop").unwrap();
         assert_eq!(source.state, "differs");
@@ -2653,7 +2915,33 @@ mod tests {
         assert!(entry_matches_config("zcode", &entry, &configured));
         // zcode 仅支持 stdio。
         assert!(supports_transport("zcode", "stdio"));
-        assert!(!supports_transport("zcode", "sse"));
+        assert!(!supports_transport("zcode", "http"));
+    }
+
+    #[test]
+    fn gemini_and_antigravity_entries_keep_minimal_shape() {
+        let entry = McpCatalogEntry {
+            name: "demo".into(),
+            transport: "stdio".into(),
+            command: "npx".into(),
+            args: vec!["-y".into(), "x".into()],
+            description: "描述".into(),
+            ..Default::default()
+        };
+        for agent in ["gemini", "antigravity"] {
+            let value = agent_entry_value(agent, &entry);
+            assert_eq!(value["command"], "npx");
+            // Gemini settings.json / Antigravity mcp_config.json 的 schema
+            // 未文档化 description 扩展键：不写 description/type/enabled。
+            assert!(value.get("description").is_none(), "{agent}");
+            assert!(value.get("type").is_none(), "{agent}");
+            let configured = json!({"command": "npx", "args": ["-y", "x"]});
+            assert!(entry_matches_config(agent, &entry, &configured));
+            // 远程形态与中央目录 {type,url} 不一致，v1 仅开放 stdio。
+            assert!(supports_transport(agent, "stdio"));
+            assert!(!supports_transport(agent, "http"));
+            assert!(!supports_transport(agent, "sse"));
+        }
     }
 
     #[test]
@@ -2821,8 +3109,8 @@ mod tests {
             assert_eq!(next.phase, "active");
             assert_eq!(next.proxy_command, "new-launcher");
             assert_eq!(next.relay_command.as_deref(), Some("new-relay"));
-            assert!(next.previous_proxy_command.is_none());
-            assert!(next.previous_relay_command.is_none());
+            assert_eq!(next.previous_proxy_command.as_ref(), Some(&manifest.proxy_command));
+            assert_eq!(next.previous_relay_command, previous_relay);
             assert_eq!(next.id, manifest.id);
             assert_eq!(next.fingerprint, manifest.fingerprint);
             assert_eq!(read_json_config(&manifest.config_path).unwrap()["theme"], "light");
@@ -2861,7 +3149,7 @@ mod tests {
         let recovered = recover_upgrade_node(&preparing.unwrap(), current.as_ref()).unwrap();
         assert_eq!(recovered.phase, "active");
         assert_eq!(recovered.relay_command.as_deref(), Some("new-relay"));
-        assert!(recovered.previous_relay_command.is_none());
+        assert_eq!(recovered.previous_relay_command.as_deref(), Some("old-relay"));
     }
 
     #[test]
@@ -2882,6 +3170,213 @@ mod tests {
         assert!(old.relay_command.is_none());
         assert_eq!(old.phase, "active");
         assert_eq!(read_json_config(&manifest.config_path).unwrap()["mcpServers"]["demo"]["command"], "node");
+    }
+
+    #[test]
+    fn committed_upgrade_reconciles_delayed_writeback_without_losing_either_pair() {
+        let (_directory, mut original, canonical) = synthetic_observation();
+        original.relay_command = Some("old-relay".into());
+        patch_observation_node(&original, &canonical, &proxy_entry(&original)).unwrap();
+        let upgraded = upgrade_observation_node(&original, "new-launcher".into(), "new-relay".into(), |_| Ok(())).unwrap();
+        let upgraded: ObservationManifest = serde_json::from_slice(&serde_json::to_vec(&upgraded).unwrap()).unwrap();
+        let retained = upgrade_observation_node(&upgraded, "third-launcher".into(), "third-relay".into(), |_| {
+            panic!("a third generation must not overwrite rollback history")
+        }).unwrap();
+        assert_eq!(retained, upgraded);
+        patch_observation_node(&original, &proxy_entry(&upgraded), &proxy_entry(&original)).unwrap();
+        let installed = read_observation_node(&original.agent, &original.config_path, &original.name).unwrap();
+        let rolled_back = recover_upgrade_node(&upgraded, installed.as_ref()).unwrap();
+        assert_eq!(rolled_back.proxy_command, original.proxy_command);
+        assert_eq!(rolled_back.relay_command, original.relay_command);
+        assert_eq!(rolled_back.previous_proxy_command.as_deref(), Some("new-launcher"));
+        assert_eq!(rolled_back.previous_relay_command.as_deref(), Some("new-relay"));
+        assert_eq!(recover_upgrade_node(&rolled_back, installed.as_ref()).unwrap(), rolled_back);
+        let unchanged = upgrade_observation_node(&rolled_back, "third-launcher".into(), "third-relay".into(), |_| {
+            panic!("polling must not replace retained endpoint history")
+        }).unwrap();
+        assert_eq!(unchanged, rolled_back);
+        let forward = recover_upgrade_node(&rolled_back, Some(&proxy_entry(&upgraded))).unwrap();
+        assert_eq!(forward.proxy_command, upgraded.proxy_command);
+        assert_eq!(forward.relay_command, upgraded.relay_command);
+        assert_eq!(read_json_config(&original.config_path).unwrap()["theme"], "light");
+    }
+
+    #[test]
+    fn upgrade_rechecks_the_node_after_saving_active() {
+        let (_directory, mut original, canonical) = synthetic_observation();
+        original.relay_command = Some("old-relay".into());
+        patch_observation_node(&original, &canonical, &proxy_entry(&original)).unwrap();
+        let mut saved = Vec::new();
+        let result = upgrade_observation_node(&original, "new-launcher".into(), "new-relay".into(), |state| {
+            saved.push(state.clone());
+            if saved.len() == 2 {
+                patch_observation_node(state, &proxy_entry(state), &proxy_entry(&original))?;
+            }
+            Ok(())
+        }).unwrap();
+        assert_eq!(saved.len(), 3);
+        assert_eq!(result.proxy_command, original.proxy_command);
+        assert_eq!(result.relay_command, original.relay_command);
+        assert_eq!(result.previous_relay_command.as_deref(), Some("new-relay"));
+        assert_eq!(saved.last(), Some(&result));
+    }
+
+    #[test]
+    fn disable_restores_either_recorded_proxy_but_rejects_a_changed_upstream() {
+        for previous in [false, true] {
+            let (_directory, mut manifest, canonical) = synthetic_observation();
+            let entry = McpCatalogEntry { name: "demo".into(), command: "node".into(), ..Default::default() };
+            manifest.previous_proxy_command = Some("previous-launcher".into());
+            manifest.previous_relay_command = Some("previous-relay".into());
+            let installed = if previous { previous_observation_endpoint(&manifest).unwrap() } else { manifest.clone() };
+            patch_observation_node(&manifest, &canonical, &proxy_entry(&installed)).unwrap();
+            let mut changed = entry.clone();
+            changed.args.push("changed.js".into());
+            assert!(restore_observation_node(&manifest, &changed, |_| panic!("changed upstream must not be saved")).is_err());
+            let mut saved = false;
+            restore_observation_node(&manifest, &entry, |state| {
+                assert_eq!(state.phase, "recovery");
+                saved = true;
+                Ok(())
+            }).unwrap();
+            assert!(saved);
+            assert_eq!(read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name).unwrap(), Some(canonical));
+            assert_eq!(read_json_config(&manifest.config_path).unwrap()["theme"], "light");
+        }
+    }
+
+    #[test]
+    fn recovery_requires_confirmed_idle_and_readable_fallback_state() {
+        assert!(require_idle_observation(Some(0), Ok(0)).is_ok());
+        for active in [None, Some(1), Some(-1)] {
+            assert!(require_idle_observation(active, Ok(0)).is_err());
+        }
+        assert!(require_idle_observation(Some(0), Ok(1)).is_err());
+        assert!(require_idle_observation(Some(0), Err("unreadable".into())).is_err());
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(fallback_connections_at(directory.path(), "assignment", 20_000).unwrap(), 0);
+        let heartbeat = directory.path().join("123.json");
+        std::fs::write(&heartbeat, b"invalid").unwrap();
+        assert!(fallback_connections_at(directory.path(), "assignment", 20_000).is_err());
+        std::fs::write(&heartbeat, serde_json::to_vec(&json!({
+            "assignment_id": "assignment", "pid": 123, "last_seen_unix_ms": 15_000
+        })).unwrap()).unwrap();
+        assert_eq!(fallback_connections_at(directory.path(), "assignment", 20_000).unwrap(), 1);
+        assert_eq!(fallback_connections_at(directory.path(), "assignment", 30_000).unwrap(), 0);
+    }
+
+    fn synthetic_orphan() -> (tempfile::TempDir, PathBuf, McpCatalogEntry, ObservationManifest, Value) {
+        let (directory, mut manifest, canonical) = synthetic_observation();
+        let launchers = directory.path().join("mcp-launchers");
+        std::fs::create_dir(&launchers).unwrap();
+        let bytes = b"fixture launcher, never executed";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let filename = if cfg!(windows) { format!("mcp-launcher-{digest}.exe") } else { format!("mcp-launcher-{digest}") };
+        let launcher = launchers.join(filename);
+        std::fs::write(&launcher, bytes).unwrap();
+        manifest.proxy_command = launcher.to_string_lossy().into_owned();
+        manifest.phase = "recovery".into();
+        let current = proxy_entry(&manifest);
+        patch_observation_node(&manifest, &canonical, &current).unwrap();
+        let entry = McpCatalogEntry { name: "demo".into(), command: "node".into(),
+            assigned_agents: vec!["claude_desktop".into()], ..Default::default() };
+        (directory, launchers, entry, manifest, current)
+    }
+
+    #[test]
+    fn orphan_recovery_is_non_launchable_and_restores_catalog_before_fresh_enable() {
+        let (_directory, launchers, entry, original, current) = synthetic_orphan();
+        let recovery = orphaned_observation(&original.agent, &entry, &original.config_path, &current, &[], &launchers).unwrap();
+        assert_eq!(recovery.id, original.id);
+        assert_eq!(recovery.phase, "recovery");
+        assert!(recovery.relay_command.is_none());
+        assert!(restore_observation_node(&recovery, &entry, |_| Err("simulated recovery save failure".into())).is_err());
+        assert_eq!(read_observation_node(&original.agent, &original.config_path, &original.name).unwrap(), Some(current));
+        let mut saved = Vec::new();
+        restore_observation_node(&recovery, &entry, |state| { saved.push(state.clone()); Ok(()) }).unwrap();
+        assert_eq!(saved.len(), 1);
+        let canonical = observation_canonical(&original.agent, &entry);
+        assert_eq!(read_observation_node(&original.agent, &original.config_path, &original.name).unwrap(), Some(canonical.clone()));
+        let mut fresh = original.clone();
+        fresh.id = uuid::Uuid::new_v4().to_string();
+        fresh.relay_command = Some("current-relay".into());
+        fresh.phase = "preparing".into();
+        activate_observation_node(&fresh, &canonical, || {}).unwrap();
+        let node = read_observation_node(&original.agent, &original.config_path, &original.name).unwrap().unwrap();
+        assert_eq!(node, proxy_entry(&fresh));
+        assert_ne!(node["args"][1], original.id);
+        assert_eq!(read_json_config(&original.config_path).unwrap()["theme"], "light");
+    }
+
+    #[test]
+    fn orphan_repair_rejects_custom_nodes_conflicting_ids_and_untrusted_launchers() {
+        let (_directory, launchers, entry, original, current) = synthetic_orphan();
+        let validate = |node: &Value, manifests: &[ObservationManifest]| {
+            orphaned_observation(&original.agent, &entry, &original.config_path, node, manifests, &launchers)
+        };
+        let mut custom = current.clone();
+        custom["env"] = json!({"TOKEN": "private"});
+        assert!(validate(&custom, &[]).is_err());
+        let mut bad_id = current.clone();
+        bad_id["args"][1] = json!("invalid");
+        assert!(validate(&bad_id, &[]).is_err());
+        let mut conflict = original.clone();
+        conflict.name = "another-service".into();
+        assert!(validate(&current, &[conflict]).is_err());
+        let mut foreign = current.clone();
+        foreign["command"] = json!(launchers.parent().unwrap().join("foreign-launcher").to_string_lossy());
+        assert!(validate(&foreign, &[]).is_err());
+        let mut malformed = current.clone();
+        let filename = format!("mcp-launcher-{}{}", "g".repeat(64), if cfg!(windows) { ".exe" } else { "" });
+        malformed["command"] = json!(launchers.join(filename).to_string_lossy());
+        assert!(validate(&malformed, &[]).is_err());
+        let mut invalid_entry = entry.clone();
+        invalid_entry.command.clear();
+        assert!(orphaned_observation(&original.agent, &invalid_entry, &original.config_path, &current, &[], &launchers).is_err());
+        std::fs::write(&original.proxy_command, b"changed executable").unwrap();
+        assert!(validate(&current, &[]).is_err());
+        std::fs::remove_file(&original.proxy_command).unwrap();
+        assert!(validate(&current, &[]).is_ok(), "missing owned launcher may be restored, never executed");
+        assert_eq!(read_observation_node(&original.agent, &original.config_path, &original.name).unwrap(), Some(current));
+    }
+
+    #[test]
+    fn explicit_disable_recovers_a_displaced_launcher_without_inventing_a_relay() {
+        let (_directory, launchers, entry, installed, current) = synthetic_orphan();
+        let mut stale = installed.clone();
+        stale.proxy_command = "unrecorded-new-launcher".into();
+        stale.relay_command = Some("unrecorded-new-relay".into());
+        stale.phase = "active".into();
+        let recovery = displaced_observation(&stale, &entry, &current, &launchers).unwrap();
+        assert_eq!(recovery.id, stale.id);
+        assert_eq!(recovery.phase, "recovery");
+        assert!(recovery.relay_command.is_none());
+        restore_observation_node(&recovery, &entry, |_| Ok(())).unwrap();
+        assert_eq!(read_observation_node(&installed.agent, &installed.config_path, &installed.name).unwrap(),
+            Some(observation_canonical(&installed.agent, &entry)));
+    }
+
+    #[test]
+    fn displaced_launcher_recovery_rejects_another_assignment_and_changed_catalog() {
+        let (_directory, launchers, entry, installed, current) = synthetic_orphan();
+        let mut another = installed.clone();
+        another.id = uuid::Uuid::new_v4().to_string();
+        assert!(displaced_observation(&another, &entry, &current, &launchers).is_err());
+        let mut changed = entry.clone();
+        changed.args.push("changed.js".into());
+        assert!(displaced_observation(&installed, &changed, &current, &launchers).is_err());
+        assert_eq!(read_observation_node(&installed.agent, &installed.config_path, &installed.name).unwrap(), Some(current));
+    }
+
+    #[test]
+    fn orphan_restoration_preserves_a_custom_edit_after_recovery_save() {
+        let (_directory, launchers, entry, original, current) = synthetic_orphan();
+        let recovery = orphaned_observation(&original.agent, &entry, &original.config_path, &current, &[], &launchers).unwrap();
+        let result = restore_observation_node(&recovery, &entry, |_| {
+            patch_observation_node(&original, &current, &json!({"command": "custom"}))
+        });
+        assert!(result.is_err());
+        assert_eq!(read_json_config(&original.config_path).unwrap()["mcpServers"]["demo"]["command"], "custom");
     }
 
     #[test]

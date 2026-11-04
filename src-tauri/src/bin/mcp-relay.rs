@@ -6,8 +6,8 @@
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "--mcp-relay") && args.len() == 2 {
-        if agent_manager_lib::run_mcp_stdio_relay(&args[1]).is_err() {
-            eprintln!("[mcp-relay] unable to start or forward server");
+        if let Err(reason) = agent_manager_lib::run_mcp_stdio_relay(&args[1]) {
+            eprintln!("[mcp-relay] {reason}");
             std::process::exit(1);
         }
         return;

@@ -7,7 +7,7 @@ import type { SkillItem } from '../../types/skill'
 interface Profile { name: string; servers: string[]; skills: { source: string; name: string }[] }
 interface Plan { revision: string; items: { kind: string; source: string; name: string; action: string }[] }
 interface Log { id: string; profile: string; target: string; at: string; items: { kind: string; name: string; state: string; detail: string }[] }
-const TARGETS = [['claude_cli', 'Claude Code'], ['codex_cli', 'Codex'], ['qoder', 'Qoder'], ['workbuddy', 'WorkBuddy'], ['minimax', 'MiniMax'], ['kimi', 'Kimi'], ['zcode', 'ZCode'], ['dsh', 'DeepSeek Harness']]
+const TARGETS = [['claude_cli', 'Claude Code'], ['codex_cli', 'Codex'], ['qoder', 'Qoder'], ['workbuddy', 'WorkBuddy'], ['minimax', 'MiniMax'], ['kimi', 'Kimi'], ['zcode', 'ZCode'], ['dsh', 'DeepSeek Harness'], ['gemini', 'Gemini CLI'], ['antigravity', 'Antigravity']]
 export function EquipmentProfiles({ onBack }: { onBack: () => void }) {
   const { t } = useTranslation()
   const [profiles, setProfiles] = useState<Profile[]>([])

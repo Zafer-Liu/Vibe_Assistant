@@ -60,7 +60,12 @@ fn canonical(agent: &str, entry: &CatalogEntry) -> Value {
         value["type"] = json!("stdio");
         value["enabled"] = json!(true);
     }
-    if !entry.description.is_empty() && agent != "zcode" && !agent.starts_with("codex") {
+    if !entry.description.is_empty()
+        && agent != "zcode"
+        && !agent.starts_with("codex")
+        && agent != "gemini"
+        && agent != "antigravity"
+    {
         value["description"] = json!(entry.description);
     }
     value
@@ -124,6 +129,10 @@ fn default_config_path(agent: &str) -> Option<PathBuf> {
             let chosen = if score(&candidates[1]) > score(&candidates[0]) { &candidates[1] } else { &candidates[0] };
             Some(chosen.join("mcp.json"))
         }
+        // Gemini 的 mcpServers 在 ~/.gemini/settings.json；Antigravity 的
+        // 全局 MCP 配置在 ~/.gemini/config/mcp_config.json。
+        "gemini" => Some(home?.join(".gemini").join("settings.json")),
+        "antigravity" => Some(home?.join(".gemini").join("config").join("mcp_config.json")),
         "kimi" => {
             let desktop = std::env::var_os("APPDATA").map(PathBuf::from)
                 .map(|path| path.join("kimi-desktop").join("daimon-storage.json"))
@@ -181,7 +190,7 @@ fn verified_path(manifest: &Manifest) -> Result<(), String> {
             }
         }
         "workbuddy" => dirs_next::home_dir().map(|home| home.join(".workbuddy").join(".mcp.json")),
-        "qoder" | "minimax" | "kimi" | "zcode" => {
+        "qoder" | "minimax" | "kimi" | "zcode" | "gemini" | "antigravity" => {
             // Overrides share the same per-user file as the Agent source UI.
             let overrides = config_root()?.join("agent_source_paths.json");
             let settings: Value = std::fs::read(&overrides).ok()
@@ -190,6 +199,8 @@ fn verified_path(manifest: &Manifest) -> Result<(), String> {
                 let mut path = PathBuf::from(home);
                 match manifest.agent.as_str() {
                     "zcode" => path.push("cli/config.json"),
+                    "gemini" => path.push("settings.json"),
+                    "antigravity" => path.push("mcp_config.json"),
                     _ => path.push("mcp.json"),
                 }
                 Some(path)
@@ -229,7 +240,7 @@ fn resolve(assignment_id: &str, launcher_process: bool) -> Result<FallbackLaunch
     let manifest: Manifest = serde_json::from_slice(&std::fs::read(&path).map_err(|_| "Assignment unavailable")?)
         .map_err(|_| "Assignment invalid")?;
     if manifest.id != id || manifest.phase != "active" || manifest.name.is_empty()
-        || !matches!(manifest.agent.as_str(), "codex_cli" | "claude_cli" | "claude_desktop" | "qoder" | "workbuddy" | "minimax" | "kimi" | "zcode")
+        || !matches!(manifest.agent.as_str(), "codex_cli" | "claude_cli" | "claude_desktop" | "qoder" | "workbuddy" | "minimax" | "kimi" | "zcode" | "gemini" | "antigravity")
         || manifest.relay_command.as_ref().is_none_or(|command| command.is_empty())
         || !manifest.config_path.is_absolute()
         || !Path::new(&manifest.proxy_command).is_absolute() {

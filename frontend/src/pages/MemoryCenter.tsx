@@ -127,9 +127,9 @@ const MemoryCard = memo(function MemoryCard({ memory: m, ranking, onPin, onEdit,
   )
 })
 
-export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPending, onOpenOrganized, onOpenCapture, onOpenInjection, active = true }: { onOpenUsage?: () => void; onOpenPending?: () => void; onOpenOrganized?: () => void; onOpenCapture?: () => void; onOpenInjection?: () => void; active?: boolean }) {
+export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGraph, onOpenPending, onOpenOrganized, onOpenCapture, onOpenInjection, active = true }: { onOpenUsage?: () => void; onOpenGraph?: () => void; onOpenPending?: () => void; onOpenOrganized?: () => void; onOpenCapture?: () => void; onOpenInjection?: () => void; active?: boolean }) {
   const { t } = useTranslation()
-  const { engineOnline, memories, memoryDomains, selectedMemoryDomainId, importance, loading, lastSearchResults, lastSearchQuery, memoryCacheReady, localMemoryStats, ingestStatus, l2Documents, l3Documents, checkIngest, loadMemoryLayers, consolidateShortTermMemory, draftLongTermProfile, publishLongTermProfile, updatePublishedMemoryDocument, deleteLongTermProfileDraft, organizeConversations, cancelOrganize, importMemoryFolder, checkEngine, stopEngine, search, listMemories, loadMemoryDomains, setSelectedMemoryDomain, resetL1ForReextraction, updateMemory, deleteMemory, addUserMemory, dreaming, restoreConsolidation, refreshImportance, setMemoryPinned, hookStatus, qoderHookStatus, codexHookStatus, workbuddyHookStatus, agentSources, loadAgentSources } = useMemoryFields('engineOnline', 'memories', 'memoryDomains', 'selectedMemoryDomainId', 'importance', 'loading', 'lastSearchResults', 'lastSearchQuery', 'memoryCacheReady', 'localMemoryStats', 'ingestStatus', 'l2Documents', 'l3Documents', 'checkIngest', 'loadMemoryLayers', 'consolidateShortTermMemory', 'draftLongTermProfile', 'publishLongTermProfile', 'updatePublishedMemoryDocument', 'deleteLongTermProfileDraft', 'organizeConversations', 'cancelOrganize', 'importMemoryFolder', 'checkEngine', 'stopEngine', 'search', 'listMemories', 'loadMemoryDomains', 'setSelectedMemoryDomain', 'resetL1ForReextraction', 'updateMemory', 'deleteMemory', 'addUserMemory', 'dreaming', 'restoreConsolidation', 'refreshImportance', 'setMemoryPinned', 'hookStatus', 'qoderHookStatus', 'codexHookStatus', 'workbuddyHookStatus', 'agentSources', 'loadAgentSources')
+  const { engineOnline, memories, memoryDomains, selectedMemoryDomainId, importance, loading, lastSearchResults, lastSearchQuery, memoryCacheReady, localMemoryStats, ingestStatus, l2Documents, l3Documents, checkIngest, loadMemoryLayers, consolidateShortTermMemory, draftLongTermProfile, publishLongTermProfile, updatePublishedMemoryDocument, deleteLongTermProfileDraft, organizeConversations, cancelOrganize, importMemoryFolder, checkEngine, stopEngine, search, listMemories, loadMemoryDomains, setSelectedMemoryDomain, resetL1ForReextraction, updateMemory, deleteMemory, addUserMemory, dreaming, restoreConsolidation, refreshImportance, setMemoryPinned, hookStatus, qoderHookStatus, codexHookStatus, workbuddyHookStatus, geminiHookStatus, antigravityHookStatus, agentSources, loadAgentSources } = useMemoryFields('engineOnline', 'memories', 'memoryDomains', 'selectedMemoryDomainId', 'importance', 'loading', 'lastSearchResults', 'lastSearchQuery', 'memoryCacheReady', 'localMemoryStats', 'ingestStatus', 'l2Documents', 'l3Documents', 'checkIngest', 'loadMemoryLayers', 'consolidateShortTermMemory', 'draftLongTermProfile', 'publishLongTermProfile', 'updatePublishedMemoryDocument', 'deleteLongTermProfileDraft', 'organizeConversations', 'cancelOrganize', 'importMemoryFolder', 'checkEngine', 'stopEngine', 'search', 'listMemories', 'loadMemoryDomains', 'setSelectedMemoryDomain', 'resetL1ForReextraction', 'updateMemory', 'deleteMemory', 'addUserMemory', 'dreaming', 'restoreConsolidation', 'refreshImportance', 'setMemoryPinned', 'hookStatus', 'qoderHookStatus', 'codexHookStatus', 'workbuddyHookStatus', 'geminiHookStatus', 'antigravityHookStatus', 'agentSources', 'loadAgentSources')
   const { telemetrySummary, telemetryLiveStatus, checkTelemetry } = useTelemetryFields('telemetrySummary', 'telemetryLiveStatus', 'checkTelemetry')
 
   const [query, setQuery] = useState('')
@@ -573,6 +573,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
   // 判定与「记忆注入」页共用（见 memoryAgentStatus）。
   const hookStatusByAgent: Record<string, HookStatus | null> = {
     codex: codexHookStatus, claude: hookStatus, qoder: qoderHookStatus, workbuddy: workbuddyHookStatus,
+    gemini: geminiHookStatus, antigravity: antigravityHookStatus,
   }
   const injectionReadyCount = agentSources
     .filter((source) => source.supports_hooks && isInjectionReady(hookStatusByAgent[source.id] ?? null))
@@ -609,6 +610,16 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenPend
             <span className={`text-xs px-2 py-1 rounded ${notice.kind === 'ok' ? 'bg-green-500/10 text-green-600 dark:text-green-400' : 'bg-red-500/10 text-red-600 dark:text-red-400'}`}>
               {notice.text}
             </span>
+          )}
+          {onOpenGraph && (
+            <button
+              type="button"
+              onClick={onOpenGraph}
+              className="inline-flex items-center gap-1.5 rounded-full border border-violet-500/40 bg-violet-500/10 px-2.5 py-1 text-xs font-medium text-violet-700 transition hover:bg-violet-500/20 dark:text-violet-300"
+            >
+              <Brain size={13} />
+              {t('nav.memoryGraph')}
+            </button>
           )}
           <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs ${telemetryLiveStatus?.active_sessions ? 'bg-sky-500/10 text-sky-700 dark:text-sky-300' : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300'}`} title={t('memory.memoryStatusTitle')}><span className={`h-1.5 w-1.5 rounded-full ${telemetryLiveStatus?.active_sessions ? 'animate-pulse bg-sky-500 motion-reduce:animate-none' : 'bg-gray-400'}`} />{t('memory.liveRunLabel')}{liveRunText}</span>
           <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/35 px-2.5 py-1 text-xs text-emerald-700 dark:text-emerald-300" title={t('memory.memoryStatusTitle')}><Database size={13} />{t('memory.memoryStatusLocal')}</span>

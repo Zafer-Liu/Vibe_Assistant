@@ -144,24 +144,39 @@ fn prepare_hook_context(path: &str, body: &str) -> (&'static str, String, Option
     let source = query.split('&').find_map(|part| part.strip_prefix("source="))
         // dsh 的注入由 cordis pre-step 插件发起（记忆注入插件），采集走
         // 本地转录扫描而非 Hook payload。
-        .filter(|source| matches!(*source, "claude" | "qoder" | "codex" | "workbuddy" | "dsh"))
+        .filter(|source| matches!(*source, "claude" | "qoder" | "codex" | "workbuddy" | "dsh" | "gemini" | "antigravity"))
         .unwrap_or("unknown");
+    // 各 Agent 的“每轮提问”事件名不同：Claude 系 UserPromptSubmit、Gemini CLI
+    // BeforeAgent、Antigravity PreInvocation，端点内统一按 per-turn 处理。
     let event = query.split('&').find_map(|part| part.strip_prefix("event="))
-        .filter(|event| matches!(*event, "SessionStart" | "UserPromptSubmit"))
+        .filter(|event| matches!(*event, "SessionStart" | "UserPromptSubmit" | "BeforeAgent" | "PreInvocation"))
         .unwrap_or("SessionStart");
+    let per_turn = matches!(event, "UserPromptSubmit" | "BeforeAgent" | "PreInvocation");
     let payload = serde_json::from_str::<Value>(body).ok();
-    let session_id = payload.as_ref().and_then(|value| value.get("session_id"))
+    let session_id = payload.as_ref()
+        .and_then(|value| value.get("session_id").or_else(|| value.get("conversationId")))
         .and_then(Value::as_str).filter(|id| !id.is_empty() && id.len() <= 256)
         .map(str::to_owned);
     // dsh 的对话沉淀由转录扫描负责，不把插件请求当 Hook 采集事件入账。
-    if event == "UserPromptSubmit" && payload.is_some() && source != "dsh" {
+    if per_turn && payload.is_some() && source != "dsh" {
+        // Antigravity 的 protojson payload 不带 hook_event_name 字段；事件
+        // 已从 URL 解析，缺失时补写后再转发，沉淀管道才能识别每轮提问。
+        let forwarded = if payload.as_ref().is_some_and(|value| value.get("hook_event_name").is_none()) {
+            let mut enriched = payload.clone().unwrap_or_else(|| json!({}));
+            if let Some(object) = enriched.as_object_mut() {
+                object.insert("hook_event_name".into(), json!(event));
+            }
+            enriched.to_string()
+        } else {
+            body.to_string()
+        };
         if let (Some(ingest), Some(backend)) = (
             crate::memory_ingest::ingest_store(), crate::memory_backend::shared_backend(),
         ) {
-            let _ = ingest.handle_hook(backend, body, source);
+            let _ = ingest.handle_hook(backend, &forwarded, source);
         }
     }
-    if event == "UserPromptSubmit" {
+    if per_turn {
         let injection = crate::memory_mcp::hook_prompt_context_gated(source, session_id.as_deref());
         let (response, summary, detail, commit_gate) = match injection.context {
             Some(context) => {
@@ -278,7 +293,7 @@ async fn route(
                         .split('&')
                         .find_map(|part| part.strip_prefix("source="))
                 })
-                .filter(|source| matches!(*source, "claude" | "qoder" | "codex" | "workbuddy"))
+                .filter(|source| matches!(*source, "claude" | "qoder" | "codex" | "workbuddy" | "gemini" | "antigravity"))
                 .unwrap_or("unknown");
             if let Some(ingest) = crate::memory_ingest::ingest_store() {
                 if let Some(backend) = crate::memory_backend::shared_backend() {
@@ -312,6 +327,7 @@ async fn route(
                     | "claude"
                     | "qoder"
                     | "gemini"
+                    | "antigravity"
                     | "opencode"
                     | "openclaw"
                     | "pi"
@@ -577,13 +593,28 @@ fn handle_collect_trigger(body: &str) -> (&'static str, String) {
     ("202 Accepted", json!({"status": "scheduled"}).to_string())
 }
 
-/// Hook 注入的 stdout 响应体（SessionStart / UserPromptSubmit 同构）。Claude
+/// Hook 注入的 stdout 响应体（SessionStart / 每轮提问事件同构）。Claude
 /// 形态 harness（Qoder / Claude Code / WorkBuddy）要求结构化 JSON，注入正文放
 /// 在 `hookSpecificOutput.additionalContext`，hookEventName 需与事件同名；纯文
-/// 本 stdout 会被丢弃（日志中的 "winner=none (no parsed output)"）。Codex 的
-/// hook 协议不同且未验证，保持纯文本以免破坏其现有行为。
+/// 本 stdout 会被丢弃（日志中的 "winner=none (no parsed output)"）。Gemini CLI
+/// 的 hook 聚合器对 SessionStart / BeforeAgent 读取同一 additionalContext 字段，
+/// 信封与 Claude 形态共用。Antigravity 走 injectSteps：SessionStart 注入持久
+/// systemMessage，PreInvocation 注入当轮 ephemeralMessage。Codex 的 hook 协议
+/// 不同且未验证，保持纯文本以免破坏其现有行为。
 fn hook_inject_body(source: &str, event: &str, context: String) -> String {
-    if matches!(source, "claude" | "qoder" | "workbuddy") {
+    if source == "antigravity" {
+        if event == "SessionStart" {
+            json!({
+                "injectSteps": [{"systemMessage": {"systemMessage": context}}]
+            })
+            .to_string()
+        } else {
+            json!({
+                "injectSteps": [{"ephemeralMessage": context}]
+            })
+            .to_string()
+        }
+    } else if matches!(source, "claude" | "qoder" | "workbuddy" | "gemini") {
         json!({
             "hookSpecificOutput": {
                 "hookEventName": event,
@@ -613,13 +644,32 @@ mod tests {
 
     #[test]
     fn claude_shape_sources_get_structured_hook_envelope() {
-        for source in ["claude", "qoder", "workbuddy"] {
+        for source in ["claude", "qoder", "workbuddy", "gemini"] {
             let body = hook_inject_body(source, "SessionStart", "记忆正文".to_string());
             let value: serde_json::Value =
                 serde_json::from_str(&body).expect("envelope must be valid JSON");
             assert_eq!(value["hookSpecificOutput"]["hookEventName"], "SessionStart");
             assert_eq!(value["hookSpecificOutput"]["additionalContext"], "记忆正文");
         }
+    }
+
+    #[test]
+    fn gemini_per_turn_envelope_names_its_own_event() {
+        let body = hook_inject_body("gemini", "BeforeAgent", "每轮注入正文".to_string());
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["hookSpecificOutput"]["hookEventName"], "BeforeAgent");
+        assert_eq!(value["hookSpecificOutput"]["additionalContext"], "每轮注入正文");
+    }
+
+    #[test]
+    fn antigravity_envelope_uses_inject_steps() {
+        let start = hook_inject_body("antigravity", "SessionStart", "启动记忆".to_string());
+        let value: serde_json::Value = serde_json::from_str(&start).unwrap();
+        assert_eq!(value["injectSteps"][0]["systemMessage"]["systemMessage"], "启动记忆");
+
+        let per_turn = hook_inject_body("antigravity", "PreInvocation", "当轮记忆".to_string());
+        let value: serde_json::Value = serde_json::from_str(&per_turn).unwrap();
+        assert_eq!(value["injectSteps"][0]["ephemeralMessage"], "当轮记忆");
     }
 
     #[test]

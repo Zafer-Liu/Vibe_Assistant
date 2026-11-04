@@ -9,6 +9,8 @@ export const TARGETS = [
   { id: 'kimi', label: 'Kimi', color: 'bg-cyan-500', remote: false },
   { id: 'zcode', label: 'ZCode', color: 'bg-fuchsia-500', remote: false },
   { id: 'dsh', label: 'DeepSeek Harness', color: 'bg-teal-600', remote: true },
+  { id: 'gemini', label: 'Gemini CLI', color: 'bg-blue-500', remote: false },
+  { id: 'antigravity', label: 'Antigravity', color: 'bg-purple-500', remote: false },
 ] as const
 
 export function targetOf(id: string) {

@@ -104,7 +104,7 @@ fn skill_target(target: &str) -> Result<&str, String> {
     match target {
         "claude_cli" => Ok("claude"),
         "codex_cli" => Ok("codex"),
-        "qoder" | "workbuddy" | "minimax" | "kimi" | "zcode" | "dsh" => Ok(target),
+        "qoder" | "workbuddy" | "minimax" | "kimi" | "zcode" | "dsh" | "gemini" | "antigravity" => Ok(target),
         _ => Err("该目标不支持 MCP 与 Skill 联合装备".into()),
     }
 }
@@ -115,6 +115,15 @@ fn installed(target: &str) -> Result<(), String> {
             .is_some_and(|path| path.parent().is_some_and(|dir| dir.is_dir()));
         if !present {
             return Err("未检测到 DeepSeek Harness（~/.dsh/profiles/desktop），请先安装".into());
+        }
+        return Ok(());
+    }
+    if target == "antigravity" {
+        // Antigravity 同为桌面应用：以 ~/.gemini/antigravity 数据目录存在为准。
+        let present = dirs_next::home_dir()
+            .is_some_and(|home| home.join(".gemini").join("antigravity").is_dir());
+        if !present {
+            return Err("未检测到 Antigravity（~/.gemini/antigravity），请先安装".into());
         }
         return Ok(());
     }
