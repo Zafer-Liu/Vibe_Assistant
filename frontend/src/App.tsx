@@ -285,7 +285,7 @@ export default function App() {
         </nav>
 
         <div className="app-sidebar-footer">
-          <div className="app-sidebar-footer-meta"><span>v1.2.0</span><a href="https://www.zaferliu.me" target="_blank" rel="noreferrer">@ZaferLiu</a>
+          <div className="app-sidebar-footer-meta"><span>v1.2.1</span><a href="https://www.zaferliu.me" target="_blank" rel="noreferrer">@ZaferLiu</a>
             <div className="app-sidebar-footer-controls"><LanguageSwitcher /><button type="button" onClick={toggleTheme} className="app-icon-button" title={theme === 'dark' ? t('app.switchToLight') : t('app.switchToDark')} aria-label={theme === 'dark' ? t('app.switchToLight') : t('app.switchToDark')}>{theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}</button></div>
           </div>
           <div className="app-sidebar-footer-update"><UpdateChecker sidebar autoCheck /></div>

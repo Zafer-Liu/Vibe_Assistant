@@ -1,6 +1,6 @@
 [package]
 name = "mcp-launcher"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 description = "Small MCP observation fallback launcher for Vibe Assistant"
 
