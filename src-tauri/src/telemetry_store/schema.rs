@@ -73,6 +73,70 @@ fn ensure_writable_connection(conn: &Connection, path: &std::path::Path) -> Resu
 mod tests {
     use super::*;
 
+    fn classification_store_on_disk(path: &std::path::Path) -> crate::telemetry_store::TelemetryStore {
+        let conn = initialize_database(Connection::open(path).unwrap()).unwrap();
+        conn.execute(
+            "INSERT INTO local_memory_items
+             (id, source_event_key, ordinal, memory, memory_type, durability, source,
+              session_id, created_at, updated_at)
+             VALUES ('memory', 'event', 0, 'A shared memory', 'fact', 'short_term',
+                     'test', 'session', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        // No built-in waiting in these tests: exercise the bounded retry path.
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        crate::telemetry_store::TelemetryStore::from_connection(conn)
+    }
+
+    #[test]
+    fn classification_save_retries_peer_writer_without_reclassifying() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("classification.sqlite3");
+        let store = classification_store_on_disk(&path);
+        let item = store.local_l1_memory_snapshot().unwrap().remove(0);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut peer = Connection::open(path).unwrap();
+            let transaction = peer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+            transaction.execute(
+                "INSERT INTO app_settings (setting_key, value_json, updated_at)
+                 VALUES ('peer-write', 'true', '2020-01-01T00:00:00Z')",
+                [],
+            ).unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            transaction.commit().unwrap();
+        });
+        locked_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        release_tx.send(()).unwrap();
+        // The model response already exists; only this local save is retried.
+        let result = store.save_memory_domain_classification(&item, &[]);
+        writer.join().unwrap();
+        result.unwrap();
+        assert!(store.completed_memory_domain_classification_ids().unwrap().contains("memory"));
+    }
+
+    #[test]
+    fn classification_lock_exhaustion_keeps_previous_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("classification.sqlite3");
+        let store = classification_store_on_disk(&path);
+        let item = store.local_l1_memory_snapshot().unwrap().remove(0);
+        store.save_memory_domain_classification(&item, &[crate::telemetry_store::MemoryDomainAssignment {
+            domain_id: "study".into(), weight: 0.9,
+        }]).unwrap();
+        let mut peer = Connection::open(path).unwrap();
+        let transaction = peer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        let result = store.save_memory_domain_classification(&item, &[]);
+        transaction.rollback().unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("3"), "{error}");
+        assert!(store.memory_ids_for_domains(&["study".into()]).unwrap().contains("memory"));
+        assert!(store.completed_memory_domain_classification_ids().unwrap().contains("memory"));
+    }
+
     #[test]
     fn rejects_read_only_connections_without_changing_existing_data() {
         let dir = tempfile::tempdir().unwrap();
@@ -238,6 +302,11 @@ pub(super) fn initialize_database(mut conn: Connection) -> Result<Connection, St
          );
          CREATE INDEX IF NOT EXISTS idx_local_memory_domains_domain
            ON local_memory_domains(domain_id, weight DESC);
+         CREATE TABLE IF NOT EXISTS memory_domain_classification_state (
+           memory_id TEXT PRIMARY KEY REFERENCES local_memory_items(id) ON DELETE CASCADE,
+           content_hash TEXT NOT NULL,
+           classified_at TEXT NOT NULL
+         );
          CREATE TABLE IF NOT EXISTS l1_deletion_tombstones (
            memory_id TEXT PRIMARY KEY,
            deleted_at TEXT NOT NULL

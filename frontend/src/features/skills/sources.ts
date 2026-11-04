@@ -1,4 +1,4 @@
-export type SourceFilter = 'all' | 'published' | 'codex' | 'claude' | 'qoder' | 'workbuddy' | 'minimax' | 'kimi' | 'copilot' | 'zcode' | 'dsh'
+export type SourceFilter = 'all' | 'published' | 'codex' | 'claude' | 'qoder' | 'workbuddy' | 'minimax' | 'kimi' | 'copilot' | 'zcode' | 'dsh' | 'gemini' | 'antigravity'
 
 export const SOURCES: { id: Exclude<SourceFilter, 'all'>; label: string; color: string }[] = [
   { id: 'codex',    label: 'Codex',       color: 'bg-emerald-500' },
@@ -10,6 +10,8 @@ export const SOURCES: { id: Exclude<SourceFilter, 'all'>; label: string; color: 
   { id: 'copilot',  label: 'GitHub Copilot', color: 'bg-slate-500' },
   { id: 'zcode',    label: 'ZCode',       color: 'bg-fuchsia-500' },
   { id: 'dsh',      label: 'DeepSeek Harness', color: 'bg-teal-500' },
+  { id: 'gemini',   label: 'Gemini CLI',  color: 'bg-blue-500' },
+  { id: 'antigravity', label: 'Antigravity', color: 'bg-purple-500' },
 ]
 
 export const sourceColor = (source: string) => SOURCES.find(s => s.id === source)?.color ?? 'bg-gray-400'

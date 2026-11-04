@@ -18,7 +18,7 @@ export interface MemoryMcpRuntimeStatus {
   detail: string
 }
 
-export type MemoryMcpTarget = 'codex_cli' | 'claude_cli' | 'codex_desktop' | 'claude_desktop' | 'qoder' | 'workbuddy' | 'minimax' | 'kimi' | 'zcode' | 'dsh'
+export type MemoryMcpTarget = 'codex_cli' | 'claude_cli' | 'codex_desktop' | 'claude_desktop' | 'qoder' | 'workbuddy' | 'minimax' | 'kimi' | 'zcode' | 'dsh' | 'gemini' | 'antigravity'
 
 /** Shared event shape used by the MCP connection center's passive activity rows. */
 export type McpAccessLog = MemoryInjectionLog

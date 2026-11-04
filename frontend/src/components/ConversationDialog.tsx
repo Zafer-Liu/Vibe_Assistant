@@ -5,7 +5,7 @@ import type { MemoryConversationDetail } from '../types/memory'
 import { intlLocale } from '../i18n'
 
 export function sourceLabel(source: string) {
-  return ({ codex: 'Codex', claude: 'Claude Code', qoder: 'Qoder', workbuddy: 'WorkBuddy', minimax: 'MiniMax Code', kimi: 'Kimi', copilot: 'GitHub Copilot', zcode: 'ZCode', dsh: 'DeepSeek Harness' } as Record<string, string>)[source] ?? source
+  return ({ codex: 'Codex', claude: 'Claude Code', qoder: 'Qoder', workbuddy: 'WorkBuddy', minimax: 'MiniMax Code', kimi: 'Kimi', copilot: 'GitHub Copilot', zcode: 'ZCode', dsh: 'DeepSeek Harness', gemini: 'Gemini CLI', antigravity: 'Antigravity' } as Record<string, string>)[source] ?? source
 }
 
 export function displayTime(value: string) {

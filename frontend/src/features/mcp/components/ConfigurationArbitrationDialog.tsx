@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Loader2, RefreshCw, X } from 'lucide-react'
 import { mcpApi } from '../../../api/mcp'
+import { useMcpStore } from '../../../store/mcpStore'
 import type { McpArbitrationResult, McpComparisonSource, McpConfigurationComparison } from '../../../types/mcp'
 import { buildMcpComparisonRows } from '../configurationComparison'
 import { targetOf } from '../targets'
@@ -46,13 +47,15 @@ export function ConfigurationArbitrationDialog({ name, initialAgent, onClose, on
     }
   }, [])
 
-  const reload = useCallback(async () => {
+  const reload = useCallback(async (preserveSelection = false) => {
     const request = ++requestId.current
     setLoading(true)
     setError('')
     setComparison(null)
-    setWinner('')
-    setTargets(new Set())
+    if (!preserveSelection) {
+      setWinner('')
+      setTargets(new Set())
+    }
     setShowSensitive(false)
     setOutcome(null)
     try {
@@ -62,8 +65,13 @@ export function ConfigurationArbitrationDialog({ name, initialAgent, onClose, on
       const right = next.sources.find(source => source.agent === initialAgent)
         ?? next.sources.find(source => source.state === 'differs' && source.entry)
         ?? next.sources.find(source => source.entry) ?? next.sources[0]
-      setCompareAgent(right?.agent ?? '')
-      setLeftSource(next.catalog ? 'catalog' : next.sources.find(source => source.entry && !source.observed && source.agent !== right?.agent)?.agent ?? 'catalog')
+      if (!preserveSelection) {
+        setCompareAgent(right?.agent ?? '')
+        setLeftSource(next.catalog ? 'catalog' : next.sources.find(source => source.entry && !source.observed && source.agent !== right?.agent)?.agent ?? 'catalog')
+      } else {
+        setWinner(previous => previous === 'catalog' ? next.catalog ? previous : ''
+          : next.sources.some(source => source.agent === previous && source.entry && !source.observed) ? previous : '')
+      }
     } catch (reason) {
       if (mounted.current && request === requestId.current) setError(String(reason))
     } finally {
@@ -125,6 +133,32 @@ export function ConfigurationArbitrationDialog({ name, initialAgent, onClose, on
     }
   }
 
+  async function prepareArbitration() {
+    if (!comparison || submitting.current || loading) return
+    const observed = comparison.sources.filter(source => source.observed)
+    if (observed.length === 0) return
+    submitting.current = true
+    setBusy(true)
+    setError('')
+    const failures: string[] = []
+    try {
+      for (const source of observed) {
+        try {
+          const status = await useMcpStore.getState().setMcpObservation(name, source.agent, false)
+          if (status.state !== 'off') failures.push(`${agentLabel(source.agent)} · ${t('mcpLibrary.arbitration.prepareIncomplete')}`)
+        } catch (reason) {
+          failures.push(`${agentLabel(source.agent)} · ${String(reason)}`)
+        }
+      }
+      if (mounted.current) await reload(true)
+      await useMcpStore.getState().checkMcpStatuses().catch(() => {})
+      if (mounted.current && failures.length) setError(failures.join('\n'))
+    } finally {
+      submitting.current = false
+      if (mounted.current) setBusy(false)
+    }
+  }
+
   const cellValue = (value: string | undefined, sensitive: boolean) => value === undefined
     ? t('mcpLibrary.arbitration.absent') : value === '' ? t('mcpLibrary.arbitration.emptyValue')
       : sensitive && !showSensitive ? t('mcpLibrary.arbitration.hiddenValue') : value
@@ -151,13 +185,19 @@ export function ConfigurationArbitrationDialog({ name, initialAgent, onClose, on
         </div>
         <div className="min-h-0 space-y-5 overflow-y-auto p-5">
           {loading && <p role="status" className="flex items-center gap-2 text-sm"><Loader2 size={16} className="animate-spin motion-reduce:animate-none" />{t('mcpLibrary.checkingStatus')}</p>}
-          {error && <p role="alert" className="break-words text-sm leading-6 text-red-700 dark:text-red-300">{error}</p>}
+          {error && <p role="alert" className="whitespace-pre-line break-words text-sm leading-6 text-red-700 dark:text-red-300">{error}</p>}
           {outcome && <div role="alert" className="space-y-1 text-sm leading-6 text-amber-900 dark:text-amber-200">
             <p>{t('mcpLibrary.arbitration.partial', { updated: outcome.catalog_updated ? t('mcpLibrary.arbitration.catalogSaved') : t('mcpLibrary.arbitration.catalogKept'), count: outcome.applied_agents.length })}</p>
             <ul>{outcome.errors.map(issue => <li key={issue.agent}>{agentLabel(issue.agent)} · {issue.message}</li>)}</ul>
           </div>}
           {comparison && <>
-            {comparison.blocked_reason && <p role="status" className="text-sm leading-6 text-amber-900 dark:text-amber-200">{comparison.blocked_reason}</p>}
+            {comparison.blocked_reason && <div className="space-y-2 text-sm leading-6 text-amber-900 dark:text-amber-200">
+              <p role="status">{comparison.blocked_reason}</p>
+              <p>{t('mcpLibrary.arbitration.prepareHint')}</p>
+              <button type="button" disabled={busy || loading} onClick={() => { void prepareArbitration() }} className="rounded-md border border-amber-400 px-3 py-1.5 disabled:opacity-50 dark:border-amber-600">
+                {t('mcpLibrary.arbitration.prepare')}
+              </button>
+            </div>}
             <div className="flex flex-wrap items-center gap-x-5 gap-y-3 text-sm">
               <label className="flex min-w-0 flex-wrap items-center gap-2">{t('mcpLibrary.arbitration.leftSource')}
                 <select value={leftSource} disabled={busy} onChange={event => { setLeftSource(event.target.value); setWinner(''); setTargets(new Set()) }} className="max-w-full rounded-md border border-gray-300 bg-white px-3 py-2 dark:border-gray-600 dark:bg-gray-800">
@@ -181,10 +221,10 @@ export function ConfigurationArbitrationDialog({ name, initialAgent, onClose, on
                   <tr>
                     <th scope="col" className="w-1/4 px-4 py-3 font-medium">{t('mcpLibrary.arbitration.field')}</th>
                     <th scope="col" className="px-4 py-3 font-medium">
-                      <label className="flex items-center gap-2"><input type="radio" name="mcp-winner" checked={winner === leftSource} disabled={!leftVersion || leftAgent?.observed || busy || !!comparison.blocked_reason} onChange={() => setWinner(leftSource)} className="accent-violet-600" />{leftSource === 'catalog' ? t('mcpLibrary.arbitration.useCatalog') : t('mcpLibrary.arbitration.useAgent', { agent: agentLabel(leftSource) })}</label>
+                      <label className="flex items-center gap-2"><input type="radio" name="mcp-winner" checked={winner === leftSource} disabled={!leftVersion || leftAgent?.observed || busy} onChange={() => setWinner(leftSource)} className="accent-violet-600" />{leftSource === 'catalog' ? t('mcpLibrary.arbitration.useCatalog') : t('mcpLibrary.arbitration.useAgent', { agent: agentLabel(leftSource) })}</label>
                     </th>
                     <th scope="col" className="px-4 py-3 font-medium">
-                      <label className="flex items-center gap-2"><input type="radio" name="mcp-winner" checked={winner === compareAgent && winner !== ''} disabled={!viewedSource?.entry || viewedSource?.observed || busy || !!comparison.blocked_reason} onChange={() => setWinner(compareAgent)} className="accent-violet-600" />{t('mcpLibrary.arbitration.useAgent', { agent: agentLabel(compareAgent) })}</label>
+                      <label className="flex items-center gap-2"><input type="radio" name="mcp-winner" checked={winner === compareAgent && winner !== ''} disabled={!viewedSource?.entry || viewedSource?.observed || busy} onChange={() => setWinner(compareAgent)} className="accent-violet-600" />{t('mcpLibrary.arbitration.useAgent', { agent: agentLabel(compareAgent) })}</label>
                     </th>
                   </tr>
                 </thead>
@@ -198,14 +238,14 @@ export function ConfigurationArbitrationDialog({ name, initialAgent, onClose, on
                 </tbody>
               </table>
             </div>
-            <fieldset disabled={!selectedVersion || busy || !!comparison.blocked_reason} className="min-w-0 border-t border-gray-200 pt-3 dark:border-gray-700">
+            <fieldset disabled={!selectedVersion || busy} className="min-w-0 border-t border-gray-200 pt-3 dark:border-gray-700">
               <legend className="px-1 text-sm font-medium">{t('mcpLibrary.arbitration.syncTargets')}</legend>
               <p className="mb-3 text-sm leading-6 text-gray-600 dark:text-gray-300">{winner === 'catalog' ? t('mcpLibrary.arbitration.catalogScope') : t('mcpLibrary.arbitration.agentScope')}</p>
               <button type="button" disabled={!selectedVersion} onClick={() => setTargets(new Set(comparison.sources.filter(source => canSync(source) && buildMcpComparisonRows(selectedVersion ?? null, source.entry).some(row => row.changed)).map(source => source.agent)))} className="mb-3 rounded-md border border-gray-300 px-3 py-1.5 text-sm disabled:opacity-50 dark:border-gray-600">{t('mcpLibrary.arbitration.selectDifferent')}</button>
               <div className="grid gap-2 sm:grid-cols-2">
                 {comparison.sources.map(source => <label key={source.agent} className={`flex items-start gap-2 text-sm leading-6 ${canSync(source) ? '' : 'text-gray-500 dark:text-gray-400'}`}>
                   <input type="checkbox" checked={effectiveTargets.includes(source.agent)} disabled={!canSync(source)} onChange={() => toggleTarget(source.agent)} className="mt-1 accent-violet-600" />
-                  <span className="min-w-0 break-words">{agentLabel(source.agent)} · {source.agent === winner ? t('mcpLibrary.arbitration.chosenSource') : selectedVersion && (selectedVersion.transport || 'stdio') !== 'stdio' && !targetOf(source.agent)?.remote ? t('mcpLibrary.remoteUnsupported') : stateLabel(source.state)}</span>
+                  <span className="min-w-0 break-words">{agentLabel(source.agent)} · {source.agent === winner ? t('mcpLibrary.arbitration.chosenSource') : source.observed ? t('mcpLibrary.arbitration.observationMustClose') : selectedVersion && (selectedVersion.transport || 'stdio') !== 'stdio' && !targetOf(source.agent)?.remote ? t('mcpLibrary.remoteUnsupported') : stateLabel(source.state)}</span>
                 </label>)}
               </div>
             </fieldset>

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// 全部受支持的会话/Token 来源。
-pub const AGENT_SOURCE_IDS: [&str; 9] = [
+pub const AGENT_SOURCE_IDS: [&str; 11] = [
     "codex",
     "claude",
     "qoder",
@@ -20,6 +20,8 @@ pub const AGENT_SOURCE_IDS: [&str; 9] = [
     "copilot",
     "zcode",
     "dsh",
+    "gemini",
+    "antigravity",
 ];
 
 pub fn is_supported_source(id: &str) -> bool {
@@ -39,6 +41,8 @@ pub fn agent_label(id: &str) -> &'static str {
         "zcode" => "ZCode",
         // DeepSeek Harness：数据根目录 ~/.dsh（$DSH_HOME 可覆盖）。
         "dsh" => "DeepSeek Harness",
+        "gemini" => "Gemini CLI",
+        "antigravity" => "Antigravity",
         _ => "Agent",
     }
 }
@@ -47,7 +51,10 @@ pub fn agent_label(id: &str) -> &'static str {
 /// 命令 Hook 入口，会话监听依靠本地转录扫描。DSH 通过 cordis pre-step
 /// 插件承载等价注入（见 dsh_injection），对上层暴露与 Hook 相同的安装面。
 pub fn supports_hooks(id: &str) -> bool {
-    matches!(id, "codex" | "claude" | "qoder" | "workbuddy" | "dsh")
+    matches!(
+        id,
+        "codex" | "claude" | "qoder" | "workbuddy" | "dsh" | "gemini" | "antigravity"
+    )
 }
 
 // ── 跨设备路径覆盖 ────────────────────────────────────────────────────────────
@@ -265,6 +272,12 @@ fn default_transcript_roots(id: &str) -> Vec<PathBuf> {
         "dsh" => dsh_home()
             .map(|dsh| vec![dsh.join("sessions")])
             .unwrap_or_default(),
+        "gemini" => vec![home.join(".gemini").join("tmp")],
+        "antigravity" => vec![
+            home.join(".gemini").join("antigravity"),
+            home.join(".gemini").join("antigravity-cli"),
+            home.join(".gemini").join("antigravity-ide"),
+        ],
         _ => Vec::new(),
     }
 }
@@ -277,6 +290,8 @@ fn default_config_home(id: &str) -> Option<PathBuf> {
         "copilot" => home().map(|home| home.join(".copilot")),
         "zcode" => home().map(|home| home.join(".zcode")),
         "dsh" => dsh_home(),
+        "gemini" => home().map(|home| home.join(".gemini")),
+        "antigravity" => home().map(|home| home.join(".gemini").join("config")),
         _ => None,
     }
 }
@@ -319,6 +334,8 @@ pub fn mcp_config_path(id: &str) -> Option<PathBuf> {
         // DeepSeek Harness 的 MCP 走 desktop profile 的 cordis patch 层
         // （YAML，非 JSON）；路径供界面展示与状态定位，读写见 dsh_mcp。
         "dsh" => crate::dsh_mcp::patch_path(),
+        "gemini" => config_home(id).map(|home| home.join("settings.json")),
+        "antigravity" => config_home(id).map(|home| home.join("mcp_config.json")),
         _ => None,
     }
 }
@@ -327,6 +344,11 @@ pub fn mcp_config_path(id: &str) -> Option<PathBuf> {
 
 /// 该 Agent 的配置主目录，补齐 default_config_home 未覆盖的 codex/claude/workbuddy。
 fn resolved_config_home(id: &str) -> Option<PathBuf> {
+    // Antigravity 例外：其 config_home 指向 ~/.gemini/config（只放 MCP/hooks
+    // 配置），Skill 的用户层仍在 ~/.gemini/skills，不随 config 目录走。
+    if id == "antigravity" {
+        return home().map(|home| home.join(".gemini"));
+    }
     if let Some(home) = config_home(id) {
         return Some(home);
     }
@@ -343,6 +365,7 @@ fn resolved_config_home(id: &str) -> Option<PathBuf> {
         "zcode" => home.join(".zcode"),
         // dsh 的 default_config_home 已覆盖；此处兜底默认 ~/.dsh。
         "dsh" => dsh_home().unwrap_or_else(|| home.join(".dsh")),
+        "gemini" | "antigravity" => home.join(".gemini"),
         _ => return None,
     })
 }
@@ -371,6 +394,20 @@ pub fn skill_scan_roots(id: &str) -> Vec<PathBuf> {
             let mut roots = vec![home.join("skills")];
             if let Some(agents) = dsh_agents_home() {
                 let shared = agents.join("skills");
+                if shared != home.join("skills") {
+                    roots.push(shared);
+                }
+            }
+            roots
+        }
+        "gemini" | "antigravity" => {
+            // Gemini CLI 与 Antigravity 的用户 Skill 同构（<name>/SKILL.md）：
+            // ~/.gemini/skills 与共享别名 ~/.agents/skills 两个根都可能存在技能。
+            // 注意：此处的局部 `home`（PathBuf）遮蔽了模块级 home() 函数，
+            // 取用户主目录须直接用 dirs_next::home_dir()。
+            let mut roots = vec![home.join("skills")];
+            if let Some(user_home) = dirs_next::home_dir() {
+                let shared = user_home.join(".agents").join("skills");
                 if shared != home.join("skills") {
                     roots.push(shared);
                 }
@@ -456,6 +493,28 @@ pub fn session_id_for_path(source: &str, path: &Path) -> Option<String> {
                     .map(str::to_string);
             }
             None
+        }
+        "gemini" => {
+            // Gemini CLI session: session-<timestamp>-<shortId>.jsonl or <safeSessionId>.jsonl
+            if stem.starts_with("session-") {
+                if let Some(short_id) = stem.rsplit('-').next() {
+                    if !short_id.is_empty() {
+                        return Some(short_id.to_string());
+                    }
+                }
+            }
+            (!stem.is_empty()).then_some(stem.to_string())
+        }
+        "antigravity" => {
+            // Antigravity sessions: <workspace>/.gemini/antigravity/transcript.jsonl
+            if stem == "transcript" {
+                if let Some(ws_dir) = path.parent().and_then(Path::parent).and_then(Path::parent) {
+                    if let Some(name) = ws_dir.file_name().and_then(|n| n.to_str()) {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+            (!stem.is_empty()).then_some(stem.to_string())
         }
         _ => (!stem.is_empty()).then_some(stem.to_string()),
     }
@@ -634,5 +693,17 @@ mod tests {
         )
         .is_none());
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn gemini_session_id_extracts_short_id() {
+        let path = Path::new("C:/Users/test/.gemini/tmp/worker-2/chats/session-2026-11-03T19-04-a1b2c3d4.jsonl");
+        assert_eq!(session_id_for_path("gemini", path).as_deref(), Some("a1b2c3d4"));
+    }
+
+    #[test]
+    fn antigravity_session_id_extracts_from_workspace_or_stem() {
+        let path = Path::new("F:/Projects/my-app/.gemini/antigravity/transcript.jsonl");
+        assert_eq!(session_id_for_path("antigravity", path).as_deref(), Some("my-app"));
     }
 }

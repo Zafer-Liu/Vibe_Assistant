@@ -40,7 +40,7 @@ fn run() -> Result<i32, String> {
         _ => return Err("expected --mcp-relay UUID or --mcp-memory".into()),
     };
     let launch = resolver::resolve_fallback(&id)
-        .map_err(|_| "unable to resolve MCP assignment".to_string())?;
+        .map_err(|reason| format!("unable to resolve MCP assignment: {reason}"))?;
     let mut child = match start_relay(&launch) {
         Ok(child) => child,
         Err(StartupFailure::BeforeGo) => return run_original(&launch),
@@ -160,12 +160,19 @@ fn default_stderr_tail() -> Arc<Mutex<Vec<u8>>> {
     Arc::new(Mutex::new(Vec::new()))
 }
 
-/// Last non-empty stderr line of the upstream server, if the launcher started it.
-fn stderr_excerpt(tail: &Arc<Mutex<Vec<u8>>>) -> Option<String> {
+/// Classify upstream stderr without exposing commands, credentials or payloads.
+fn stderr_classification(tail: &Arc<Mutex<Vec<u8>>>) -> Option<&'static str> {
     let tail = tail.lock().ok()?;
     let text = String::from_utf8_lossy(&tail);
     let last = text.lines().rev().map(str::trim).find(|line| !line.is_empty())?;
-    Some(last.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect())
+    let last = last.to_ascii_lowercase();
+    Some(if last.contains("daemon stopped") || last.contains("daemon_stopped") {
+        "stderr: daemon_stopped"
+    } else if last.contains("fetch failed") {
+        "stderr: fetch failed"
+    } else {
+        "stderr captured"
+    })
 }
 
 fn relay_io(child: &mut Child, mut heartbeat: Option<&mut FallbackHeartbeat>, stderr_tail: &Arc<Mutex<Vec<u8>>>) -> Result<i32, String> {
@@ -236,7 +243,7 @@ fn relay_io(child: &mut Child, mut heartbeat: Option<&mut FallbackHeartbeat>, st
         if !succeeded { failed = true; }
     }
     if failed {
-        return Err(match stderr_excerpt(stderr_tail) {
+        return Err(match stderr_classification(stderr_tail) {
             Some(excerpt) => format!("MCP server connection ended unexpectedly: {excerpt}"),
             None => "MCP server connection ended unexpectedly".into(),
         });
@@ -406,4 +413,22 @@ fn original_command(program: &str, args: &[String]) -> Result<Command, String> {
     let mut command = Command::new(program);
     command.args(args);
     Ok(command)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_diagnostics_never_expose_stderr_values() {
+        for (text, expected) in [
+            ("api-key=private-credential", Some("stderr captured")),
+            ("daemon stopped; token=private-credential", Some("stderr: daemon_stopped")),
+            ("fetch failed: https://private/token", Some("stderr: fetch failed")),
+            ("  ", None),
+        ] {
+            let tail = Arc::new(Mutex::new(text.as_bytes().to_vec()));
+            assert_eq!(stderr_classification(&tail), expected);
+        }
+    }
 }

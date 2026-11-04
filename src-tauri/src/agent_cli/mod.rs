@@ -36,6 +36,11 @@ pub(crate) const AGENT_CLI_CANDIDATES: &[AgentCliCandidate] = &[
         command: "gemini",
     },
     AgentCliCandidate {
+        id: "antigravity",
+        name: "Antigravity CLI",
+        command: "agy",
+    },
+    AgentCliCandidate {
         id: "qodercli",
         name: "Qoder CLI",
         command: "qodercli",

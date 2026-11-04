@@ -31,6 +31,10 @@ interface MemoryStore {
   workbuddyHookStatus: HookStatus | null
   /** DeepSeek Harness 注入插件状态（pre-step 注入，语义同 Hook） */
   dshHookStatus: HookStatus | null
+  /** Gemini CLI Hook 安装状态（SessionStart / BeforeAgent） */
+  geminiHookStatus: HookStatus | null
+  /** Antigravity Hook 安装状态（SessionStart / PreInvocation） */
+  antigravityHookStatus: HookStatus | null
   /** 沉淀管道状态 */
   ingestStatus: IngestStatus | null
   memoryInjectionLogs: MemoryInjectionLog[]
@@ -53,8 +57,8 @@ interface MemoryStore {
   startEngine: () => Promise<boolean>
   stopEngine: () => Promise<void>
   checkIngest: () => Promise<void>
-  installHook: (agentType?: 'claude' | 'qoder' | 'codex' | 'workbuddy' | 'dsh') => Promise<void>
-  uninstallHook: (agentType?: 'claude' | 'qoder' | 'codex' | 'workbuddy' | 'dsh') => Promise<void>
+  installHook: (agentType?: 'claude' | 'qoder' | 'codex' | 'workbuddy' | 'dsh' | 'gemini' | 'antigravity') => Promise<void>
+  uninstallHook: (agentType?: 'claude' | 'qoder' | 'codex' | 'workbuddy' | 'dsh' | 'gemini' | 'antigravity') => Promise<void>
   setIngestEnabled: (on: boolean) => Promise<void>
   flushIngestQueue: () => Promise<number>
   organizeConversations: () => Promise<OrganizeConversationsResult>
@@ -110,6 +114,8 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
   workbuddyHookStatus: null,
 
   dshHookStatus: null,
+  geminiHookStatus: null,
+  antigravityHookStatus: null,
 
   ingestStatus: null,
 
@@ -147,20 +153,22 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
 
   async checkIngest() {
     try {
-      const [hook, qoderHook, codexHook, workbuddyHook, dshHook, ingest] = await Promise.all([
+      const [hook, qoderHook, codexHook, workbuddyHook, dshHook, geminiHook, antigravityHook, ingest] = await Promise.all([
         invoke<HookStatus>('memory_hook_status', { agentType: 'claude' }),
         invoke<HookStatus>('memory_hook_status', { agentType: 'qoder' }),
         invoke<HookStatus>('memory_hook_status', { agentType: 'codex' }),
         invoke<HookStatus>('memory_hook_status', { agentType: 'workbuddy' }),
         invoke<HookStatus>('memory_hook_status', { agentType: 'dsh' }),
+        invoke<HookStatus>('memory_hook_status', { agentType: 'gemini' }),
+        invoke<HookStatus>('memory_hook_status', { agentType: 'antigravity' }),
         invoke<IngestStatus>('memory_ingest_status'),
       ])
       // 数据未变化时返回同一 state 引用，zustand 不通知订阅者 →
       // 空闲轮询零重渲染。
       set((state) => (
-        jsonEqual(state.hookStatus, hook) && jsonEqual(state.qoderHookStatus, qoderHook) && jsonEqual(state.codexHookStatus, codexHook) && jsonEqual(state.workbuddyHookStatus, workbuddyHook) && jsonEqual(state.dshHookStatus, dshHook) && jsonEqual(state.ingestStatus, ingest)
+        jsonEqual(state.hookStatus, hook) && jsonEqual(state.qoderHookStatus, qoderHook) && jsonEqual(state.codexHookStatus, codexHook) && jsonEqual(state.workbuddyHookStatus, workbuddyHook) && jsonEqual(state.dshHookStatus, dshHook) && jsonEqual(state.geminiHookStatus, geminiHook) && jsonEqual(state.antigravityHookStatus, antigravityHook) && jsonEqual(state.ingestStatus, ingest)
           ? state
-          : { hookStatus: hook, qoderHookStatus: qoderHook, codexHookStatus: codexHook, workbuddyHookStatus: workbuddyHook, dshHookStatus: dshHook, ingestStatus: ingest }
+          : { hookStatus: hook, qoderHookStatus: qoderHook, codexHookStatus: codexHook, workbuddyHookStatus: workbuddyHook, dshHookStatus: dshHook, geminiHookStatus: geminiHook, antigravityHookStatus: antigravityHook, ingestStatus: ingest }
       ))
     } catch {
       /* 浏览器预览下无 Tauri 后端，忽略 */
@@ -387,10 +395,11 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
     if (!force && get().memoryCacheReady) return
     set({ loading: true })
     try {
-      const [extracted, stats, domains] = await Promise.allSettled([
-        invoke<MemoryItem[]>('local_memory_list', { limit: 200 }),
+      const [extracted, stats, domains, domainLinks] = await Promise.allSettled([
+        invoke<MemoryItem[]>('local_memory_list_all'),
         invoke<LocalMemoryStats>('local_memory_stats'),
         invoke<MemoryDomainItem[]>('memory_domain_list'),
+        invoke<Record<string, string[]>>('memory_domain_links_map'),
       ])
       if (extracted.status === 'rejected') throw extracted.reason
       const localMemories = extracted.status === 'fulfilled'
@@ -400,14 +409,15 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
       for (const domain of domains.status === 'fulfilled' ? domains.value : []) {
         domainIndex.set(domain.id, domain)
       }
+      const linksByMemory = domainLinks.status === 'fulfilled' ? domainLinks.value : {}
       // SQLite L1 is authoritative. The optional sidecar may temporarily
       // retain old embeddings after a deliberate rebuild, so it is used for
       // retrieval only and never rendered as an independent memory inventory.
-      const memories = await Promise.all(localMemories.map(async (memory) => {
+      const memories = localMemories.map((memory) => {
         if (memory.user_defined) return { ...memory, domains: [] as MemoryDomainItem[] }
-        const assignments = await invoke<Array<{ domain_id: string }>>('memory_domain_links', { memoryId: memory.id })
-        return { ...memory, domains: assignments.map((assignment) => domainIndex.get(assignment.domain_id)).filter(Boolean) as MemoryDomainItem[] }
-      }))
+        const ids = linksByMemory[memory.id] ?? []
+        return { ...memory, domains: ids.map((id) => domainIndex.get(id)).filter(Boolean) as MemoryDomainItem[] }
+      })
       const records = await invoke<MemoryImportance[]>('memory_importance_list', { memoryIds: memories.map((memory) => memory.id) })
       set({
         memories,
