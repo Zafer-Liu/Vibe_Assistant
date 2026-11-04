@@ -3937,9 +3937,10 @@ mod tests {
     use super::{
         filter_l3_profile, has_l2_final_heading, hook_inject_command, hook_prompt_command,
         is_l2_analysis_preamble, is_usable_l3_profile, normalize_l2_document,
-        output_language_directive, parse_typed_l1_candidates, read_claude_session,
-        read_claude_turn, read_codex_session, read_codex_turn, read_qoder_session,
-        read_workbuddy_session, select_l2_evidence, strip_memory_thinking,
+        output_language_directive, parse_typed_l1_candidates, read_antigravity_session,
+        read_claude_session, read_claude_turn, read_codex_session, read_codex_turn,
+        read_gemini_session, read_qoder_session, read_workbuddy_session,
+        select_l2_evidence, strip_memory_thinking,
         unwrap_markdown_document_fence,
     };
 
