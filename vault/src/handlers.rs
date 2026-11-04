@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -9,8 +9,6 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::store::{self, CasError, SharedStore};
-
-const MAX_PAYLOAD: usize = 256 * 1024;
 
 #[derive(Deserialize)]
 pub struct PutBody {
@@ -71,7 +69,13 @@ struct SinceQuery {
 pub fn router(store: SharedStore) -> Router {
     Router::new()
         .route("/objects", get(list_objects))
-        .route("/objects/:key", get(get_object).put(put_object).delete(delete_object))
+        .route(
+            "/objects/:key",
+            get(get_object)
+                .put(put_object)
+                .delete(delete_object)
+                .layer(DefaultBodyLimit::disable()),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             store.clone(),
             auth,
@@ -138,16 +142,10 @@ async fn put_object(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if body.len() > 1024 * 1024 {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response();
-    }
     let parsed: PutBody = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("bad body: {e}")).into_response(),
     };
-    if parsed.payload.len() > MAX_PAYLOAD {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "payload exceeds 256KB").into_response();
-    }
     if key.is_empty() || key.len() > 256 {
         return (StatusCode::BAD_REQUEST, "invalid key").into_response();
     }
@@ -202,5 +200,48 @@ async fn delete_object(
             StatusCode::CONFLICT,
             Json(json!({ "error": "revision conflict", "current_revision": current_revision })),
         ).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn large_object_passes_router_and_payload_validation() {
+        let store = Arc::new(store::open(":memory:").unwrap());
+        let _ = store::bootstrap_tokens(&store, Some("size-limit-test-token"));
+        let payload = "A".repeat(3 * 1024 * 1024);
+        let body = json!({
+            "content_hash": "large-payload-hash",
+            "payload": &payload,
+            "updated_at": "2026-11-04T00:00:00Z",
+            "device_id": "test-device",
+        }).to_string();
+        assert!(body.len() > 2 * 1024 * 1024);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = router(store.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let response = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let headers = format!(
+                "PUT /objects/large HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer size-limit-test-token\r\nIf-Match: 0\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len(),
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(body.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            response
+        }).await.expect("large object request timed out");
+        server.abort();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+        let stored = store::get_object(&store, "large").unwrap();
+        assert_eq!(stored.payload, payload, "payload must not be truncated");
     }
 }

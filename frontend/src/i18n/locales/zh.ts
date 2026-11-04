@@ -1781,7 +1781,7 @@ const zh = {
     sectionBackupHint: '导出配置、记忆中心和技能库到 ZIP 文件，用于跨设备迁移。',
    cloudVault: {
      title: '云端记忆库',
-     hint: '跨设备同步 L2/L3 已发布记忆、用户自定义 L1 与 Token 用量统计。端到端加密，服务端只存密文。',
+     hint: '跨设备同步已发布的 L2/L3、自定义 L1 和用量统计；WebDAV/S3 还同步全部提取的 L1（含“仅本会话”），保留原标签。端到端加密。',
      loading: '加载中…',
      target: '同步目标',
      kindServer: '自建服务端',

@@ -1783,7 +1783,7 @@ const en: TranslationSchema = {
     sectionBackupHint: 'Export configs, Memory Center, and Skill library to a ZIP file for cross-device migration.',
    cloudVault: {
      title: 'Cloud Memory Vault',
-     hint: 'Sync published L2/L3 memories, user-defined L1, and token usage stats across devices. End-to-end encrypted; the server only stores ciphertext.',
+     hint: 'Sync published L2/L3, user-defined L1 and usage stats. WebDAV/S3 also syncs all extracted L1, including session-only records, with original scope labels. End-to-end encrypted.',
      loading: 'Loading…',
      target: 'Sync target',
      kindServer: 'Self-hosted server',

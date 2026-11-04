@@ -14,6 +14,8 @@ Agent Manager 云端记忆库的独立同步服务（设计见 `../docs/16-cloud
 
 认证：`Authorization: Bearer <PAT>`；可选 `X-Device-Id` 头用于设备活跃统计。
 
+同步对象的载荷和上传请求体不设置应用内固定大小上限；仍校验身份、对象 key 和 CAS 修订号。部署在反向代理或托管平台后时，外层服务自身的容量限制仍然适用。
+
 ## 首次启动
 
 tokens 表为空时自动生成一个 PAT 打印到 stdout（仅此一次）；也可用环境变量 `VAULT_TOKENS=tok1,tok2` 预置多个。

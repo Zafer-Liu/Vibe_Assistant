@@ -2390,12 +2390,10 @@ impl TelemetryStore {
         Ok(deleted > 0)
     }
 
-    /// 云端记忆库：本机跨会话（短期 + 长期）的自动提取记忆，供
-    /// `l1-auto-agg:{device}` 聚合打包。仅含本机提取的行
-    /// （`origin_device IS NULL`）——从其他设备镜像来的行绝不能回传，
-    /// 否则 A 的记忆会经 B 的聚合二次广播，信封与对端镜像无限膨胀。
-    /// 「仅本会话」作用域绑定产生它的会话，不跨设备。
-    pub fn cross_session_extracted_l1_memories(
+    /// 云端记忆库：导出本机全部自动提取记忆，保留原始作用域标签。
+    /// `l1-auto-agg:{device}` 包含 session / short_term / long_term，
+    /// 仅按来源排除其他设备的镜像，避免同一批数据在设备间重复广播。
+    pub fn exportable_extracted_l1_memories(
         &self,
     ) -> Result<Vec<LocalMemorySnapshot>, String> {
         let conn = self
@@ -2407,7 +2405,6 @@ impl TelemetryStore {
                 "SELECT id, source_event_key, ordinal, memory, memory_type, durability, source, session_id, user_defined, event_time, created_at, updated_at
                    FROM local_memory_items
                   WHERE user_defined = 0
-                    AND lower(durability) IN ('short_term', 'long_term')
                     AND origin_device IS NULL
                   ORDER BY id",
             )

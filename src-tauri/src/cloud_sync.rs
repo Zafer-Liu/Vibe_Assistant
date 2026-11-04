@@ -832,12 +832,6 @@ fn push_usage(
             return;
         }
     };
-    if blob.len() > 250 * 1024 {
-        report
-            .errors
-            .push(format!("{key}: 统计超过 250KB 上限，已跳过"));
-        return;
-    }
     let body = PutBody {
         content_hash: &local_hash,
         payload: b64_encode(&blob),
@@ -1754,81 +1748,68 @@ fn build_envelope(
         .usage_day_aggregates()
         .map_err(|e| format!("{usage_key}: 统计读取失败 {e}"))?;
     let plain = serde_json::to_vec(&rows).map_err(|e| format!("{usage_key}: 序列化失败 {e}"))?;
-    if plain.len() > 250 * 1024 {
-        report
-            .errors
-            .push(format!("{usage_key}: 统计超过 250KB 上限，已跳过"));
-    } else {
-        let local_hash = sha256_hex(&plain);
-        let remote_hash = objects.get(&usage_key).map(|obj| obj.content_hash.clone());
-        // 单写者：与远端不同就整体重推，不需要 CAS 水位。
-        if remote_hash.as_deref() != Some(local_hash.as_str()) {
-            let sealed = b64_encode(&vault_encrypt(vault_key_bytes, &plain)?);
-            revision += 1;
-            objects.insert(
-                usage_key.clone(),
-                RemoteObject {
-                    key: usage_key.clone(),
-                    revision,
-                    content_hash: local_hash.clone(),
-                    payload: sealed,
-                    updated_at: now.clone(),
-                    device_id: device.to_string(),
-                },
-            );
-            pending.push(PendingWrite::Meta {
-                key: usage_key,
+    let local_hash = sha256_hex(&plain);
+    let remote_hash = objects.get(&usage_key).map(|obj| obj.content_hash.clone());
+    // 单写者：与远端不同就完整重推，不按聚合大小跳过。
+    if remote_hash.as_deref() != Some(local_hash.as_str()) {
+        let sealed = b64_encode(&vault_encrypt(vault_key_bytes, &plain)?);
+        revision += 1;
+        objects.insert(
+            usage_key.clone(),
+            RemoteObject {
+                key: usage_key.clone(),
                 revision,
-                hash: Some(local_hash),
-                state: "clean",
-            });
-            report.pushed += 1;
-        }
+                content_hash: local_hash.clone(),
+                payload: sealed,
+                updated_at: now.clone(),
+                device_id: device.to_string(),
+            },
+        );
+        pending.push(PendingWrite::Meta {
+            key: usage_key,
+            revision,
+            hash: Some(local_hash),
+            state: "clean",
+        });
+        report.pushed += 1;
     }
 
-    // 跨会话提取记忆：每台设备只写自己的聚合 `l1-auto-agg:{device}`，对端
-    // 只读镜像（见 sync_peer_extracted_l1）。与 usage-agg 同一套单写者语义：
-    // 内容哈希变了才整体重推，不做逐条 CAS；「仅本会话」作用域不跨设备。
+    // 全部提取记忆（含 session）：每台设备只写自己的聚合，保留原作用域。
+    // 其他设备镜像不重复上报。升级后的完整集合改变内容哈希，使旧镜像自动补齐。
     let agg_key = format!("l1-auto-agg:{}", device.replace(':', "-"));
     let extracted = store
-        .cross_session_extracted_l1_memories()
-        .map_err(|e| format!("{agg_key}: 读取跨会话提取记忆失败 {e}"))?;
+        .exportable_extracted_l1_memories()
+        .map_err(|e| format!("{agg_key}: 读取提取记忆失败 {e}"))?;
     let agg_plain =
         serde_json::to_vec(&extracted).map_err(|e| format!("{agg_key}: 序列化失败 {e}"))?;
-    if agg_plain.len() > 4 * 1024 * 1024 {
-        report.errors.push(format!(
-            "{agg_key}: 跨会话提取记忆聚合超过 4MB 上限（{} 字节），本轮已跳过；请整理记忆后重试",
-            agg_plain.len()
-        ));
-    } else {
-        let local_hash = sha256_hex(&agg_plain);
-        let remote_hash = objects.get(&agg_key).map(|obj| obj.content_hash.clone());
-        // 空聚合不凭空创建对象（没有提取记忆的设备保持信封干净）；但远端
-        // 已有本设备的聚合时必须推空版本，让对端把镜像修剪干净。
-        if !extracted.is_empty() || remote_hash.is_some() {
-            if remote_hash.as_deref() != Some(local_hash.as_str()) {
-                let sealed = b64_encode(&vault_encrypt(vault_key_bytes, &agg_plain)?);
-                revision += 1;
-                objects.insert(
-                    agg_key.clone(),
-                    RemoteObject {
-                        key: agg_key.clone(),
-                        revision,
-                        content_hash: local_hash.clone(),
-                        payload: sealed,
-                        updated_at: now.clone(),
-                        device_id: device.to_string(),
-                    },
-                );
-                pending.push(PendingWrite::Meta {
-                    key: agg_key,
-                    revision,
-                    hash: Some(local_hash),
-                    state: "clean",
-                });
-                report.pushed += 1;
-            }
-        }
+    // 移除旧的本地 4MiB 跳过阈值，避免完整 L1 集合一直停留在旧版本。
+    // 网络写入失败时仍不提交本地同步水位。
+    let local_hash = sha256_hex(&agg_plain);
+    let remote_hash = objects.get(&agg_key).map(|obj| obj.content_hash.clone());
+    // 空聚合不凭空创建对象；远端已有本机聚合时，空版本仍要传播删除。
+    if (!extracted.is_empty() || remote_hash.is_some())
+        && remote_hash.as_deref() != Some(local_hash.as_str())
+    {
+        let sealed = b64_encode(&vault_encrypt(vault_key_bytes, &agg_plain)?);
+        revision += 1;
+        objects.insert(
+            agg_key.clone(),
+            RemoteObject {
+                key: agg_key.clone(),
+                revision,
+                content_hash: local_hash.clone(),
+                payload: sealed,
+                updated_at: now.clone(),
+                device_id: device.to_string(),
+            },
+        );
+        pending.push(PendingWrite::Meta {
+            key: agg_key,
+            revision,
+            hash: Some(local_hash),
+            state: "clean",
+        });
+        report.pushed += 1;
     }
 
     let objects: Vec<RemoteObject> = objects.into_values().collect();
@@ -2984,9 +2965,8 @@ mod tests {
         assert!(object(&envelope, "l1-user:beta").is_some(), "B 的记忆应已在远端");
     }
 
-    /// 跨会话提取记忆按设备聚合同步：短期/长期到对端落为只读镜像，
-    /// 「仅本会话」不跨设备；撞 id 的本地行不被镜像覆盖；B 的聚合
-    /// 只含 B 自己的提取（对端镜像不二次广播）。
+    /// 全部提取记忆按设备聚合同步，session 标签原样保留；
+    /// 撞 id 的本地行不被覆盖，对端镜像不二次广播。
     #[test]
     fn extracted_memories_sync_as_per_device_mirror() {
         let server = fake_dav::Server::start();
@@ -3009,7 +2989,7 @@ mod tests {
                 .into_iter()
                 .map(|(id, memory, origin)| (id, (memory, origin)))
                 .collect();
-        // a1 撞 id 不镜像、a3 仅本会话不同步 → B 只有 a2 这一条镜像。
+        // a1 撞 id 不镜像，a2/a3 都应落为来自 A 的镜像。
         assert_eq!(
             by_id.get("local-l1:a1"),
             Some(&("B 自己的同 id 记忆".to_string(), None)),
@@ -3020,12 +3000,98 @@ mod tests {
             Some(&("A 的长期记忆".to_string(), Some(a_device.clone()))),
             "跨会话条目应落成 A 的只读镜像：{by_id:?}"
         );
-        assert!(!by_id.contains_key("local-l1:a3"), "仅本会话不得跨设备");
+        assert_eq!(
+            by_id.get("local-l1:a3"),
+            Some(&("A 的仅本会话".to_string(), Some(a_device.clone()))),
+            "session 记忆也应同步：{by_id:?}"
+        );
+        let conn = b.conn.lock().unwrap();
+        let durability: String = conn
+            .query_row("SELECT durability FROM local_memory_items WHERE id = 'local-l1:a3'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(durability, "session", "同步不得升级记忆的作用域");
+        drop(conn);
 
-        // B 推送的聚合只含自己的 a1；A 的聚合仍含 a1/a2 两条。
+        // B 推送的聚合只含自己的 a1；A 的聚合包含全部三种作用域。
         let envelope = remote_envelope(&server);
         assert_eq!(agg_entries(&envelope, &agg_key_of(&b)), vec!["local-l1:a1".to_string()]);
-        assert_eq!(agg_entries(&envelope, &agg_key_of(&a)).len(), 2);
+        assert_eq!(agg_entries(&envelope, &agg_key_of(&a)).len(), 3);
+    }
+
+    #[test]
+    fn full_l1_sync_backfills_a_legacy_cross_session_aggregate() {
+        let server = fake_dav::Server::start();
+        let a = paired(&server.url);
+        let b = paired(&server.url);
+        add_extracted(&a, "local-l1:shared", "已同步的短期记忆", "short_term");
+        add_extracted(&a, "local-l1:session", "旧版漏掉的会话摘要", "session");
+
+        // 模拟旧客户端写入的聚合：来源设备已经有 session，但远端只含短期/长期。
+        let legacy_rows: Vec<_> = a
+            .exportable_extracted_l1_memories()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.durability != "session")
+            .collect();
+        let plain = serde_json::to_vec(&legacy_rows).unwrap();
+        let legacy = VaultEnvelope {
+            format: ENVELOPE_FORMAT,
+            revision: 1,
+            objects: vec![RemoteObject {
+                key: agg_key_of(&a),
+                revision: 1,
+                content_hash: sha256_hex(&plain),
+                payload: b64_encode(&vault_encrypt(&key(), &plain).unwrap()),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                device_id: device_id(&a),
+            }],
+            tombstones: Vec::new(),
+        };
+        assert!(matches!(
+            open_remote(&server.url).put(&encode_envelope(&key(), &legacy).unwrap(), None).unwrap(),
+            PutOutcome::Written(_)
+        ));
+        let old_pull = run_sync(&b).unwrap();
+        assert!(old_pull.errors.is_empty(), "{:?}", old_pull.errors);
+        assert_eq!(extracted_inventory(&b).len(), 1);
+
+        let upgraded_push = run_sync(&a).unwrap();
+        assert!(upgraded_push.errors.is_empty(), "{:?}", upgraded_push.errors);
+        let backfill = run_sync(&b).unwrap();
+        assert!(backfill.errors.is_empty(), "{:?}", backfill.errors);
+        assert_eq!(extracted_inventory(&b).len(), 2, "旧水位不能阻止 session 补齐");
+        assert_eq!(agg_entries(&remote_envelope(&server), &agg_key_of(&a)).len(), 2);
+    }
+
+    #[test]
+    fn full_l1_aggregate_over_four_mib_syncs_without_truncation() {
+        let server = fake_dav::Server::start();
+        let a = paired(&server.url);
+        let b = paired(&server.url);
+        let content = "x".repeat(768);
+        for index in 0..6001 {
+            add_extracted(&a, &format!("local-l1:bulk-{index:05}"), &content, "session");
+        }
+        let rows = a.exportable_extracted_l1_memories().unwrap();
+        assert_eq!(rows.len(), 6001);
+        assert!(serde_json::to_vec(&rows).unwrap().len() > 4 * 1024 * 1024);
+        drop(rows);
+
+        let uploaded = run_sync(&a).unwrap();
+        assert!(uploaded.errors.is_empty(), "{:?}", uploaded.errors);
+        assert_eq!(agg_entries(&remote_envelope(&server), &agg_key_of(&a)).len(), 6001);
+        let downloaded = run_sync(&b).unwrap();
+        assert!(downloaded.errors.is_empty(), "{:?}", downloaded.errors);
+        assert_eq!(extracted_inventory(&b).len(), 6001);
+        let count: i64 = b.conn.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM local_memory_items WHERE durability = 'session' AND origin_device IS NOT NULL",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 6001, "全量同步后必须保留 session 标签");
+        let repeated = run_sync(&b).unwrap();
+        assert!(repeated.errors.is_empty(), "{:?}", repeated.errors);
+        assert_eq!(extracted_inventory(&b).len(), 6001, "重复同步不得增加副本");
     }
 
     /// 对端删除（或重整理后聚合变短）通过整体替换传播：B 修剪掉不再
@@ -3168,6 +3234,44 @@ mod tests {
             .expect("合并行还在");
         assert_eq!(merged.1, "合并后的版本", "晋升后不被源聚合回滚：{inventory:?}");
         assert_eq!(merged.2, None, "晋升为本机行（origin 置空）");
+    }
+
+    #[test]
+    fn usage_aggregate_over_250_kib_syncs_in_full() {
+        let server = fake_dav::Server::start();
+        let a = paired(&server.url);
+        let b = paired(&server.url);
+        {
+            let conn = a.conn.lock().unwrap();
+            let start = chrono::NaiveDate::from_ymd_opt(2015, 1, 1).unwrap();
+            let mut statement = conn.prepare(
+                "INSERT INTO usage_records
+                   (record_id, source, session_id, occurred_at, model, record_kind,
+                    input_tokens, output_tokens, cached_tokens, origin)
+                 VALUES (?1, 'claude', ?1, ?2, 'm', 'estimated', 100, 20, 0, 'hooks')",
+            ).unwrap();
+            for index in 0..3000_i64 {
+                let day = start + chrono::Duration::days(index);
+                statement.execute(rusqlite::params![
+                    format!("bulk-usage-{index}"),
+                    format!("{day}T12:00:00Z"),
+                ]).unwrap();
+            }
+        }
+        let rows = a.usage_day_aggregates().unwrap();
+        assert_eq!(rows.len(), 3000);
+        assert!(serde_json::to_vec(&rows).unwrap().len() > 250 * 1024);
+        let pushed = run_sync(&a).unwrap();
+        assert!(pushed.errors.is_empty(), "{:?}", pushed.errors);
+        let envelope = remote_envelope(&server);
+        let usage_key = format!("usage-agg:{}", device_id(&a).replace(':', "-"));
+        let remote_rows: Vec<UsageDayAggregate> = serde_json::from_str(
+            &plain_of(object(&envelope, &usage_key).unwrap()),
+        ).unwrap();
+        assert_eq!(remote_rows.len(), 3000);
+        let pulled = run_sync(&b).unwrap();
+        assert!(pulled.errors.is_empty(), "{:?}", pulled.errors);
+        assert_eq!(pulled.usage_imported, 3000);
     }
 
     /// 用量统计是「每台设备只写自己那一个对象」：本机变了就重写自己的，

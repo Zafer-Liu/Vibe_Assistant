@@ -905,7 +905,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
         </article>
       </section>
 
-      {/* 云端记忆库：跨设备同步 L2/L3 发布版 */}
+      {/* WebDAV/S3 同步全部 L1，作用域标签保持不变。 */}
       <CloudVaultCard onSynced={() => { void loadMemoryLayers(); void listMemories(true) }} />
 
       {/* 可检索记忆（L1） */}

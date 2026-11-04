@@ -192,18 +192,8 @@ export function CloudVaultCard({ onSynced }: { onSynced?: () => void }) {
               {status.last_report ? ` · ${status.last_report}` : ''}
             </p>
           )}
-          {phase.kind === 'done' && (
-            <p className={phase.report.errors.length ? 'text-amber-700 dark:text-amber-300' : 'text-green-600 dark:text-green-400'}>
-              {t('memory.cloudCard.report', {
-                pushed: phase.report.pushed,
-                pulled: phase.report.pulled,
-                usage: phase.report.usage_imported,
-                skipped: phase.report.skipped,
-                conflicts: phase.report.conflicts,
-                errors: phase.report.errors.length,
-              })}
-              {phase.report.errors.length ? ` — ${phase.report.errors[0]}` : ''}
-            </p>
+          {phase.kind === 'done' && phase.report.errors.length > 0 && (
+            <p role="alert" className="text-amber-700 dark:text-amber-300">{phase.report.errors[0]}</p>
           )}
           {phase.kind === 'error' && (
             <p className="text-red-600 dark:text-red-400">{phase.message}</p>
