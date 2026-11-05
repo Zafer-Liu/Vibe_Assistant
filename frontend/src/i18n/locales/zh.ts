@@ -1884,7 +1884,12 @@ const zh = {
     modules: {
       firstAction: "第一次可以这样开始",
       memory: {
+    language: {
+      hint: "选择后界面会立即切换；之后可随时通过侧栏底部的语言按钮更改。",
+      continue: "继续",
+    },
         title: "记忆中心",
+      language: "语言",
         desc: "把项目背景、工作进展和长期偏好留在工作空间，减少新会话中重复交代的内容。",
         one: {
           title: "采集与检索",

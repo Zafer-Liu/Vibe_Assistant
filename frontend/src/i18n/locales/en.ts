@@ -1886,7 +1886,12 @@ const en: TranslationSchema = {
     modules: {
       firstAction: "A useful first step",
       memory: {
+    language: {
+      hint: "The interface switches as soon as you choose. You can change it again anytime from the language button at the bottom of the sidebar.",
+      continue: "Continue",
+    },
         title: "Memory Center",
+      language: "Language",
         desc: "Keep project context, recent progress, and lasting preferences in your workspace so new sessions need less repetition.",
         one: {
           title: "Capture and search",

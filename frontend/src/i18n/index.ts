@@ -53,6 +53,16 @@ export function getLanguage(): LangCode {
   return (i18n.language as LangCode) || 'zh'
 }
 
+/** 用户是否已经明确选择过界面语言（setLanguage 会写入）；只靠系统语言自动判断时为 false。 */
+export function hasChosenLanguage(): boolean {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY)
+    return saved === 'zh' || saved === 'en'
+  } catch {
+    return false
+  }
+}
+
 /** Intl locale matching the current app language, for Intl.DateTimeFormat etc. */
 export function intlLocale(): string {
   return getLanguage() === 'en' ? 'en-US' : 'zh-CN'
