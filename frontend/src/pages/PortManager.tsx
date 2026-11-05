@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { invoke } from '@tauri-apps/api/core'
 import { RefreshCw, Zap, Search, AlertTriangle } from 'lucide-react'
+import { Modal } from '../components/Modal'
 
 interface PortInfo {
   port: number
@@ -56,12 +57,12 @@ export function PortManager() {
   })
 
   return (
-    <div className="flex h-full flex-col bg-gray-50 dark:bg-gray-950">
+    <div className="flex h-full flex-col bg-[var(--app-canvas)]">
       {/* Header */}
-      <div className="border-b border-gray-200 bg-white px-6 py-4 dark:border-gray-700 dark:bg-gray-900">
+      <div className="border-b border-gray-200 bg-white px-[var(--app-page-gutter)] py-4 dark:border-gray-700 dark:bg-gray-900">
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-base font-semibold text-gray-900 dark:text-gray-100">{t('ports.title')}</h1>
+            <h1 className="font-semibold text-gray-900 dark:text-gray-100">{t('ports.title')}</h1>
             <p className="text-xs text-gray-500 dark:text-gray-400">{t('ports.subtitle', { count: ports.length })}</p>
           </div>
           <button
@@ -88,7 +89,7 @@ export function PortManager() {
 
       {/* Kill result toast */}
       {killResult && (
-        <div className={`mx-6 mt-4 flex items-center gap-2 rounded-lg px-4 py-2.5 text-sm ${
+        <div className={`mx-[var(--app-page-gutter)] mt-4 flex items-center gap-2 rounded-lg px-4 py-2.5 text-sm ${
           killResult.ok
             ? 'bg-green-50 text-green-700 dark:bg-green-900/20 dark:text-green-400'
             : 'bg-red-50 text-red-600 dark:bg-red-900/20 dark:text-red-400'
@@ -98,7 +99,7 @@ export function PortManager() {
       )}
 
       {/* Table */}
-      <div className="flex-1 overflow-auto p-6">
+      <div className="flex-1 overflow-auto px-[var(--app-page-gutter)] py-6">
         <div className="rounded-2xl border border-gray-200 bg-white overflow-hidden dark:border-gray-700 dark:bg-gray-900">
           <table className="w-full text-sm">
             <thead>
@@ -160,14 +161,14 @@ export function PortManager() {
 
       {/* Kill confirm modal */}
       {confirmKill && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+        <Modal labelledBy="port-kill-title" dismissOnBackdrop onClose={() => setConfirmKill(null)}>
           <div className="rounded-2xl border border-gray-200 bg-white p-6 shadow-xl dark:border-gray-700 dark:bg-gray-900 w-80">
             <div className="flex items-center gap-3 mb-3">
               <div className="flex h-10 w-10 items-center justify-center rounded-full bg-red-100 dark:bg-red-900/30">
                 <AlertTriangle className="h-5 w-5 text-red-600 dark:text-red-400" />
               </div>
               <div>
-                <h3 className="font-semibold text-gray-900 dark:text-gray-100">{t('ports.killConfirmTitle', { port: confirmKill.port })}</h3>
+                <h3 id="port-kill-title" className="font-semibold text-gray-900 dark:text-gray-100">{t('ports.killConfirmTitle', { port: confirmKill.port })}</h3>
                 <p className="text-xs text-gray-500">{t('ports.killConfirmProcess', { name: confirmKill.process_name, pid: confirmKill.pid })}</p>
               </div>
             </div>
@@ -186,7 +187,7 @@ export function PortManager() {
               </button>
             </div>
           </div>
-        </div>
+        </Modal>
       )}
     </div>
   )

@@ -169,14 +169,14 @@ export const PendingMemories = memo(function PendingMemories({ onBack, active = 
     setDetailError(null)
   }
 
-  return <main className="h-full overflow-y-auto bg-gray-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
-    <div className="mx-auto max-w-[1200px] px-5 py-6 lg:px-9 lg:py-8">
+  return <div className="h-full overflow-y-auto bg-[var(--app-canvas)] text-slate-900 dark:text-slate-100">
+    <div className="app-page-fluid py-6 lg:py-8">
       <header className="fluent-page-header flex flex-wrap items-start justify-between gap-4">
         <div className="flex items-start gap-3">
           <button type="button" onClick={onBack} className="mt-0.5 inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white" aria-label={t('memory.pending.back')}><ArrowLeft size={19} /></button>
           <div>
             <MemoryBreadcrumb currentKey="memory.pending.title" onBack={onBack} />
-            <h1 className="mt-1 text-2xl font-bold tracking-[-0.025em]">{t('memory.pending.title')}</h1>
+            <h1 className="mt-1 font-bold tracking-[-0.025em]">{t('memory.pending.title')}</h1>
             <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">{t('memory.pending.desc')}</p>
           </div>
         </div>
@@ -269,6 +269,6 @@ export const PendingMemories = memo(function PendingMemories({ onBack, active = 
         onClose={handleCloseDetail}
       />}
     </div>
-  </main>
+  </div>
 })
 

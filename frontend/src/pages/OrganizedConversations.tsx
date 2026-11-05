@@ -6,6 +6,7 @@ import { useMemoryFields } from '../store/memoryStore'
 import type { MemoryImportance, MemoryItem } from '../types/memory'
 import { MemoryBreadcrumb } from '../components/MemoryBreadcrumb'
 import { MemoryMarkdown } from '../components/MemoryMarkdown'
+import { Modal } from '../components/Modal'
 import { intlLocale } from '../i18n'
 
 function localTime(value: string) {
@@ -31,18 +32,19 @@ const MemoryRow = memo(function MemoryRow({
 }) {
   const { t } = useTranslation()
   const level = ranking?.score == null ? null : ranking.score >= 70 ? 'high' : ranking.score >= 40 ? 'medium' : 'low'
+  const pinLabel = ranking?.pinned ? t('memory.importanceUnpin') : t('memory.importancePin')
   return (
     <div className="rounded-md bg-gray-50 dark:bg-gray-700/50 border border-gray-200 dark:border-gray-600 px-3 py-2 [content-visibility:auto] [contain-intrinsic-size:auto_64px]">
       <div className="flex items-start gap-2">
         <MemoryMarkdown content={m.memory} className="flex-1 break-words" />
         <div className="flex shrink-0 gap-1">
-          <button onClick={() => { void onPin(m.id, !ranking?.pinned) }} className={`p-1 rounded hover:bg-amber-100 hover:text-amber-800 dark:hover:bg-amber-900/40 dark:hover:text-amber-200 ${ranking?.pinned ? 'text-amber-500' : 'text-gray-500 dark:text-gray-400'}`} title={ranking?.pinned ? t('memory.importanceUnpin') : t('memory.importancePin')}>
+          <button type="button" onClick={() => { void onPin(m.id, !ranking?.pinned) }} className={`inline-flex h-7 w-7 items-center justify-center rounded hover:bg-amber-100 hover:text-amber-800 dark:hover:bg-amber-900/40 dark:hover:text-amber-200 ${ranking?.pinned ? 'text-amber-500' : 'text-gray-500 dark:text-gray-400'}`} title={pinLabel} aria-label={pinLabel}>
             <Star size={13} className={ranking?.pinned ? 'fill-current' : ''} />
           </button>
-          <button onClick={() => onEdit(m)} className="p-1 rounded hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-500 dark:text-gray-400" title={t('common.edit')}>
+          <button type="button" onClick={() => onEdit(m)} className="inline-flex h-7 w-7 items-center justify-center rounded hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-500 dark:text-gray-400" title={t('common.edit')} aria-label={t('common.edit')}>
             <Pencil size={13} />
           </button>
-          <button onClick={() => onDelete(m)} className="p-1 rounded hover:bg-red-100 dark:hover:bg-red-900/40 text-gray-500 dark:text-gray-400 hover:text-red-800 dark:hover:text-red-200" title={t('common.delete')}>
+          <button type="button" onClick={() => onDelete(m)} className="ml-2 inline-flex h-7 w-7 items-center justify-center rounded hover:bg-red-100 dark:hover:bg-red-900/40 text-gray-500 dark:text-gray-400 hover:text-red-800 dark:hover:text-red-200" title={t('common.delete')} aria-label={t('common.delete')}>
             <Trash2 size={13} />
           </button>
         </div>
@@ -225,14 +227,14 @@ export const OrganizedConversations = memo(function OrganizedConversations({ onB
   }, [])
 
   // 页头与分类筛选固定不动，只有下方记忆列表在剩余高度内部滚动。
-  return <main className="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-gray-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
-    <div className="mx-auto flex min-h-0 w-full max-w-[1200px] flex-1 flex-col px-5 py-6 lg:px-9 lg:py-8">
+  return <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-[var(--app-canvas)] text-slate-900 dark:text-slate-100">
+    <div className="app-page-fluid flex min-h-0 flex-1 flex-col py-6 lg:py-8">
       <header className="fluent-page-header flex shrink-0 flex-wrap items-start justify-between gap-4">
         <div className="flex items-start gap-3">
           <button type="button" onClick={onBack} className="mt-0.5 inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white" aria-label={t('memory.organized.back')}><ArrowLeft size={19} /></button>
           <div>
             <MemoryBreadcrumb currentKey="memory.organized.title" onBack={onBack} />
-            <h1 className="mt-1 text-2xl font-bold tracking-[-0.025em]">{t('memory.organized.title')}</h1>
+            <h1 className="mt-1 font-bold tracking-[-0.025em]">{t('memory.organized.title')}</h1>
             <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">{t('memory.organized.desc')}</p>
           </div>
         </div>
@@ -292,15 +294,16 @@ export const OrganizedConversations = memo(function OrganizedConversations({ onB
       </section>
 
       {editing && (
-        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={() => setEditing(null)}>
-          <div className="w-full max-w-md rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 p-4 space-y-3" onClick={(e) => e.stopPropagation()}>
+        <Modal labelledBy="organized-edit-title" onClose={() => setEditing(null)}>
+          <div className="w-full max-w-md rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 p-4 space-y-3">
             <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('memory.editTitle')}</h3>
+              <h3 id="organized-edit-title" className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('memory.editTitle')}</h3>
               <button onClick={() => setEditing(null)} className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500">
                 <X size={15} />
               </button>
             </div>
             <textarea
+              data-autofocus
               value={editContent}
               onChange={(e) => setEditContent(e.target.value)}
               rows={4}
@@ -315,15 +318,15 @@ export const OrganizedConversations = memo(function OrganizedConversations({ onB
               </button>
             </div>
           </div>
-        </div>
+        </Modal>
       )}
 
       {deleteTarget && (
-        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={() => setDeleteTarget(null)}>
-          <div className="w-full max-w-sm rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 p-4 space-y-3" onClick={(e) => e.stopPropagation()}>
+        <Modal labelledBy="organized-delete-title" dismissOnBackdrop onClose={() => setDeleteTarget(null)}>
+          <div className="w-full max-w-sm rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 p-4 space-y-3">
             <div className="flex items-center gap-2">
               <Trash2 size={18} className="text-red-500" />
-              <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('memory.deleteConfirm')}</h3>
+              <h3 id="organized-delete-title" className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('memory.deleteConfirm')}</h3>
             </div>
             <p className="text-sm text-gray-600 dark:text-gray-300 line-clamp-3 break-all">{deleteTarget.memory}</p>
             <p className="text-xs text-amber-600 dark:text-amber-400">{t('memory.deleteGlobalHint')}</p>
@@ -337,7 +340,7 @@ export const OrganizedConversations = memo(function OrganizedConversations({ onB
               {t('memory.deleteDontAsk')}
             </label>
             <div className="flex justify-end gap-2">
-              <button onClick={() => setDeleteTarget(null)} className="px-3 py-1.5 rounded-md border border-gray-300 dark:border-gray-600 text-sm text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700">
+              <button data-autofocus onClick={() => setDeleteTarget(null)} className="px-3 py-1.5 rounded-md border border-gray-300 dark:border-gray-600 text-sm text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700">
                 {t('common.cancel')}
               </button>
               <button onClick={() => { void confirmDelete() }} className="px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-500 text-white text-sm font-medium">
@@ -345,8 +348,8 @@ export const OrganizedConversations = memo(function OrganizedConversations({ onB
               </button>
             </div>
           </div>
-        </div>
+        </Modal>
       )}
     </div>
-  </main>
+  </div>
 })

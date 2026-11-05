@@ -112,7 +112,7 @@ export function ClaudeDesktopConfigSelector({ disabled, onBusyChange, onChanged 
     : error?.kind === 'pick' ? 'mcpLibrary.desktopConfigPickFailed' : 'mcpLibrary.desktopConfigLoadFailed'
 
   return (
-    <section aria-label={t('mcpLibrary.desktopConfigLabel')} aria-busy={busy !== null} className="shrink-0 border-b border-gray-200 px-5 text-left dark:border-gray-800">
+    <section aria-label={t('mcpLibrary.desktopConfigLabel')} aria-busy={busy !== null} className="shrink-0 border-b border-gray-200 px-[var(--app-page-gutter)] text-left dark:border-gray-800">
       <button type="button" onClick={() => setExpanded(current => !current)} aria-expanded={expanded} aria-controls={`${id}-manager`}
         title={config?.selected_path ?? undefined}
         className="flex w-full items-center gap-2 rounded py-2.5 text-xs text-gray-700 hover:text-violet-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-violet-500 dark:text-gray-300 dark:hover:text-violet-300">
@@ -150,7 +150,7 @@ export function ClaudeDesktopConfigSelector({ disabled, onBusyChange, onChanged 
           <RefreshCw size={13} className={busy === 'load' ? 'animate-spin' : ''} />{t('common.refresh')}
         </button>
       </div>
-      <div id={`${id}-details`} className="space-y-1 text-[11px] leading-5 text-gray-500 dark:text-gray-400">
+      <div id={`${id}-details`} className="space-y-1 text-xs leading-5 text-gray-500 dark:text-gray-400">
         <p className="break-all" aria-live="polite">
           {t('mcpLibrary.desktopConfigEffective')}{' '}
           <span className="font-mono">{config ? config.selected_path ?? t('mcpLibrary.desktopConfigNone') : t('mcpLibrary.desktopConfigUnknown')}</span>

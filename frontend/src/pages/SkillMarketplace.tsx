@@ -118,15 +118,11 @@ export const SkillMarketplace = memo(function SkillMarketplace() {
     : null
 
   return (
-    <div className="flex h-full min-w-0 flex-col bg-gray-50 dark:bg-gray-950">
-      <header className="fluent-page-header border-b border-gray-200 bg-white px-6 py-4 dark:border-gray-800 dark:bg-gray-900">
+    <div className="flex h-full min-w-0 flex-col bg-[var(--app-canvas)]">
+      <header className="fluent-page-header border-b border-gray-200 bg-white px-[var(--app-page-gutter)] py-4 dark:border-gray-800 dark:bg-gray-900">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <div className="mb-1 flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400">
-              <BookOpenText className="h-3.5 w-3.5" />
-              <span>{t('nav.skills')}</span><span>/</span><span>{t('nav.skillsMarketplace')}</span>
-            </div>
-            <h1 className="text-xl font-semibold text-gray-900 dark:text-white">{t('marketplace.title')}</h1>
+            <h1 className="font-semibold text-gray-900 dark:text-white">{t('marketplace.title')}</h1>
             <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">{t('marketplace.subtitle')}</p>
           </div>
           <button
@@ -142,12 +138,12 @@ export const SkillMarketplace = memo(function SkillMarketplace() {
       </header>
 
       {notice && (
-        <div className="mx-6 mt-4 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm text-emerald-800 dark:border-emerald-900/70 dark:bg-emerald-950/40 dark:text-emerald-200">
+        <div className="mx-[var(--app-page-gutter)] mt-4 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm text-emerald-800 dark:border-emerald-900/70 dark:bg-emerald-950/40 dark:text-emerald-200">
           {notice}
         </div>
       )}
       {error && (
-        <div className="mx-6 mt-4 flex items-start justify-between gap-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800 dark:border-red-900/70 dark:bg-red-950/40 dark:text-red-200">
+        <div className="mx-[var(--app-page-gutter)] mt-4 flex items-start justify-between gap-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800 dark:border-red-900/70 dark:bg-red-950/40 dark:text-red-200">
           <span className="break-all">{error}</span>
           <button type="button" onClick={() => { void loadCatalog(true) }} className="shrink-0 font-medium underline underline-offset-2">
             {t('common.reload')}
@@ -155,8 +151,8 @@ export const SkillMarketplace = memo(function SkillMarketplace() {
         </div>
       )}
 
-      <div className="flex min-h-0 flex-1 gap-4 p-6">
-        <aside className="flex w-[360px] shrink-0 flex-col overflow-hidden rounded-xl border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
+      <div className="flex min-h-0 flex-1 gap-4 px-[var(--app-page-gutter)] py-6">
+        <aside className="flex w-[clamp(240px,32%,360px)] shrink-0 flex-col overflow-hidden rounded-xl border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
           <div className="space-y-3 border-b border-gray-200 p-4 dark:border-gray-800">
             <label className="relative block">
               <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-gray-500" />
@@ -222,7 +218,7 @@ export const SkillMarketplace = memo(function SkillMarketplace() {
           </div>
         </aside>
 
-        <main className="min-w-0 flex-1 overflow-y-auto rounded-xl border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
+        <div className="min-w-0 flex-1 overflow-y-auto rounded-xl border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
           {!selectedItem ? (
             <div className="flex h-full flex-col items-center justify-center px-8 text-center text-gray-500">
               <BookOpenText className="mb-3 h-9 w-9 opacity-50" />
@@ -234,7 +230,7 @@ export const SkillMarketplace = memo(function SkillMarketplace() {
                 <div className="flex flex-wrap items-start justify-between gap-4">
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
-                      <h2 className="text-lg font-semibold text-gray-900 dark:text-white">{selectedItem.name}</h2>
+                      <h2 className="break-words text-lg font-semibold text-gray-900 dark:text-white">{selectedItem.name}</h2>
                       <span className="inline-flex items-center gap-1 rounded-full bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-950/50 dark:text-blue-300">
                         <BadgeCheck className="h-3.5 w-3.5" />{selectedItem.source_label}
                       </span>
@@ -292,7 +288,7 @@ export const SkillMarketplace = memo(function SkillMarketplace() {
               </div>
             </div>
           )}
-        </main>
+        </div>
       </div>
     </div>
   )

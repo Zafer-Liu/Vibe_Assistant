@@ -142,7 +142,7 @@ export function AddEditDialog({ initial, editing, onClose, onSaved }: {
                 rows={6}
                 className={`${input} font-mono text-xs`}
               />
-              <p className="text-[11px] text-gray-500">{t('mcpLibrary.pasteHint')}</p>
+              <p className="text-xs text-gray-500">{t('mcpLibrary.pasteHint')}</p>
               <button onClick={applyPaste} className="inline-flex items-center gap-1 rounded-md bg-violet-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-violet-500">
                 <Check size={12} />{t('mcpLibrary.tabPaste')}
               </button>
@@ -154,7 +154,7 @@ export function AddEditDialog({ initial, editing, onClose, onSaved }: {
                 {busy ? <Loader2 size={16} className="animate-spin" /> : <FolderOpen size={16} />}
                 {scanDir || t('mcpLibrary.scanPick')}
               </button>
-              <p className="text-[11px] text-gray-500">{t('mcpLibrary.scanHint')}</p>
+              <p className="text-xs text-gray-500">{t('mcpLibrary.scanHint')}</p>
             </div>
           )}
           {tab === 'manual' && (
@@ -162,7 +162,7 @@ export function AddEditDialog({ initial, editing, onClose, onSaved }: {
               <div>
                 <label htmlFor={`${fieldId}-name`} className={label}>{t('mcpLibrary.fieldName')}</label>
                 <input id={`${fieldId}-name`} value={form.name} onChange={(e) => set({ name: e.target.value })} placeholder="playwright" className={`${input} font-mono ${editing ? 'opacity-60' : ''}`} disabled={editing || busy} />
-                <p className="mt-1 text-[11px] text-gray-500">{t('mcpLibrary.fieldNameHint')}</p>
+                <p className="mt-1 text-xs text-gray-500">{t('mcpLibrary.fieldNameHint')}</p>
               </div>
               <div>
                 <label htmlFor={`${fieldId}-description`} className={label}>{t('mcpLibrary.fieldDescription')}</label>

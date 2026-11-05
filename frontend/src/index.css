@@ -19,33 +19,25 @@ body {
   overflow: hidden;
 }
 
-/* ── Slim visible scrollbar for scrollable panels ───── */
+/* ── Slim visible scrollbar for scrollable panels ─────
+   Same --app-scrollbar token and 6px size as the global scrollbar in styles/fluent.css (the token already
+   switches per theme); the class is kept so call sites need no change. */
 .scrollbar-slim {
   scrollbar-width: thin;
-  scrollbar-color: rgba(148, 163, 184, 0.55) transparent;
+  scrollbar-color: var(--app-scrollbar) transparent;
 }
 .scrollbar-slim::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
 }
 .scrollbar-slim::-webkit-scrollbar-track {
   background: transparent;
 }
 .scrollbar-slim::-webkit-scrollbar-thumb {
-  border-radius: 9999px;
-  background: rgba(148, 163, 184, 0.55);
-}
-.scrollbar-slim::-webkit-scrollbar-thumb:hover {
-  background: rgba(148, 163, 184, 0.8);
-}
-.dark .scrollbar-slim {
-  scrollbar-color: rgba(100, 116, 139, 0.65) transparent;
-}
-.dark .scrollbar-slim::-webkit-scrollbar-thumb {
-  background: rgba(100, 116, 139, 0.65);
-}
-.dark .scrollbar-slim::-webkit-scrollbar-thumb:hover {
-  background: rgba(100, 116, 139, 0.9);
+  border-radius: 8px;
+  background: var(--app-scrollbar);
+  border: 1px solid transparent;
+  background-clip: padding-box;
 }
 
 /* ── Shared input styles (theme-aware) ─────────────── */

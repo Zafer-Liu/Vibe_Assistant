@@ -25,10 +25,10 @@ export function Settings({ section, onOpenOnboarding }: {
 
   return (
     <div className="flex h-full flex-col overflow-y-auto bg-[var(--app-canvas)]">
-      <div className="mx-auto w-full max-w-3xl px-6 py-8 space-y-8">
+      <div className="app-page-form py-8 space-y-8">
       {/* Page header */}
       <div>
-        <h1 className="text-lg font-semibold text-[var(--app-text)]">
+        <h1 className="font-semibold text-[var(--app-text)]">
           {sectionTitles[section]}
         </h1>
         <p className="text-xs text-[var(--app-secondary)] mt-0.5">{t('settings.subtitle')}</p>
@@ -228,7 +228,7 @@ function MemoryAutoRefreshSettings() {
               <span className="text-xs text-[var(--app-secondary)]">{t('settings.memoryAutoRefresh.daysUnit')}</span>
               {saved && <CheckCircle2 size={14} className="text-emerald-500" />}
             </div>
-            <p className="mt-1.5 text-[11px] leading-4 text-[var(--app-secondary)]">{t('settings.memoryAutoRefresh.l2Hint')}</p>
+            <p className="mt-1.5 text-xs leading-4 text-[var(--app-secondary)]">{t('settings.memoryAutoRefresh.l2Hint')}</p>
           </label>
           <label className="block rounded-lg border border-[var(--app-stroke)] bg-[var(--app-layer)] p-3">
             <span className="text-xs font-medium text-[var(--app-text)]">{t('settings.memoryAutoRefresh.l3Label')}</span>
@@ -248,7 +248,7 @@ function MemoryAutoRefreshSettings() {
               <span className="text-xs text-[var(--app-secondary)]">{t('settings.memoryAutoRefresh.daysUnit')}</span>
               {saved && <CheckCircle2 size={14} className="text-emerald-500" />}
             </div>
-            <p className="mt-1.5 text-[11px] leading-4 text-[var(--app-secondary)]">{t('settings.memoryAutoRefresh.l3Hint')}</p>
+            <p className="mt-1.5 text-xs leading-4 text-[var(--app-secondary)]">{t('settings.memoryAutoRefresh.l3Hint')}</p>
           </label>
         </div>
       )}

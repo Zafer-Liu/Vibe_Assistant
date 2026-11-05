@@ -117,12 +117,12 @@ export const MemoryCapture = memo(function MemoryCapture({ onBack, onOpenInjecti
     catch (error) { flash('err', t('memory.capture.dirResetFailed', { error: String(error) })) }
   }
 
-  return <main className="h-full overflow-y-auto bg-gray-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
-    <div className="mx-auto max-w-[1120px] px-5 py-6 lg:px-9 lg:py-8">
+  return <div className="h-full overflow-y-auto bg-[var(--app-canvas)] text-slate-900 dark:text-slate-100">
+    <div className="app-page-fluid py-6 lg:py-8">
       <header className="fluent-page-header flex flex-wrap items-start justify-between gap-4 border-b border-slate-200 pb-5 dark:border-slate-800">
         <div className="flex items-start gap-3">
           <button type="button" onClick={onBack} className="mt-0.5 inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:hover:bg-slate-800" aria-label={t('memory.capture.back')}><ArrowLeft size={19} /></button>
-          <div><MemoryBreadcrumb currentKey="memory.capture.title" onBack={onBack} /><h1 className="mt-1 text-2xl font-semibold tracking-tight">{t('memory.capture.title')}</h1><p className="mt-1 max-w-2xl text-sm leading-6 text-slate-500 dark:text-slate-400">{t('memory.capture.desc')}</p></div>
+          <div><MemoryBreadcrumb currentKey="memory.capture.title" onBack={onBack} /><h1 className="mt-1 font-semibold tracking-tight">{t('memory.capture.title')}</h1><p className="mt-1 max-w-2xl text-sm leading-6 text-slate-500 dark:text-slate-400">{t('memory.capture.desc')}</p></div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {notice && <span className={`rounded-lg px-3 py-2 text-xs ${notice.kind === 'ok' ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300' : 'bg-red-500/10 text-red-700 dark:text-red-300'}`} role="status">{notice.text}</span>}
@@ -288,5 +288,5 @@ export const MemoryCapture = memo(function MemoryCapture({ onBack, onOpenInjecti
       </section>
 
     </div>
-  </main>
+  </div>
 })

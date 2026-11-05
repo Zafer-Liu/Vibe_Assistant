@@ -12,6 +12,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 
 import { useTranslation } from 'react-i18next'
+import { useConfirmDialog } from '../components/ConfirmDialog'
 import { ErrorRecovery } from '../components/ErrorRecovery'
 import { HelpDocument } from '../components/HelpDocument'
 import { Plug, Plus, Download, RefreshCw, Search, Trash2, Pencil, Loader2, Terminal, Globe, X, Check, Activity, ChevronRight } from 'lucide-react'
@@ -35,6 +36,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
   onSectionChange?: (section: McpSection) => void
 }) {
   const { t, i18n } = useTranslation()
+  const { confirm, confirmDialog } = useConfirmDialog()
   const [equipmentOpen, setEquipmentOpen] = useState(false)
   useEffect(() => { setEquipmentOpen(false) }, [section])
   const { mcpCatalog, mcpStatuses, mcpObservationStatuses, mcpObservationError, mcpStatusError: statusError, mcpStatusState, mcpCallStats, mcpCallRefreshState, mcpCallError, memoryMcp, memoryMcpRuntime, memoryMcpRuntimeError, loadMcpCatalog, checkMcpStatuses, loadMcpCallStats, loadMcpObservationStatuses, setMcpObservation, dshBridge, dshBridgeError, loadDshBridge, setDshBridge, setDshBridgeFeatures, refreshMcpCallObservations, deleteMcpEntry, checkMemoryMcp, checkMemoryMcpRuntime, installMemoryMcp, uninstallMemoryMcp } = useMcpFields('mcpCatalog', 'mcpStatuses', 'mcpObservationStatuses', 'mcpObservationError', 'mcpStatusError', 'mcpStatusState', 'mcpCallStats', 'mcpCallRefreshState', 'mcpCallError', 'memoryMcp', 'memoryMcpRuntime', 'memoryMcpRuntimeError', 'loadMcpCatalog', 'checkMcpStatuses', 'loadMcpCallStats', 'loadMcpObservationStatuses', 'setMcpObservation', 'dshBridge', 'dshBridgeError', 'loadDshBridge', 'setDshBridge', 'setDshBridgeFeatures', 'refreshMcpCallObservations', 'deleteMcpEntry', 'checkMemoryMcp', 'checkMemoryMcpRuntime', 'installMemoryMcp', 'uninstallMemoryMcp')
@@ -432,7 +434,17 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
   }
 
   async function handleDelete(entry: McpCatalogEntry) {
-    if (!window.confirm(t('mcpLibrary.deleteConfirm', { name: entry.name }))) return
+    const equipped = entry.assigned_agents.map(id => targetOf(id)?.label ?? id).join(', ')
+    if (!(await confirm({
+      title: t('mcpLibrary.deleteTitle'),
+      message: t('mcpLibrary.deleteConfirm', { name: entry.name }),
+      detailLines: [
+        { label: t('mcpLibrary.fieldName'), value: entry.name },
+        ...(equipped ? [{ label: t('mcpLibrary.deleteEquipped'), value: equipped }] : []),
+      ],
+      confirmLabel: t('mcpLibrary.delete'),
+      tone: 'danger',
+    }))) return
     setLoading(true)
     try {
       await deleteMcpEntry(entry.name)
@@ -487,7 +499,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
         <span className={`text-lg font-semibold tabular-nums ${tone === 'warn' ? 'text-amber-700 dark:text-amber-300' : 'text-gray-900 dark:text-gray-100'}`}>{value}</span>
         <span className="text-xs font-medium text-gray-600 dark:text-gray-300">{label}</span>
       </div>
-      {hint && <p className="mt-0.5 break-words text-[11px] leading-5 text-gray-500 dark:text-gray-400" title={hintTitle ?? hint}>{hint}</p>}
+      {hint && <p className="mt-0.5 break-words text-xs leading-5 text-gray-500 dark:text-gray-400" title={hintTitle ?? hint}>{hint}</p>}
     </div>
   )
 
@@ -499,7 +511,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
       <div className="fluent-page-header fluent-command-header flex flex-wrap items-center gap-3 border-b border-gray-200 dark:border-gray-800">
         <div className="mr-auto flex min-w-0 items-center gap-4">
           <div className="min-w-0">
-            <h1 className="flex items-center gap-2 text-base font-semibold text-gray-900 dark:text-gray-100">
+            <h1 className="flex items-center gap-2 font-semibold text-gray-900 dark:text-gray-100">
               <Plug size={18} className="text-violet-500" />{t('mcpLibrary.title')}
             </h1>
             <p className="truncate text-xs text-gray-500 dark:text-gray-400">{t('mcpLibrary.subtitle')}</p>
@@ -541,7 +553,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
       </div>
 
       {!loadError && <>
-        <div className="grid grid-cols-1 divide-y divide-gray-200 border-b border-gray-200 px-5 py-2 sm:grid-cols-3 sm:divide-x sm:divide-y-0 dark:divide-gray-800 dark:border-gray-800" aria-label={t('mcpLibrary.statusCards')}>
+        <div className="grid grid-cols-1 divide-y divide-gray-200 border-b border-gray-200 px-[var(--app-page-gutter)] py-2 sm:grid-cols-3 sm:divide-x sm:divide-y-0 dark:divide-gray-800 dark:border-gray-800" aria-label={t('mcpLibrary.statusCards')}>
           {statusCard(t('mcpLibrary.servicesCount'), mcpCatalog.length,
             t('mcpLibrary.serviceLocations', { local: mcpCatalog.length - remoteServices, remote: remoteServices }))}
           {statusCard(t('mcpLibrary.dashboardCalls'),
@@ -554,7 +566,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
                 : t('mcpLibrary.healthSummary', { range: healthWindow, rate: `${(failureRate7d * 100).toFixed(1)}%`, count: confirmedCalls7d }),
             unhealthyTools.length > 0 ? 'warn' : undefined, healthWindowDetail)}
         </div>
-        {unhealthyTools.length > 0 && <details className="group shrink-0 border-b border-gray-200 px-5 text-xs dark:border-gray-800">
+        {unhealthyTools.length > 0 && <details className="group shrink-0 border-b border-gray-200 px-[var(--app-page-gutter)] text-xs dark:border-gray-800">
           <summary className="flex cursor-pointer list-none items-center gap-2 rounded py-2.5 text-amber-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-violet-500 dark:text-amber-300 [&::-webkit-details-marker]:hidden">
             <ChevronRight size={14} aria-hidden="true" className="shrink-0 transition-transform group-open:rotate-90 motion-reduce:transition-none" />
             <span className="min-w-0 flex-1 truncate font-medium" title={[t('mcpLibrary.unhealthyToolsTitle', { range: healthWindow, count: unhealthyTools.length }), healthWindowDetail].filter(Boolean).join(' · ')}>{t('mcpLibrary.unhealthyToolsTitle', { range: healthWindow, count: unhealthyTools.length })}</span>
@@ -582,29 +594,29 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
         <ErrorRecovery onRetry={() => { void refreshAll() }} disabled={loading || configBusy} />
       </div>}
       {!loadError && section === 'services' && mcpObservationError && (
-        <div role="alert" className="border-b border-red-200 bg-red-50 px-5 py-2 text-xs text-red-600 dark:border-red-800 dark:bg-red-500/10 dark:text-red-300">
+        <div role="alert" className="border-b border-red-200 bg-red-50 px-[var(--app-page-gutter)] py-2 text-xs text-red-600 dark:border-red-800 dark:bg-red-500/10 dark:text-red-300">
           {t('mcpLibrary.observationLoadFailed', { error: mcpObservationError })}
         </div>
       )}
       {!loadError && section === 'services' && observationNotice && (
-        <div role={observationNotice.tone === 'error' ? 'alert' : 'status'} className={`border-b px-5 py-2 text-xs ${observationNotice.tone === 'error' ? 'border-red-200 bg-red-50 text-red-600 dark:border-red-800 dark:bg-red-500/10 dark:text-red-300' : observationNotice.tone === 'warning' ? 'border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-800 dark:bg-amber-500/10 dark:text-amber-300' : 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-500/20 dark:bg-emerald-500/10 dark:text-emerald-300'}`}>
+        <div role={observationNotice.tone === 'error' ? 'alert' : 'status'} className={`border-b px-[var(--app-page-gutter)] py-2 text-xs ${observationNotice.tone === 'error' ? 'border-red-200 bg-red-50 text-red-600 dark:border-red-800 dark:bg-red-500/10 dark:text-red-300' : observationNotice.tone === 'warning' ? 'border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-800 dark:bg-amber-500/10 dark:text-amber-300' : 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-500/20 dark:bg-emerald-500/10 dark:text-emerald-300'}`}>
           {observationNotice.message}
         </div>
       )}
       {!loadError && statusError && (
-        <div role="alert" className="border-b border-red-200 bg-red-50 px-5 py-3 text-xs text-red-600 dark:border-red-800 dark:bg-red-500/10 dark:text-red-300">
+        <div role="alert" className="border-b border-red-200 bg-red-50 px-[var(--app-page-gutter)] py-3 text-xs text-red-600 dark:border-red-800 dark:bg-red-500/10 dark:text-red-300">
           {t('mcpLibrary.statusFailed', { error: statusError })}
           <ErrorRecovery onRetry={() => { void refreshAll() }} disabled={loading || configBusy} />
         </div>
       )}
       {!loadError && section === 'services' && migrationNotices.length > 0 && (
-        <div role="status" className="border-b border-amber-200 bg-amber-50 px-5 py-3 text-xs leading-5 text-amber-800 dark:border-amber-800 dark:bg-amber-500/10 dark:text-amber-300">
+        <div role="status" className="border-b border-amber-200 bg-amber-50 px-[var(--app-page-gutter)] py-3 text-xs leading-5 text-amber-800 dark:border-amber-800 dark:bg-amber-500/10 dark:text-amber-300">
           <p className="font-medium">{t('mcpLibrary.migrationNotice')}</p>
           {migrationNotices.map((message, index) => <p key={index} className="break-words">{message}</p>)}
         </div>
       )}
       {!loadError && notice && (
-        <div className="flex items-center gap-2 border-b border-emerald-200 bg-emerald-50 px-5 py-2 text-xs text-emerald-700 dark:border-emerald-500/20 dark:bg-emerald-500/10 dark:text-emerald-300">
+        <div className="flex items-center gap-2 border-b border-emerald-200 bg-emerald-50 px-[var(--app-page-gutter)] py-2 text-xs text-emerald-700 dark:border-emerald-500/20 dark:bg-emerald-500/10 dark:text-emerald-300">
           <Check size={12} className="shrink-0" />
           <span className="min-w-0 flex-1 break-all">{notice}</span>
           <button onClick={() => setNotice('')} className="shrink-0 text-emerald-500 transition hover:text-emerald-700 dark:hover:text-emerald-300" aria-label="dismiss"><X size={12} /></button>
@@ -612,7 +624,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
       )}
 
       {!loadError && section === 'services' && <>
-      <div className="min-h-0 flex-1 overflow-y-auto p-5">
+      <div className="min-h-0 flex-1 overflow-y-auto px-[var(--app-page-gutter)] py-5">
         {/* DeepSeek Harness 统一桥接插件：注入/观测/用量/收集/原生工具 */}
         <article className="mb-3 rounded-xl border border-gray-200 bg-white p-4 transition hover:border-violet-300 dark:border-gray-700 dark:bg-gray-900 dark:hover:border-violet-500/40">
           <div className="flex flex-wrap items-start gap-3">
@@ -669,8 +681,8 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
                 <h3 className="min-w-0 truncate font-mono text-sm font-semibold text-gray-900 dark:text-gray-100">Vibe-Assistant-memory</h3>
-                <span className="shrink-0 rounded-full bg-indigo-500/10 px-1.5 py-0.5 text-[10px] font-medium text-indigo-600 dark:text-indigo-300">{t('mcpLibrary.builtinBadge')}</span>
-                <span className="shrink-0 rounded-full bg-gray-100 px-1.5 py-0.5 text-[10px] font-medium text-gray-600 dark:bg-gray-800 dark:text-gray-300">stdio</span>
+                <span className="shrink-0 rounded-full bg-indigo-500/10 px-1.5 py-0.5 text-[11px] font-medium text-indigo-600 dark:text-indigo-300">{t('mcpLibrary.builtinBadge')}</span>
+                <span className="shrink-0 rounded-full bg-gray-100 px-1.5 py-0.5 text-[11px] font-medium text-gray-600 dark:bg-gray-800 dark:text-gray-300">stdio</span>
               </div>
               <p className="mt-0.5 truncate text-xs text-gray-500 dark:text-gray-400">{t('mcpLibrary.builtinMemoryMcpDesc')}</p>
             </div>
@@ -743,7 +755,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
               })}
             </div>
             {memoryMcpActionError && <p role="alert" className="mt-2 text-xs text-red-600 dark:text-red-400">{t('mcpLibrary.memoryMcpActionFailed', { error: memoryMcpActionError })}</p>}
-            {memoryMcpRuntimeError && <p className="mt-1 text-[11px] text-red-600 dark:text-red-400">{t('mcpLibrary.memoryMcpRuntimeError', { error: memoryMcpRuntimeError })}</p>}
+            {memoryMcpRuntimeError && <p className="mt-1 text-xs text-red-600 dark:text-red-400">{t('mcpLibrary.memoryMcpRuntimeError', { error: memoryMcpRuntimeError })}</p>}
           </div>}
         </article>
         {visible.length === 0 ? (
@@ -755,7 +767,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
             <p className="mt-1 text-xs leading-5 text-gray-500 dark:text-gray-400">{t(mcpCatalog.length === 0 ? 'mcpLibrary.emptyHint' : 'mcpLibrary.filteredEmptyHint')}</p>
           </div>
         ) : (
-          <div className="space-y-3">
+          <div className="app-card-grid">
             {visible.map((entry) => {
               const isRemote = entry.transport === 'sse' || entry.transport === 'http'
               return (
@@ -767,7 +779,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2">
                         <h3 className="min-w-0 truncate font-mono text-sm font-semibold text-gray-900 dark:text-gray-100">{entry.name}</h3>
-                        <span className="shrink-0 rounded-full bg-gray-100 px-1.5 py-0.5 text-[10px] font-medium text-gray-600 dark:bg-gray-800 dark:text-gray-300">
+                        <span className="shrink-0 rounded-full bg-gray-100 px-1.5 py-0.5 text-[11px] font-medium text-gray-600 dark:bg-gray-800 dark:text-gray-300">
                           {entry.transport === 'stdio' ? 'stdio' : entry.transport.toUpperCase()}
                         </span>
                       </div>
@@ -795,7 +807,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
                       )
                     })}
                     {entry.assigned_agents.length === 0 && (
-                      <span className="text-[10px] text-gray-500 dark:text-gray-400">{t('mcpLibrary.notEquipped')}</span>
+                      <span className="text-[11px] text-gray-500 dark:text-gray-400">{t('mcpLibrary.notEquipped')}</span>
                     )}
                   </div>
                   {mcpStatusState === 'ready' && mcpStatuses.some(status => status.name === entry.name && (status.state === 'differs' || status.error)) && (
@@ -924,8 +936,8 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
       </div>
       </>}
 
-      {!loadError && section === 'tools' && <div className="min-h-0 flex-1 overflow-y-auto p-5">
-        <div className="mx-auto max-w-5xl">
+      {!loadError && section === 'tools' && <div className="min-h-0 flex-1 overflow-y-auto px-[var(--app-page-gutter)] py-5">
+        <div className="w-full">
           <div className="mb-4 flex flex-wrap items-center gap-3">
             <div className="min-w-0 flex-1">
               <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">{t('mcpLibrary.toolsTitle')}</h2>
@@ -945,26 +957,26 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
           {selectedToolDiscovery?.loading && <p role="status" className="mb-3 text-sm text-gray-600 dark:text-gray-300">{t('mcpLibrary.toolsLoading')}</p>}
           {!selectedToolEntry && <p className="py-12 text-center text-sm text-gray-500 dark:text-gray-400">{t('mcpLibrary.emptyTitle')}</p>}
           {selectedToolEntry && selectedToolEntry.transport !== 'sse' && selectedToolEntry.transport !== 'http' && !selectedToolDiscovery && <p className="border-t border-gray-200 py-10 text-center text-sm text-gray-500 dark:border-gray-700 dark:text-gray-400">{t('mcpLibrary.toolsStartHint')}</p>}
-          {selectedToolDiscovery?.error && <p role="alert" className="rounded-lg bg-red-50 px-4 py-3 text-sm text-red-700 dark:bg-red-500/10 dark:text-red-300">{t('mcpLibrary.toolsLoadFailed', { error: selectedToolDiscovery.error })}</p>}
+          {selectedToolDiscovery?.error && <p role="alert" className="app-reading-measure rounded-lg bg-red-50 px-4 py-3 text-sm text-red-700 dark:bg-red-500/10 dark:text-red-300">{t('mcpLibrary.toolsLoadFailed', { error: selectedToolDiscovery.error })}</p>}
           {selectedToolDiscovery?.result && <div className="border-t border-gray-200 dark:border-gray-700">
             <div className="flex flex-wrap items-center gap-3 py-3 text-xs text-gray-500 dark:text-gray-400">
               <span className="font-medium text-gray-800 dark:text-gray-200">{t(`mcpLibrary.toolsState.${selectedToolDiscovery.result.state}`)}</span>
               {['complete', 'empty', 'partial'].includes(selectedToolDiscovery.result.state) && <span>{t('mcpLibrary.toolCount', { count: selectedToolDiscovery.result.tools.length })}</span>}
               <span>{new Date(selectedToolDiscovery.result.fetched_at).toLocaleString()}</span>
             </div>
-            {selectedToolDiscovery.result.reason && <p role={selectedToolDiscovery.result.state === 'error' ? 'alert' : undefined} className="mb-3 text-xs text-amber-700 dark:text-amber-300">{selectedToolDiscovery.result.reason}</p>}
+            {selectedToolDiscovery.result.reason && <p role={selectedToolDiscovery.result.state === 'error' ? 'alert' : undefined} className="app-reading-measure mb-3 text-xs text-amber-700 dark:text-amber-300">{selectedToolDiscovery.result.reason}</p>}
             {selectedToolDiscovery.result.state === 'partial' && <p role="status" className="mb-3 text-xs text-amber-700 dark:text-amber-300">{t('mcpLibrary.toolsPartialHint')}</p>}
             {selectedToolDiscovery.result.state === 'empty' && <p className="py-8 text-center text-sm text-gray-500 dark:text-gray-400">{t('mcpLibrary.toolsEmpty')}</p>}
             <div className="divide-y divide-gray-100 dark:divide-gray-800">{selectedToolDiscovery.result.tools.map(tool => <div key={tool.name} className="grid gap-1 py-3 sm:grid-cols-[minmax(12rem,1fr)_2fr] sm:gap-6">
               <span className="break-all font-mono text-xs font-medium text-gray-900 dark:text-gray-100">{tool.name}</span>
-              <p className="text-xs leading-5 text-gray-600 dark:text-gray-300">{tool.description || t('mcpLibrary.noDescription')}</p>
+              <p className="app-reading-measure text-xs leading-5 text-gray-600 dark:text-gray-300">{tool.description || t('mcpLibrary.noDescription')}</p>
             </div>)}</div>
           </div>}
         </div>
       </div>}
 
       {!loadError && section === 'calls' && (
-        <div className="min-h-0 flex-1 overflow-y-auto space-y-4 p-5">
+        <div className="min-h-0 flex-1 overflow-y-auto space-y-4 px-[var(--app-page-gutter)] py-5">
           <section className="rounded-2xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-900">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div><h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">{t('mcpLibrary.observedCallsTitle')}</h2></div>
@@ -1040,15 +1052,15 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
               <button type="button" onClick={() => setShowCoverage(current => !current)} aria-expanded={showCoverage} className="text-xs text-violet-700 hover:underline dark:text-violet-300">{t('mcpLibrary.coverageDetails')}</button>
               {showCoverage && <div className="mt-2 space-y-2 text-xs text-gray-500 dark:text-gray-400">
                 <p>{t('mcpLibrary.observationSourceCounts', { native: mcpCallStats.native_calls, proxy: mcpCallStats.proxy_calls, transcript: mcpCallStats.transcript_calls, plugin: mcpCallStats.plugin_calls })}</p>
-                <div className="flex flex-wrap gap-1.5">{mcpCallStats.coverage.map(item => <span key={item.source} title={item.state === 'unsupported' ? t('mcpLibrary.coverageReason.unsupported') : item.reason ?? undefined} className="rounded-full bg-violet-50 px-2 py-1 text-[10px] text-violet-700 dark:bg-violet-500/10 dark:text-violet-300">{item.source}: {t(`mcpLibrary.coverageState.${item.state}`, { defaultValue: item.state })}</span>)}</div>
+                <div className="flex flex-wrap gap-1.5">{mcpCallStats.coverage.map(item => <span key={item.source} title={item.state === 'unsupported' ? t('mcpLibrary.coverageReason.unsupported') : item.reason ?? undefined} className="rounded-full bg-violet-50 px-2 py-1 text-[11px] text-violet-700 dark:bg-violet-500/10 dark:text-violet-300">{item.source}: {t(`mcpLibrary.coverageState.${item.state}`, { defaultValue: item.state })}</span>)}</div>
               </div>}
             </div>}
           </section>
         </div>
       )}
 
-      {!loadError && section === 'errors' && <div className="min-h-0 flex-1 overflow-y-auto p-5">
-        <div className="mx-auto max-w-5xl">
+      {!loadError && section === 'errors' && <div className="min-h-0 flex-1 overflow-y-auto px-[var(--app-page-gutter)] py-5">
+        <div className="w-full">
           <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
             <div>
               <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">{t('mcpLibrary.errorLogTitle')}</h2>
@@ -1081,7 +1093,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
               <option value="dsh_plugin">{t('mcpLibrary.observationSourcePlugin')}</option>
             </select>
           </div>
-          {failedCallsError && <p role="alert" className="rounded-lg bg-red-50 px-4 py-3 text-xs text-red-700 dark:bg-red-500/10 dark:text-red-300">{t('mcpLibrary.failedCallsLoadFailed', { error: failedCallsError })}</p>}
+          {failedCallsError && <p role="alert" className="app-reading-measure rounded-lg bg-red-50 px-4 py-3 text-xs text-red-700 dark:bg-red-500/10 dark:text-red-300">{t('mcpLibrary.failedCallsLoadFailed', { error: failedCallsError })}</p>}
           {failedCalls && <>
             <div className="mb-4 flex flex-wrap items-center gap-2 border-y border-gray-200 py-3 text-xs dark:border-gray-700">
               <span className="font-semibold text-gray-900 dark:text-gray-100">{t('mcpLibrary.failedTotal', { count: failedCalls.total })}</span>
@@ -1101,9 +1113,9 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
                 <div><dt className="text-gray-500 dark:text-gray-400">{t('mcpLibrary.logKind')}</dt><dd className="mt-0.5 text-gray-800 dark:text-gray-200">{call.failure_kind ? t(`mcpLibrary.failureKind.${call.failure_kind}`) : '—'}</dd></div>
                 <div><dt className="text-gray-500 dark:text-gray-400">{t('mcpLibrary.logCode')}</dt><dd className="mt-0.5 font-mono text-gray-800 dark:text-gray-200">{call.error_code ?? '—'}</dd></div>
                 <div><dt className="text-gray-500 dark:text-gray-400">{t('mcpLibrary.logResult')}</dt><dd className="mt-0.5 text-gray-800 dark:text-gray-200">{t(call.result_observed ? 'mcpLibrary.failureResultObserved' : 'mcpLibrary.failureResultMissing')}</dd></div>
-                {call.error_reason && <div className="sm:col-span-2"><dt className="text-gray-500 dark:text-gray-400">{t('mcpLibrary.logReason')}</dt><dd className="mt-0.5 break-words text-gray-800 dark:text-gray-200">{call.error_reason}</dd></div>}
+                {call.error_reason && <div className="sm:col-span-2"><dt className="text-gray-500 dark:text-gray-400">{t('mcpLibrary.logReason')}</dt><dd className="app-reading-measure mt-0.5 break-words text-gray-800 dark:text-gray-200">{call.error_reason}</dd></div>}
               </dl>
-              <p className="mt-2 px-2 text-xs leading-5 text-gray-600 dark:text-gray-300">{t(`mcpLibrary.failureAdvice.${call.failure_kind ?? call.error_category ?? 'unknown'}`, { defaultValue: t('mcpLibrary.failureAdvice.unknown') })}</p>
+              <p className="app-reading-measure mt-2 px-2 text-xs leading-5 text-gray-600 dark:text-gray-300">{t(`mcpLibrary.failureAdvice.${call.failure_kind ?? call.error_category ?? 'unknown'}`, { defaultValue: t('mcpLibrary.failureAdvice.unknown') })}</p>
             </details>)}</div>
             {failedHasMore && failedCalls.calls.length < failedCalls.total && <button type="button" onClick={() => { void loadFailedCalls(failedCalls.calls.length) }} disabled={failedCallsLoading}
               className="mt-4 rounded-lg border border-gray-300 px-3 py-2 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-800">{t('mcpLibrary.moreFailedCalls', { count: failedCalls.total - failedCalls.calls.length })}</button>}
@@ -1130,6 +1142,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
       {importOpen && (
         <ImportDialog onClose={() => { setImportOpen(false) }} onNotice={setNotice} onCompare={name => { setImportOpen(false); setArbitrating({ name }) }} />
       )}
+      {confirmDialog}
     </div>
   )
 })

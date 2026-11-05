@@ -379,12 +379,12 @@ export function NetworkManager() {
   const loading = snapshot === null && !error
 
   return (
-    <div className="flex h-full flex-col bg-gray-50 dark:bg-gray-950">
+    <div className="flex h-full flex-col bg-[var(--app-canvas)]">
       {/* Header */}
-      <div className="border-b border-gray-200 bg-white px-6 py-4 dark:border-gray-700 dark:bg-gray-900">
+      <div className="border-b border-gray-200 bg-white px-[var(--app-page-gutter)] py-4 dark:border-gray-700 dark:bg-gray-900">
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-base font-semibold text-gray-900 dark:text-gray-100">{t('network.title')}</h1>
+            <h1 className="font-semibold text-gray-900 dark:text-gray-100">{t('network.title')}</h1>
             <p className="text-xs text-gray-500 dark:text-gray-400">{t('network.subtitle', { count: interfaces.length })}</p>
           </div>
           <button
@@ -398,7 +398,7 @@ export function NetworkManager() {
         </div>
       </div>
 
-      <div className="flex-1 overflow-auto p-6">
+      <div className="flex-1 overflow-auto px-[var(--app-page-gutter)] py-6">
         {error && (
           <div role="alert" className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-300">
             <div className="flex items-center gap-1.5 font-medium">
@@ -440,7 +440,7 @@ export function NetworkManager() {
               )}
             </div>
             <SpeedSparkline history={history} />
-            <p className="mt-1 text-[11px] text-gray-500 dark:text-gray-400">{t('network.speedHint')}</p>
+            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">{t('network.speedHint')}</p>
           </div>
 
           <StatCard
@@ -477,14 +477,14 @@ export function NetworkManager() {
               <div className="mt-1.5 space-y-1.5">
                 <div className="flex items-center justify-between gap-2">
                   <p className="break-all font-mono text-lg font-semibold text-gray-900 dark:text-gray-100">
-                    <span className="mr-1.5 rounded bg-blue-50 px-1 py-0.5 font-sans text-[10px] font-medium text-blue-600 dark:bg-blue-900/30 dark:text-blue-400">{t('network.directIp')}·IPv4</span>
+                    <span className="mr-1.5 rounded bg-blue-50 px-1 py-0.5 font-sans text-[11px] font-medium text-blue-600 dark:bg-blue-900/30 dark:text-blue-400">{t('network.directIp')}·IPv4</span>
                     {publicIp?.ipv4 ?? <span className="text-sm font-normal text-gray-500">{t('network.ipUnavailable')}</span>}
                   </p>
                   {publicIp?.ipv4 && <CopyButton value={publicIp.ipv4} label={t('network.publicIpv4')} />}
                 </div>
                 <div className="flex items-center justify-between gap-2 border-t border-gray-100 pt-1.5 dark:border-gray-800">
                   <p className="break-all font-mono text-sm text-gray-600 dark:text-gray-300">
-                    <span className="mr-1.5 rounded bg-purple-50 px-1 py-0.5 font-sans text-[10px] font-medium text-purple-600 dark:bg-purple-900/30 dark:text-purple-400">{t('network.directIp')}·IPv6</span>
+                    <span className="mr-1.5 rounded bg-purple-50 px-1 py-0.5 font-sans text-[11px] font-medium text-purple-600 dark:bg-purple-900/30 dark:text-purple-400">{t('network.directIp')}·IPv6</span>
                     {publicIp?.ipv6 ?? <span className="text-gray-500">{t('network.ipUnavailable')}</span>}
                   </p>
                   {publicIp?.ipv6 && <CopyButton value={publicIp.ipv6} label={t('network.publicIpv6')} />}
@@ -492,13 +492,13 @@ export function NetworkManager() {
                 {publicIp?.proxy && (
                   <div className="flex items-center justify-between gap-2 border-t border-gray-100 pt-1.5 dark:border-gray-800">
                     <p className="break-all font-mono text-sm text-gray-600 dark:text-gray-300">
-                      <span className="mr-1.5 rounded bg-blue-50 px-1 py-0.5 font-sans text-[10px] font-medium text-blue-600 dark:bg-blue-900/30 dark:text-blue-400">{t('network.proxyEgress')}·IPv4</span>
+                      <span className="mr-1.5 rounded bg-blue-50 px-1 py-0.5 font-sans text-[11px] font-medium text-blue-600 dark:bg-blue-900/30 dark:text-blue-400">{t('network.proxyEgress')}·IPv4</span>
                       {publicIp.proxy.ipv4
                         ?? <span className="font-sans text-xs text-amber-500 dark:text-amber-400">{t('network.proxyUnreachable')}</span>}
                       <span className="ml-1.5 font-sans text-[11px] text-gray-500">({publicIp.proxy.server})</span>
                       {publicIp.proxy.ipv6 && (
                         <span className="ml-1.5 inline-flex items-center gap-1">
-                          <span className="rounded bg-purple-50 px-1 py-0.5 font-sans text-[10px] font-medium text-purple-600 dark:bg-purple-900/30 dark:text-purple-400">IPv6</span>
+                          <span className="rounded bg-purple-50 px-1 py-0.5 font-sans text-[11px] font-medium text-purple-600 dark:bg-purple-900/30 dark:text-purple-400">IPv6</span>
                           <span>{publicIp.proxy.ipv6}</span>
                         </span>
                       )}
@@ -507,10 +507,10 @@ export function NetworkManager() {
                   </div>
                 )}
                 {!publicIp?.proxy && (
-                  <p className="border-t border-gray-100 pt-1.5 text-[11px] text-gray-500 dark:border-gray-800 dark:text-gray-400">{t('network.noProxy')}</p>
+                  <p className="border-t border-gray-100 pt-1.5 text-xs text-gray-500 dark:border-gray-800 dark:text-gray-400">{t('network.noProxy')}</p>
                 )}
                 {!publicIp?.ipv4 && (
-                  <p className="border-t border-gray-100 pt-1.5 text-[11px] text-amber-500 dark:border-gray-800 dark:text-amber-400">{t('network.directFailedHint')}</p>
+                  <p className="border-t border-gray-100 pt-1.5 text-xs text-amber-500 dark:border-gray-800 dark:text-amber-400">{t('network.directFailedHint')}</p>
                 )}
               </div>
             )}
@@ -598,7 +598,7 @@ export function NetworkManager() {
                         <Wifi className="h-3.5 w-3.5 shrink-0 text-gray-500" />
                         <span className="text-sm font-medium text-gray-900 dark:text-gray-100">{item.name}</span>
                         {item.is_loopback && (
-                          <span className="rounded bg-gray-100 px-1.5 py-0.5 text-[10px] text-gray-500 dark:bg-gray-800 dark:text-gray-400">{t('network.loopback')}</span>
+                          <span className="rounded bg-gray-100 px-1.5 py-0.5 text-[11px] text-gray-500 dark:bg-gray-800 dark:text-gray-400">{t('network.loopback')}</span>
                         )}
                         {item.mac && <span className="font-mono text-[11px] text-gray-500 dark:text-gray-400">{item.mac}</span>}
                         {item.mtu > 0 && <span className="text-[11px] text-gray-500 dark:text-gray-400">MTU {item.mtu}</span>}
@@ -609,13 +609,13 @@ export function NetworkManager() {
                         ) : (
                           <>
                             {item.ipv4.map(cidr => (
-                              <span key={cidr} className="inline-flex items-center gap-1 rounded bg-blue-50 px-1.5 py-0.5 text-[10px] dark:bg-blue-900/30">
+                              <span key={cidr} className="inline-flex items-center gap-1 rounded bg-blue-50 px-1.5 py-0.5 text-[11px] dark:bg-blue-900/30">
                                 <span className="font-sans font-medium text-blue-600 dark:text-blue-400">IPv4</span>
                                 <span className="font-mono text-blue-700 dark:text-blue-300">{cidr}</span>
                               </span>
                             ))}
                             {item.ipv6.map(cidr => (
-                              <span key={cidr} className="inline-flex items-center gap-1 rounded bg-purple-50 px-1.5 py-0.5 text-[10px] dark:bg-purple-900/30">
+                              <span key={cidr} className="inline-flex items-center gap-1 rounded bg-purple-50 px-1.5 py-0.5 text-[11px] dark:bg-purple-900/30">
                                 <span className="font-sans font-medium text-purple-600 dark:text-purple-400">IPv6</span>
                                 <span className="font-mono text-purple-700 dark:text-purple-300">{cidr}</span>
                               </span>
@@ -626,7 +626,7 @@ export function NetworkManager() {
                     </div>
                     {/* 实时速率集中在「实时流量」卡展示，这里只保留各接口累计流量 */}
                     {speed && (
-                      <p className="shrink-0 text-right text-[11px] text-gray-500 dark:text-gray-400">
+                      <p className="shrink-0 text-right text-xs text-gray-500 dark:text-gray-400">
                         {t('network.totalRx')} {formatBytes(speed.rx_total_bytes)} · {t('network.totalTx')} {formatBytes(speed.tx_total_bytes)}
                       </p>
                     )}

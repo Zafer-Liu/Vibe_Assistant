@@ -6,6 +6,7 @@ import { memo, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listen } from '@tauri-apps/api/event'
 import { BookOpenText, Check, ChevronRight, FileCode2, FolderSync, RefreshCw, Search, Sparkles, Copy, CheckCheck, Hash, Globe, Rocket, ShieldCheck, Layers, RotateCcw, Loader2, Trash2, X } from 'lucide-react'
+import { useConfirmDialog } from '../components/ConfirmDialog'
 import { useSkillFields } from '../store/skillStore'
 import type { SkillDocument, SkillItem } from '../types/skill'
 
@@ -47,6 +48,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
   onSyncOpened?: () => void
 }) {
   const { t } = useTranslation()
+  const { confirm, confirmDialog } = useConfirmDialog()
   const [equipmentOpen, setEquipmentOpen] = useState(false)
  const { skills, skillCacheReady, loadSkills, scanSkills, readSkill, applySkillSync, setSkillStatus, setSkillStatusBulk, setSkillAssignment, setSkillAssignmentBulk, publishSkill, rollbackSkillLatest, deleteSkill } = useSkillFields('skills', 'skillCacheReady', 'loadSkills', 'scanSkills', 'readSkill', 'applySkillSync', 'setSkillStatus', 'setSkillStatusBulk', 'setSkillAssignment', 'setSkillAssignmentBulk', 'publishSkill', 'rollbackSkillLatest', 'deleteSkill')
   const [filter, setFilter] = useState<SourceFilter>('all')
@@ -324,10 +326,20 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
 
   // 删除当前查看的 Skill（含二次确认）。整个共享库目录与历史快照都会移除。
   async function deleteSelected() {
-    if (!selected || !window.confirm(
-      t('skills.deleteConfirm', { source: selected.item.source, name: selected.item.name })
-    )) return
-    const { source, name } = selected.item
+    if (!selected) return
+    const { source, name, assigned_agents } = selected.item
+    const equipped = assigned_agents.map((id) => SOURCES.find((s) => s.id === id)?.label ?? id).join(', ')
+    if (!(await confirm({
+      title: t('skills.deleteSkillTitle'),
+      message: t('skills.deleteConfirm', { source, name }),
+      detailLines: [
+        { label: t('skills.confirmFieldSkill'), value: name },
+        { label: t('skills.confirmFieldSource'), value: source },
+        ...(equipped ? [{ label: t('skills.equippedLabel'), value: equipped }] : []),
+      ],
+      confirmLabel: t('skills.delete'),
+      tone: 'danger',
+    }))) return
     setLoading(true)
     try {
       await deleteSkill(source, name)
@@ -355,7 +367,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
  // ── Render ──
 
   if (booting) {
-    return <div className="flex h-full min-h-0 items-center justify-center bg-gray-50 px-6 dark:bg-gray-950" role="status" aria-live="polite">
+    return <div className="flex h-full min-h-0 items-center justify-center bg-[var(--app-canvas)] px-6" role="status" aria-live="polite">
       <div className="w-full max-w-md rounded-2xl border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-900">
         <div className="flex items-center gap-3 text-gray-800 dark:text-gray-100"><span className="rounded-xl bg-violet-500/10 p-2.5 text-violet-600 dark:text-violet-400"><Loader2 className="animate-spin motion-reduce:animate-none" size={21} /></span><div><p className="text-sm font-semibold">{t('skills.booting')}</p><p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">{t('skills.bootingHint')}</p></div></div>
         <div className="mt-5 grid grid-cols-2 gap-2.5" aria-hidden="true"><div className="h-16 animate-pulse rounded-lg bg-gray-100 dark:bg-gray-800" /><div className="h-16 animate-pulse rounded-lg bg-gray-100 dark:bg-gray-800" /><div className="col-span-2 h-10 animate-pulse rounded-lg bg-gray-100 dark:bg-gray-800" /></div>
@@ -366,15 +378,15 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
   if (equipmentOpen) return <EquipmentProfiles onBack={() => { setEquipmentOpen(false); void loadSkills() }} />
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-gray-50 dark:bg-gray-950">
+    <div className="flex h-full min-h-0 flex-col bg-[var(--app-canvas)]">
       {/* ── Header: title + primary actions only ── */}
-      <header className="fluent-page-header fluent-command-header flex flex-wrap items-center gap-4 border-b border-gray-200 bg-white px-6 py-4 dark:border-gray-800 dark:bg-gray-900">
+      <header className="fluent-page-header fluent-command-header flex flex-wrap items-center gap-4 border-b border-gray-200 bg-white px-[var(--app-page-gutter)] py-4 dark:border-gray-800 dark:bg-gray-900">
         <div className="flex min-w-0 items-center gap-3">
           <div className="rounded-xl bg-violet-500/10 p-2.5 text-violet-600 dark:text-violet-400">
             <BookOpenText size={22} />
           </div>
           <div className="min-w-0">
-            <h1 className="text-base font-semibold text-gray-900 dark:text-gray-100">{t('skills.title')}</h1>
+            <h1 className="font-semibold text-gray-900 dark:text-gray-100">{t('skills.title')}</h1>
             <p className="mt-0.5 hidden text-xs text-gray-500 dark:text-gray-400 sm:block">{t('skills.subtitle')}</p>
           </div>
         </div>
@@ -388,7 +400,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
             >
               <ShieldCheck size={14} />
               {t('skills.publishedTitle')}
-              <span className="rounded-full bg-emerald-500/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-emerald-700 dark:text-emerald-300">{publishedCount}</span>
+              <span className="rounded-full bg-emerald-500/10 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">{publishedCount}</span>
             </button>
           )}
           <button
@@ -410,7 +422,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
       </header>
 
       {scanning && (
-        <div role="status" className="border-b border-violet-200 bg-violet-50 px-6 py-2 text-xs text-violet-800 dark:border-violet-900 dark:bg-violet-950/30 dark:text-violet-200">
+        <div role="status" className="border-b border-violet-200 bg-violet-50 px-[var(--app-page-gutter)] py-2 text-xs text-violet-800 dark:border-violet-900 dark:bg-violet-950/30 dark:text-violet-200">
           {scanProgress ? (
             <>
               {t('skills.scanProgress', {
@@ -426,7 +438,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
       )}
 
       {/* ── Toolbar: search + source filters in one dedicated row ── */}
-      <div className="flex flex-wrap items-center gap-3 border-b border-gray-200 bg-white px-6 py-3 dark:border-gray-800 dark:bg-gray-900">
+      <div className="flex flex-wrap items-center gap-3 border-b border-gray-200 bg-white px-[var(--app-page-gutter)] py-3 dark:border-gray-800 dark:bg-gray-900">
         <label className="relative block w-full sm:w-64">
           <Search size={14} className="pointer-events-none absolute left-2.5 top-2.5 text-gray-500" />
           <input
@@ -511,7 +523,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
                      <FileCode2 size={14} className={isSelected ? 'text-violet-600 dark:text-violet-400' : 'text-gray-500'} />
                      <span className="min-w-0 flex-1 truncate text-sm font-medium">{skill.name}</span>
                      {originOf(skill) !== 'local' && (
-                       <span className={`shrink-0 rounded px-1 py-px text-[10px] font-medium ${ORIGIN_BADGE[originOf(skill) as Exclude<SkillOrigin, 'local'>]}`}>
+                       <span className={`shrink-0 rounded px-1 py-px text-[11px] font-medium ${ORIGIN_BADGE[originOf(skill) as Exclude<SkillOrigin, 'local'>]}`}>
                          {t(ORIGIN_LABEL_KEY[originOf(skill)])}
                        </span>
                      )}
@@ -532,7 +544,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
                            onClick={() => { void quickToggleAssign(skill, agent.id) }}
                            disabled={loading}
                            title={`${equipped ? t('skills.unassignTitle') : t('skills.assignTitle')} ${agent.label}`}
-                           className={`inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium transition ${
+                           className={`inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[11px] font-medium transition ${
                              equipped
                                ? 'border-violet-500/60 bg-violet-50 text-violet-700 dark:border-violet-500/40 dark:bg-violet-500/15 dark:text-violet-200'
                                : 'border-gray-200 text-gray-500 hover:border-gray-300 hover:text-gray-600 dark:border-gray-700 dark:hover:border-gray-600'
@@ -583,7 +595,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
         {/* ── Right: skill detail ── */}
         <section className="min-h-0 min-w-0 overflow-y-auto max-md:border-t max-md:border-gray-200 max-md:dark:border-gray-800">
           {selected ? (
-            <div className="mx-auto max-w-4xl space-y-4 p-5">
+            <div className="w-full space-y-4 px-[var(--app-page-gutter)] py-5 2xl:py-8">
               {/* metadata + actions, one card instead of two */}
               <div className="rounded-2xl border border-gray-200 bg-white p-5 dark:border-gray-700 dark:bg-gray-900">
                 <div className="flex items-start gap-3">
@@ -658,7 +670,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
                   <Layers size={14} className="text-gray-500" />
                   <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">SKILL.md</span>
                 </div>
-                <pre className="overflow-x-auto whitespace-pre-wrap p-5 text-xs leading-6 text-gray-700 dark:text-gray-200 font-mono">
+                <pre className="app-reading-measure overflow-x-auto whitespace-pre-wrap p-5 text-xs leading-6 text-gray-700 dark:text-gray-200 font-mono">
                   {selected.content}
                 </pre>
               </div>
@@ -671,7 +683,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
                     <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">
                       {t('skills.bundledFiles', { count: selected.item.files.length })}
                     </span>
-                    <span className="ml-auto text-[10px] text-gray-500 dark:text-gray-400">{t('skills.bundledFilesHint')}</span>
+                    <span className="ml-auto text-xs text-gray-500 dark:text-gray-400">{t('skills.bundledFilesHint')}</span>
                   </div>
                   <div className="flex flex-wrap gap-1.5 p-5">
                     {selected.item.files.map((file) => (
@@ -717,6 +729,8 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
           onClose={() => setPublishOpen(false)}
         />
       )}
+
+      {confirmDialog}
 
       {/* ── Floating toast for notices ── */}
       {notice && (

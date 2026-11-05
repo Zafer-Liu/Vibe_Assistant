@@ -123,7 +123,7 @@ export const MemoryBrainGraph = memo(function MemoryBrainGraph({
   const selectedNode = selectedNodeId ? topology.nodeById.get(selectedNodeId) ?? null : null
 
   return (
-    <main className="flex h-full min-h-0 flex-1 flex-col gap-3 overflow-hidden p-4">
+    <div className="flex h-full min-h-0 flex-1 flex-col gap-3 overflow-hidden p-4">
       <GraphToolbar
         onBack={onBack}
         effectiveLobes={effectiveLobes}
@@ -182,6 +182,6 @@ export const MemoryBrainGraph = memo(function MemoryBrainGraph({
           />
         )}
       </div>
-    </main>
+    </div>
   )
 })

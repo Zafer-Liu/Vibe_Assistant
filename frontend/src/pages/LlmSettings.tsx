@@ -349,7 +349,7 @@ export function LlmSettings({ embedded = false, onBusyChange, onReadinessChange,
                 <input id={id} type="number" min={256} step={256} value={form.max_output_tokens ?? ''}
                   onChange={e => setForm(f => ({ ...f, max_output_tokens: e.target.value ? Number(e.target.value) : undefined }))}
                   placeholder="8192" className="field-input font-mono" />
-                <p className="mt-1 text-[11px] leading-4 text-gray-500 dark:text-gray-400">{t('llm.maxOutputTokensHint')}</p>
+                <p className="mt-1 text-xs leading-4 text-gray-500 dark:text-gray-400">{t('llm.maxOutputTokensHint')}</p>
               </>}
             </Field>
           </div>
@@ -452,7 +452,7 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
         <div className="flex flex-wrap items-center justify-between gap-2 rounded-md bg-violet-50 px-3 py-2 text-xs text-violet-800 dark:bg-violet-950/40 dark:text-violet-200">
           <div>
             <p>{t('llm.sponsorHint')}</p>
-            <p className="mt-0.5 font-mono text-[11px] text-violet-600 dark:text-violet-300">https://api.88api.ai/v1</p>
+            <p className="mt-0.5 font-mono text-xs text-violet-600 dark:text-violet-300">https://api.88api.ai/v1</p>
           </div>
           <a href={SPONSOR_CREDITS_URL} target="_blank" rel="noreferrer" className="inline-flex shrink-0 items-center gap-1 font-medium text-violet-700 underline underline-offset-2 hover:text-violet-900 dark:text-violet-300 dark:hover:text-violet-100">
             {t('llm.sponsorCredits')} <ExternalLink className="h-3 w-3" />
@@ -521,7 +521,7 @@ function BuiltinCard({ provider, showKey, onToggleKey, testResult, testing, onSa
       {provider.has_api_key && <label className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-300"><input type="checkbox" checked={clearKey} onChange={event => { setClearKey(event.target.checked); setDraft({ api_key: '', model }) }} />{t('llm.clearKey')}</label>}
 
       {isSponsor && (modelListError || modelOptions.length > 0) && (
-        <p className={`text-[11px] leading-4 ${modelListError ? 'text-red-600 dark:text-red-400' : 'text-gray-500 dark:text-gray-400'}`}>
+        <p className={`text-xs leading-4 ${modelListError ? 'text-red-600 dark:text-red-400' : 'text-gray-500 dark:text-gray-400'}`}>
           {modelListError || t('llm.fetchModelsFound', { count: modelOptions.length })}
         </p>
       )}
@@ -714,7 +714,7 @@ function OllamaPanel({ providers, onChanged, onBusyChange, onReadinessChange }: 
               <li key={m.name} className="flex items-center justify-between gap-3 py-2">
                 <div className="min-w-0">
                   <p className="truncate text-xs font-mono text-gray-800 dark:text-gray-200">{m.name}</p>
-                  <p className="text-[11px] text-gray-500">
+                  <p className="text-xs text-gray-500">
                     {[m.parameter_size, m.quantization_level, formatOllamaSize(m.size)].filter(Boolean).join(' · ')}
                   </p>
                 </div>

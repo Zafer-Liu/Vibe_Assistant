@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { useTranslation } from 'react-i18next'
 import { Brain, CheckCircle2, Loader2, Pencil, Plus, Trash2, X } from 'lucide-react'
+import { useConfirmDialog } from '../../components/ConfirmDialog'
 
 type DecisionProvider = 'jev' | 'ollama'
 
@@ -40,6 +41,7 @@ const EMPTY_DOMAIN: DomainDraft = { id: null, name: '', description: '', aliases
 
 export function DomainRoutingSettings() {
   const { t } = useTranslation()
+  const { confirm, confirmDialog } = useConfirmDialog()
   const [config, setConfig] = useState<DomainConfig | null>(null)
   const [domains, setDomains] = useState<Domain[]>([])
   const [models, setModels] = useState<string[]>([])
@@ -167,7 +169,17 @@ export function DomainRoutingSettings() {
   }
 
   async function deleteDomain(domain: Domain) {
-    if (busy || !window.confirm(t('memory.domainDeleteConfirm', { name: domain.name }))) return
+    if (busy) return
+    if (!(await confirm({
+      title: t('memory.domainDeleteTitle'),
+      message: t('memory.domainDeleteConfirm', { name: domain.name }),
+      detailLines: [
+        { label: t('memory.domainName'), value: domain.name },
+        { label: t('memory.domainDeleteAssociated'), value: String(domain.memory_count) },
+      ],
+      confirmLabel: t('common.delete'),
+      tone: 'danger',
+    }))) return
     setBusy('domain')
     setError(null)
     setNotice(null)
@@ -283,6 +295,7 @@ export function DomainRoutingSettings() {
             <button type="button" onClick={() => setDomainDraft(null)} disabled={busy !== null} className="inline-flex items-center gap-1 rounded-md border border-gray-300 px-2.5 py-1.5 text-xs dark:border-gray-600"><X size={12} />{t('common.cancel')}</button>
           </div>
         </div>}
+        {confirmDialog}
       </div>
     </section>
   )

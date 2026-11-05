@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { FileCode2, Rocket, ShieldCheck, RotateCcw, ArrowRightLeft, Loader2, X } from 'lucide-react'
+import { useConfirmDialog } from '../../../components/ConfirmDialog'
 import { useSkillFields } from '../../../store/skillStore'
 import type { SkillDriftFile, SkillItem, SkillSyncPreview } from '../../../types/skill'
 import { SOURCES } from '../sources'
@@ -72,7 +73,7 @@ export function DeployDialog({ onClose, onNotice }: {
           </div>
           <div className="min-w-0">
             <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('skills.deployDialogTitle')}</h2>
-            <p className="text-[11px] text-gray-500 dark:text-gray-400">{t('skills.deployDialogHint')}</p>
+            <p className="text-xs text-gray-500 dark:text-gray-400">{t('skills.deployDialogHint')}</p>
           </div>
           <button onClick={onClose} aria-label={t('skills.dialogCancel')} className="ml-auto shrink-0 rounded-md p-1.5 text-gray-500 transition hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300">
             <X size={15} />
@@ -107,9 +108,9 @@ export function DeployDialog({ onClose, onNotice }: {
                 <div className="flex items-center gap-2">
                   <span className={`h-2 w-2 shrink-0 rounded-full ${agent.color}`} />
                   <span className="text-xs font-semibold text-gray-800 dark:text-gray-100">{agent.label}</span>
-                  <span className="text-[11px] text-gray-500 dark:text-gray-400">{t('skills.deployEquipped', { count: equipped })}</span>
+                  <span className="text-xs text-gray-500 dark:text-gray-400">{t('skills.deployEquipped', { count: equipped })}</span>
                   {clean && (
-                    <span className="ml-auto inline-flex items-center gap-1 text-[11px] font-medium text-emerald-600 dark:text-emerald-400">
+                    <span className="ml-auto inline-flex items-center gap-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">
                       <ShieldCheck size={11} /> {t('skills.deployUpToDate')}
                     </span>
                   )}
@@ -139,7 +140,7 @@ export function DeployDialog({ onClose, onNotice }: {
                       >
                         <FileCode2 size={11} className="shrink-0 text-amber-500" />
                         <span className="truncate">{skill.name}</span>
-                        <span className="ml-auto shrink-0 text-[10px] font-medium text-violet-600 dark:text-violet-400">{t('skills.driftView')} →</span>
+                        <span className="ml-auto shrink-0 text-[11px] font-medium text-violet-600 dark:text-violet-400">{t('skills.driftView')} →</span>
                       </button>
                     ))}
                   </div>
@@ -187,6 +188,7 @@ function DriftDialog({ target, skill, onClose, onDone, onNotice }: {
   onNotice: (message: string) => void
 }) {
   const { t } = useTranslation()
+  const { confirm, confirmDialog } = useConfirmDialog()
   const { skillDriftDetail, adoptLocalSkill, applySkillSyncOne } = useSkillFields('skillDriftDetail', 'adoptLocalSkill', 'applySkillSyncOne')
   const [files, setFiles] = useState<SkillDriftFile[] | null>(null)
   const [selected, setSelected] = useState(0)
@@ -204,7 +206,16 @@ function DriftDialog({ target, skill, onClose, onDone, onNotice }: {
   const agentLabel = SOURCES.find(s => s.id === target)?.label ?? target
 
   async function overwriteWithShared() {
-    if (!window.confirm(t('skills.driftOverwriteConfirm', { name: skill.name, agent: agentLabel }))) return
+    if (!(await confirm({
+      title: t('skills.driftOverwrite'),
+      message: t('skills.driftOverwriteConfirm', { name: skill.name, agent: agentLabel }),
+      detailLines: [
+        { label: t('skills.confirmFieldSkill'), value: skill.name },
+        { label: t('skills.confirmFieldClient'), value: agentLabel },
+      ],
+      confirmLabel: t('skills.driftOverwrite'),
+      tone: 'danger',
+    }))) return
     setBusy(true)
     try {
       await applySkillSyncOne(target, skill.source, skill.name)
@@ -216,7 +227,15 @@ function DriftDialog({ target, skill, onClose, onDone, onNotice }: {
   }
 
   async function adoptLocal() {
-    if (!window.confirm(t('skills.driftAdoptConfirm', { name: skill.name, agent: agentLabel }))) return
+    if (!(await confirm({
+      title: t('skills.driftAdopt'),
+      message: t('skills.driftAdoptConfirm', { name: skill.name, agent: agentLabel }),
+      detailLines: [
+        { label: t('skills.confirmFieldSkill'), value: skill.name },
+        { label: t('skills.confirmFieldClient'), value: agentLabel },
+      ],
+      confirmLabel: t('skills.driftAdopt'),
+    }))) return
     setBusy(true)
     try {
       const result = await adoptLocalSkill(target, skill.source, skill.name)
@@ -242,7 +261,7 @@ function DriftDialog({ target, skill, onClose, onDone, onNotice }: {
           </div>
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold text-gray-800 dark:text-gray-100">{skill.name}</h2>
-            <p className="text-[11px] text-gray-500 dark:text-gray-400">{t('skills.driftSubtitle', { agent: agentLabel })}</p>
+            <p className="text-xs text-gray-500 dark:text-gray-400">{t('skills.driftSubtitle', { agent: agentLabel })}</p>
           </div>
           <button onClick={onClose} aria-label={t('skills.dialogCancel')} className="ml-auto shrink-0 rounded-md p-1.5 text-gray-500 transition hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300">
             <X size={15} />
@@ -266,7 +285,7 @@ function DriftDialog({ target, skill, onClose, onDone, onNotice }: {
         </div>
 
         <div className="border-t border-gray-100 px-5 py-3 dark:border-gray-800">
-          <p className="mb-2 text-[11px] leading-4 text-gray-500 dark:text-gray-400">{t('skills.driftHint', { agent: agentLabel })}</p>
+          <p className="mb-2 text-xs leading-4 text-gray-500 dark:text-gray-400">{t('skills.driftHint', { agent: agentLabel })}</p>
           <div className="flex flex-wrap items-center gap-2">
             <button
               onClick={() => { void overwriteWithShared() }}
@@ -287,6 +306,7 @@ function DriftDialog({ target, skill, onClose, onDone, onNotice }: {
           </div>
         </div>
       </div>
+      {confirmDialog}
     </div>
   )
 }

@@ -289,12 +289,12 @@ export function EnvManager() {
   }, [vars, query])
 
   return (
-    <div className="flex h-full flex-col bg-gray-50 dark:bg-gray-950">
+    <div className="flex h-full flex-col bg-[var(--app-canvas)]">
       {/* Header */}
-      <div className="border-b border-gray-200 bg-white px-6 py-4 dark:border-gray-700 dark:bg-gray-900">
+      <div className="border-b border-gray-200 bg-white px-[var(--app-page-gutter)] py-4 dark:border-gray-700 dark:bg-gray-900">
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-base font-semibold text-gray-900 dark:text-gray-100">{t('envVars.title')}</h1>
+            <h1 className="font-semibold text-gray-900 dark:text-gray-100">{t('envVars.title')}</h1>
             <p className="text-xs text-gray-500 dark:text-gray-400">{t('envVars.subtitle', { count: vars.length })}</p>
           </div>
           <div className="flex items-center gap-2">
@@ -319,7 +319,7 @@ export function EnvManager() {
         </div>
       </div>
 
-      <div className="flex-1 overflow-auto p-6">
+      <div className="flex-1 overflow-auto px-[var(--app-page-gutter)] py-6">
         {changed && (
           <div role="status" className="mb-4 flex items-start gap-2 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800 dark:border-blue-900/60 dark:bg-blue-950/30 dark:text-blue-300">
             <Variable className="mt-0.5 h-4 w-4 shrink-0" />
@@ -385,7 +385,7 @@ export function EnvManager() {
                       <span className="break-all font-mono text-sm font-medium text-gray-900 dark:text-gray-100">{v.name}</span>
                       {v.is_expand && (
                         <span
-                          className="shrink-0 rounded bg-amber-50 px-1.5 py-0.5 font-sans text-[10px] font-medium text-amber-600 dark:bg-amber-900/30 dark:text-amber-400"
+                          className="shrink-0 rounded bg-amber-50 px-1.5 py-0.5 font-sans text-[11px] font-medium text-amber-600 dark:bg-amber-900/30 dark:text-amber-400"
                           title={t('envVars.expandBadgeHint')}
                         >
                           {t('envVars.expandBadge')}
@@ -405,7 +405,7 @@ export function EnvManager() {
                       <>
                         <p className="mt-0.5 break-all font-mono text-xs leading-relaxed text-gray-600 dark:text-gray-300">{v.value}</p>
                         {v.expanded && (
-                          <p className="mt-0.5 break-all font-mono text-[11px] leading-relaxed text-gray-500 dark:text-gray-400">
+                          <p className="mt-0.5 break-all font-mono text-xs leading-relaxed text-gray-500 dark:text-gray-400">
                             <span className="mr-1 font-sans">→</span>{v.expanded}
                           </p>
                         )}

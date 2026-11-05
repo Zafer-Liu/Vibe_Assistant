@@ -118,12 +118,12 @@ export const MemoryInjection = memo(function MemoryInjection({ onBack, onOpenCap
     }
   }
 
-  return <main className="h-full overflow-y-auto bg-gray-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
-    <div className="mx-auto max-w-[1120px] px-5 py-6 lg:px-9 lg:py-8">
+  return <div className="h-full overflow-y-auto bg-[var(--app-canvas)] text-slate-900 dark:text-slate-100">
+    <div className="app-page-fluid py-6 lg:py-8">
       <header className="fluent-page-header flex flex-wrap items-start justify-between gap-4 border-b border-slate-200 pb-5 dark:border-slate-800">
         <div className="flex items-start gap-3">
           <button type="button" onClick={onBack} className="mt-0.5 inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:hover:bg-slate-800" aria-label={t('memory.injection.back')}><ArrowLeft size={19} /></button>
-          <div><MemoryBreadcrumb currentKey="memory.injection.title" onBack={onBack} /><h1 className="mt-1 text-2xl font-semibold tracking-tight">{t('memory.injection.title')}</h1><p className="mt-1 max-w-2xl text-sm leading-6 text-slate-500 dark:text-slate-400">{t('memory.injection.desc')}</p></div>
+          <div><MemoryBreadcrumb currentKey="memory.injection.title" onBack={onBack} /><h1 className="mt-1 font-semibold tracking-tight">{t('memory.injection.title')}</h1><p className="mt-1 max-w-2xl text-sm leading-6 text-slate-500 dark:text-slate-400">{t('memory.injection.desc')}</p></div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {notice && <span className={`rounded-lg px-3 py-2 text-xs ${notice.kind === 'ok' ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300' : 'bg-red-500/10 text-red-700 dark:text-red-300'}`} role="status">{notice.text}</span>}
@@ -151,7 +151,7 @@ export const MemoryInjection = memo(function MemoryInjection({ onBack, onOpenCap
           <div className="flex flex-wrap items-center gap-2">
             <Zap size={14} className="text-violet-600 dark:text-violet-300" />
             <h3 className="text-xs font-semibold text-slate-700 dark:text-slate-200">{t('memory.injection.hookInjectTitle')}</h3>
-            <span className="text-[11px] text-slate-500 dark:text-slate-400">{t('memory.injection.hookInjectBadge')}</span>
+            <span className="text-xs text-slate-500 dark:text-slate-400">{t('memory.injection.hookInjectBadge')}</span>
           </div>
           <div className="mt-3 grid gap-2 border-t border-slate-100 pt-3 dark:border-slate-800">
             {agentSources.map(source => {
@@ -173,14 +173,14 @@ export const MemoryInjection = memo(function MemoryInjection({ onBack, onOpenCap
               </div>
             })}
           </div>
-          <p className="mt-2 text-[11px] leading-4 text-slate-500 dark:text-slate-400">{t('memory.injection.hookInjectNote')}</p>
+          <p className="mt-2 text-xs leading-4 text-slate-500 dark:text-slate-400">{t('memory.injection.hookInjectNote')}</p>
         </div>
 
         <div className="mt-5 border-t border-slate-100 pt-4 dark:border-slate-800">
           <div className="flex flex-wrap items-center gap-2">
             <Server size={14} className="text-indigo-600 dark:text-indigo-300" />
             <h3 className="text-xs font-semibold text-slate-700 dark:text-slate-200">{t('memory.injection.mcpInjectTitle')}</h3>
-            <span className="text-[11px] text-slate-500 dark:text-slate-400">{t('memory.injection.mcpInjectBadge')}</span>
+            <span className="text-xs text-slate-500 dark:text-slate-400">{t('memory.injection.mcpInjectBadge')}</span>
           </div>
           <div className="mt-3 grid gap-2 border-t border-slate-100 pt-3 dark:border-slate-800">
             {agentSources.map(source => {
@@ -208,7 +208,7 @@ export const MemoryInjection = memo(function MemoryInjection({ onBack, onOpenCap
               </div>
             })}
           </div>
-          <p className="mt-2 text-[11px] leading-4 text-slate-500 dark:text-slate-400">{t('memory.injection.mcpInjectNote')}</p>
+          <p className="mt-2 text-xs leading-4 text-slate-500 dark:text-slate-400">{t('memory.injection.mcpInjectNote')}</p>
         </div>
 
       </section>
@@ -237,7 +237,7 @@ export const MemoryInjection = memo(function MemoryInjection({ onBack, onOpenCap
                 </div>
               })}
             </div>
-            <p className="mt-2 text-[11px] leading-4 text-slate-500">{t('memory.injection.statsNote')}</p>
+            <p className="mt-2 text-xs leading-4 text-slate-500">{t('memory.injection.statsNote')}</p>
           </div>
         ) : <p className="mt-5 border-t border-slate-100 pt-4 text-xs text-slate-500 dark:border-slate-800 dark:text-slate-400">{t('memory.injection.statsEmpty')}</p>}
         {([
@@ -262,7 +262,7 @@ export const MemoryInjection = memo(function MemoryInjection({ onBack, onOpenCap
                       <span className={`ml-auto ${log.success ? 'text-emerald-700 dark:text-emerald-300' : 'text-amber-700 dark:text-amber-300'}`}>{log.summary}</span>
                       {log.detail && <span className="shrink-0 text-[11px] text-slate-500">{expanded ? t('memory.injection.collapse') : t('memory.injection.detail')}</span>}
                     </div>
-                    {expanded && log.detail && <pre className="mx-2.5 mb-2 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded border border-slate-200 bg-white p-2.5 font-mono text-[11px] leading-5 text-slate-700 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-200">{formatLogDetail(log.detail)}</pre>}
+                    {expanded && log.detail && <pre className="mx-2.5 mb-2 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded border border-slate-200 bg-white p-2.5 font-mono text-xs leading-5 text-slate-700 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-200">{formatLogDetail(log.detail)}</pre>}
                   </div>
                 })}
               {logs.length > SUMMARY_PREVIEW_COUNT && (
@@ -277,5 +277,5 @@ export const MemoryInjection = memo(function MemoryInjection({ onBack, onOpenCap
         ))}
       </section>
     </div>
-  </main>
+  </div>
 })

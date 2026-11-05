@@ -7,10 +7,20 @@ const ThemeCtx = createContext<{ theme: Theme; toggle: () => void }>({
   toggle: () => {},
 })
 
+/**
+ * A stored choice always wins. Only when nothing is stored does the theme follow the OS
+ * colour scheme (read once; there is no live listener).
+ */
+export function getInitialTheme(): Theme {
+  const stored = localStorage.getItem('theme')
+  if (stored === 'dark' || stored === 'light') return stored
+  const prefersDark = typeof window !== 'undefined' && typeof window.matchMedia === 'function' &&
+    window.matchMedia('(prefers-color-scheme: dark)').matches
+  return prefersDark ? 'dark' : 'light'
+}
+
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  const [theme, setTheme] = useState<Theme>(() => {
-    return (localStorage.getItem('theme') as Theme) ?? 'light'
-  })
+  const [theme, setTheme] = useState<Theme>(getInitialTheme)
 
   useEffect(() => {
     const root = document.documentElement
@@ -19,11 +29,13 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     } else {
       root.classList.remove('dark')
     }
-    localStorage.setItem('theme', theme)
   }, [theme])
 
+  // Persist only an explicit choice, so an untouched install keeps following the OS default.
   function toggle() {
-    setTheme(t => (t === 'dark' ? 'light' : 'dark'))
+    const next: Theme = theme === 'dark' ? 'light' : 'dark'
+    setTheme(next)
+    localStorage.setItem('theme', next)
   }
 
   return <ThemeCtx.Provider value={{ theme, toggle }}>{children}</ThemeCtx.Provider>

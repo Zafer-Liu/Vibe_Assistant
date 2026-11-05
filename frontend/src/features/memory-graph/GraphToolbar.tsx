@@ -71,7 +71,7 @@ export const GraphToolbar = memo(function GraphToolbar({
         </div>
         <div className="min-w-0">
           <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-            <h1 className="text-lg font-semibold text-gray-800 dark:text-gray-100">
+            <h1 className="font-semibold text-gray-800 dark:text-gray-100">
               {t('memory.brainGraph.title')}
             </h1>
             <span className="text-xs text-gray-600 dark:text-gray-300">
@@ -212,7 +212,7 @@ export const GraphToolbar = memo(function GraphToolbar({
           )
         })}
 
-        <span className="ml-auto text-[11px] text-gray-500 dark:text-gray-400">
+        <span className="ml-auto text-xs text-gray-500 dark:text-gray-400">
           {t('memory.brainGraph.selectionHint')}
         </span>
       </div>

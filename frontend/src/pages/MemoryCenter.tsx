@@ -15,6 +15,8 @@ import type { ConsolidationResult, HookStatus, MemoryDomainItem, MemoryImportanc
 import { normalizeL2Document } from '../lib/thinking'
 import { MemoryMarkdown } from '../components/MemoryMarkdown'
 import { CloudVaultCard } from '../components/CloudVaultCard'
+import { Modal } from '../components/Modal'
+import { useConfirmDialog } from '../components/ConfirmDialog'
 import { sourceLabel } from '../components/ConversationDialog'
 import { intlLocale } from '../i18n'
 import { compactTokenCount } from '../lib/compactNumber'
@@ -98,18 +100,19 @@ const MemoryCard = memo(function MemoryCard({ memory: m, ranking, onPin, onEdit,
 }) {
   const { t } = useTranslation()
   const level = ranking?.score == null ? null : ranking.score >= 70 ? 'high' : ranking.score >= 40 ? 'medium' : 'low'
+  const pinLabel = ranking?.pinned ? t('memory.importanceUnpin') : t('memory.importancePin')
   return (
     <div className="rounded-md bg-gray-50 dark:bg-gray-700/50 border border-gray-200 dark:border-gray-600 px-3 py-2 [content-visibility:auto] [contain-intrinsic-size:auto_64px]">
       <div className="flex items-start gap-2">
         <MemoryMarkdown content={m.memory} className="flex-1 break-words" />
         <div className="flex shrink-0 gap-1">
-          <button onClick={() => { void onPin(m.id, !ranking?.pinned) }} className={`p-1 rounded hover:bg-amber-100 hover:text-amber-800 dark:hover:bg-amber-900/40 dark:hover:text-amber-200 ${ranking?.pinned ? 'text-amber-500' : 'text-gray-500 dark:text-gray-400'}`} title={ranking?.pinned ? t('memory.importanceUnpin') : t('memory.importancePin')}>
+          <button type="button" onClick={() => { void onPin(m.id, !ranking?.pinned) }} className={`inline-flex h-7 w-7 items-center justify-center rounded hover:bg-amber-100 hover:text-amber-800 dark:hover:bg-amber-900/40 dark:hover:text-amber-200 ${ranking?.pinned ? 'text-amber-500' : 'text-gray-500 dark:text-gray-400'}`} title={pinLabel} aria-label={pinLabel}>
             <Star size={13} className={ranking?.pinned ? 'fill-current' : ''} />
           </button>
-          <button onClick={() => onEdit(m)} className="p-1 rounded hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-500 dark:text-gray-400" title={t('common.edit')}>
+          <button type="button" onClick={() => onEdit(m)} className="inline-flex h-7 w-7 items-center justify-center rounded hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-500 dark:text-gray-400" title={t('common.edit')} aria-label={t('common.edit')}>
             <Pencil size={13} />
           </button>
-          <button onClick={() => onDelete(m)} className="p-1 rounded hover:bg-red-100 dark:hover:bg-red-900/40 text-gray-500 dark:text-gray-400 hover:text-red-800 dark:hover:text-red-200" title={t('common.delete')}>
+          <button type="button" onClick={() => onDelete(m)} className="ml-2 inline-flex h-7 w-7 items-center justify-center rounded hover:bg-red-100 dark:hover:bg-red-900/40 text-gray-500 dark:text-gray-400 hover:text-red-800 dark:hover:text-red-200" title={t('common.delete')} aria-label={t('common.delete')}>
             <Trash2 size={13} />
           </button>
         </div>
@@ -308,7 +311,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
   }
 
   if (booting) {
-    return <div className="flex h-full min-h-0 items-center justify-center bg-gray-50 px-6 dark:bg-gray-950" role="status" aria-live="polite">
+    return <div className="flex h-full min-h-0 items-center justify-center bg-[var(--app-canvas)] px-6" role="status" aria-live="polite">
       <div className="w-full max-w-md rounded-2xl border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-900">
         <div className="flex items-center gap-3 text-gray-800 dark:text-gray-100"><span className="rounded-xl bg-violet-500/10 p-2.5 text-violet-600 dark:text-violet-400"><Loader2 className="animate-spin motion-reduce:animate-none" size={21} /></span><div><p className="text-sm font-semibold">{t('memory.booting')}</p><p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">{t('memory.bootingHint')}</p></div></div>
         <div className="mt-5 space-y-2.5" aria-hidden="true"><div className="h-3 w-4/5 animate-pulse rounded bg-gray-100 dark:bg-gray-800" /><div className="h-3 w-full animate-pulse rounded bg-gray-100 dark:bg-gray-800" /><div className="h-3 w-3/5 animate-pulse rounded bg-gray-100 dark:bg-gray-800" /></div>
@@ -595,14 +598,14 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
     : t('memory.liveRunIdle', { count: telemetryLiveStatus?.captured_sessions ?? 0 })
 
   return (
-    <div className="flex flex-col gap-4 overflow-y-auto p-4">
+    <div className="flex h-full flex-col gap-4 overflow-y-auto bg-[var(--app-canvas)] px-[var(--app-page-gutter)] py-4">
       {/* 本地记忆与智能检索始终可用；旧语义侧车仅作为可选高级能力。 */}
       <div className="fluent-page-header flex flex-wrap items-center gap-3 rounded-xl">
         <div className="p-2 rounded-lg bg-violet-500/10 text-violet-600 dark:text-violet-400">
           <Brain size={20} />
         </div>
         <div>
-          <h1 className="text-lg font-semibold text-gray-800 dark:text-gray-100">{t('memory.title')}</h1>
+          <h1 className="font-semibold text-gray-800 dark:text-gray-100">{t('memory.title')}</h1>
           <p className="text-xs text-gray-500 dark:text-gray-400">{t('memory.subtitle')}</p>
         </div>
         <div className="ml-auto flex flex-wrap items-center justify-end gap-1.5">
@@ -705,7 +708,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
           <FolderOpen size={14} className="text-violet-600 dark:text-violet-400" />
           <div className="min-w-0 flex-1"><p className="text-xs font-medium text-gray-700 dark:text-gray-200">{t('memory.importMemoryTitle')}</p><p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">{t('memory.importMemoryHint')}</p></div>
           <button onClick={() => { void handleImportMemoryFolder() }} disabled={importingMemories || !ingestStatus?.model_ready} className="inline-flex items-center gap-1.5 rounded-md border border-violet-200 bg-white px-2.5 py-1.5 text-xs font-medium text-violet-700 hover:bg-violet-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-violet-500/30 dark:bg-gray-800 dark:text-violet-300 dark:hover:bg-violet-500/10">{importingMemories ? <Loader2 size={13} className="animate-spin" /> : <FolderOpen size={13} />}{importingMemories ? t('memory.importMemoryWorking') : t('memory.importMemoryButton')}</button>
-          {memoryImportResult && <p className="basis-full text-[11px] text-green-700 dark:text-green-300" role="status">{t('memory.importResult', { scanned: memoryImportResult.scanned_files, recognized: memoryImportResult.recognized_files, imported: memoryImportResult.imported_memories, skipped: memoryImportResult.skipped_files > 0 ? t('memory.importResultSkipped', { count: memoryImportResult.skipped_files }) : '' })}</p>}
+          {memoryImportResult && <p className="basis-full text-xs text-green-700 dark:text-green-300" role="status">{t('memory.importResult', { scanned: memoryImportResult.scanned_files, recognized: memoryImportResult.recognized_files, imported: memoryImportResult.imported_memories, skipped: memoryImportResult.skipped_files > 0 ? t('memory.importResultSkipped', { count: memoryImportResult.skipped_files }) : '' })}</p>}
         </div>
 
         {ingestStatus && ingestStatus.buffered_sessions > 0 && (
@@ -1047,15 +1050,16 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
 
       {/* 编辑弹窗 */}
       {editing && (
-        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={() => setEditing(null)}>
-          <div className="w-full max-w-md rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 p-4 space-y-3" onClick={(e) => e.stopPropagation()}>
+        <Modal labelledBy="memory-edit-title" onClose={() => setEditing(null)}>
+          <div className="w-full max-w-md rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 p-4 space-y-3">
             <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('memory.editTitle')}</h3>
+              <h3 id="memory-edit-title" className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('memory.editTitle')}</h3>
               <button onClick={() => setEditing(null)} className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500">
                 <X size={15} />
               </button>
             </div>
             <textarea
+              data-autofocus
               value={editContent}
               onChange={(e) => setEditContent(e.target.value)}
               rows={4}
@@ -1070,16 +1074,16 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
               </button>
             </div>
           </div>
-        </div>
+        </Modal>
       )}
 
       {/* L3 草案删除确认：仅允许删除未发布的草案。 */}
       {l3DeleteTarget && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => !deletingL3 && setL3DeleteTarget(null)}>
-          <div className="w-full max-w-sm space-y-3 rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800" onClick={(event) => event.stopPropagation()}>
+        <Modal labelledBy="memory-l3-delete-title" busy={Boolean(deletingL3)} dismissOnBackdrop onClose={() => setL3DeleteTarget(null)}>
+          <div className="w-full max-w-sm space-y-3 rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800">
             <div className="flex items-center gap-2">
               <Trash2 size={18} className="text-red-500" />
-              <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-100">{l3DeleteTarget.state === 'archived' ? t('memory.l3DeleteArchivedTitle') : t('memory.l3DeleteTitle')}</h3>
+              <h3 id="memory-l3-delete-title" className="text-sm font-semibold text-gray-800 dark:text-gray-100">{l3DeleteTarget.state === 'archived' ? t('memory.l3DeleteArchivedTitle') : t('memory.l3DeleteTitle')}</h3>
             </div>
             <p className="text-sm leading-6 text-gray-600 dark:text-gray-300">{t('memory.l3DeleteHint', { kind: l3DeleteTarget.state === 'archived' ? t('memory.l3Archived').toLowerCase() : t('memory.l3Draft').toLowerCase() })}</p>
             <p className="text-xs text-gray-500 dark:text-gray-400">{t('memory.l3SourceLine', { count: l3DeleteTarget.source_count, tokens: l3DeleteTarget.token_estimate })}</p>
@@ -1088,28 +1092,28 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
               <button onClick={() => { void confirmL3DraftDelete() }} disabled={Boolean(deletingL3)} className="inline-flex items-center gap-1 rounded-md bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50">{deletingL3 ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}{deletingL3 ? t('memory.l3Deleting') : t('memory.l3DeleteDraft')}</button>
             </div>
           </div>
-        </div>
+        </Modal>
       )}
 
       {/* L1 重新提取确认：保留 L0 与使用量，只重建派生层。 */}
       {resetL1ConfirmOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => !resettingL1 && setResetL1ConfirmOpen(false)}>
-          <div className="w-full max-w-md space-y-3 rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800" onClick={(event) => event.stopPropagation()}>
-            <div className="flex items-center gap-2"><RefreshCw size={18} className="text-violet-600 dark:text-violet-300" /><h3 className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('memory.l1ResetConfirmTitle')}</h3></div>
+        <Modal labelledBy="memory-l1-reset-title" busy={resettingL1} dismissOnBackdrop onClose={() => setResetL1ConfirmOpen(false)}>
+          <div className="w-full max-w-md space-y-3 rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800">
+            <div className="flex items-center gap-2"><RefreshCw size={18} className="text-violet-600 dark:text-violet-300" /><h3 id="memory-l1-reset-title" className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('memory.l1ResetConfirmTitle')}</h3></div>
             <p className="text-sm leading-6 text-gray-600 dark:text-gray-300">{t('memory.l1ResetConfirmDesc')}</p>
             <p className="text-xs leading-5 text-violet-700 dark:text-violet-300">{t('memory.l1ResetConfirmHint')}</p>
             <div className="flex justify-end gap-2"><button onClick={() => setResetL1ConfirmOpen(false)} disabled={resettingL1} className="rounded-md border border-gray-300 px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700">{t('common.cancel')}</button><button onClick={() => { void confirmResetL1() }} disabled={resettingL1} className="inline-flex items-center gap-1 rounded-md bg-violet-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-violet-500 disabled:opacity-50">{resettingL1 ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}{resettingL1 ? t('memory.l1Resetting') : t('memory.l1ResetRun')}</button></div>
           </div>
-        </div>
+        </Modal>
       )}
 
       {/* 删除确认弹窗 */}
       {deleteTarget && (
-        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={() => setDeleteTarget(null)}>
-          <div className="w-full max-w-sm rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 p-4 space-y-3" onClick={(e) => e.stopPropagation()}>
+        <Modal labelledBy="memory-delete-title" dismissOnBackdrop onClose={() => setDeleteTarget(null)}>
+          <div className="w-full max-w-sm rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 p-4 space-y-3">
             <div className="flex items-center gap-2">
               <Trash2 size={18} className="text-red-500" />
-              <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('memory.deleteConfirm')}</h3>
+              <h3 id="memory-delete-title" className="text-sm font-semibold text-gray-800 dark:text-gray-100">{t('memory.deleteConfirm')}</h3>
             </div>
             <p className="text-sm text-gray-600 dark:text-gray-300 line-clamp-3 break-all">{deleteTarget.memory}</p>
             <p className="text-xs text-amber-600 dark:text-amber-400">{t('memory.deleteGlobalHint')}</p>
@@ -1123,7 +1127,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
               {t('memory.deleteDontAsk')}
             </label>
             <div className="flex justify-end gap-2">
-              <button onClick={() => setDeleteTarget(null)} className="px-3 py-1.5 rounded-md border border-gray-300 dark:border-gray-600 text-sm text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700">
+              <button data-autofocus onClick={() => setDeleteTarget(null)} className="px-3 py-1.5 rounded-md border border-gray-300 dark:border-gray-600 text-sm text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700">
                 {t('common.cancel')}
               </button>
               <button onClick={() => { void confirmDelete() }} className="px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-500 text-white text-sm font-medium">
@@ -1131,7 +1135,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
               </button>
             </div>
           </div>
-        </div>
+        </Modal>
       )}
     </div>
   )
@@ -1155,8 +1159,10 @@ function UserMemoryList({ accent, scope }: { accent: 'sky' | 'violet'; scope: 'l
   const [savingId, setSavingId] = useState<string | null>(null)
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const { confirm, confirmDialog } = useConfirmDialog()
 
-  if (!customMemories.length) return null
+  // 列表在确认期间被清空时仍要渲染挂起的确认弹窗，否则 Promise 会一直悬空。
+  if (!customMemories.length) return confirmDialog
 
   const accentText = accent === 'sky' ? 'text-sky-700 dark:text-sky-300' : 'text-violet-700 dark:text-violet-300'
   const accentSave = accent === 'sky'
@@ -1180,7 +1186,14 @@ function UserMemoryList({ accent, scope }: { accent: 'sky' | 'violet'; scope: 'l
   }
 
   const handleDelete = async (id: string) => {
-    if (!window.confirm(t('memory.customMemoryDeleteConfirm'))) return
+    const target = customMemories.find((memory) => memory.id === id)
+    if (!(await confirm({
+      title: t('memory.customMemoryDeleteTitle'),
+      message: t('memory.customMemoryDeleteConfirm'),
+      detailLines: target ? [{ label: t('memory.customMemoryContent'), value: target.memory }] : undefined,
+      confirmLabel: t('memory.customMemoryDelete'),
+      tone: 'danger',
+    }))) return
     setDeletingId(id)
     setError(null)
     try {
@@ -1194,6 +1207,7 @@ function UserMemoryList({ accent, scope }: { accent: 'sky' | 'violet'; scope: 'l
 
   return (
     <div className="mt-3 space-y-1.5">
+      {confirmDialog}
       <p className={`text-xs font-medium ${accentText}`}>{t('memory.customMemoryList', { count: customMemories.length })}</p>
       {error && <p className="rounded border border-red-200 bg-red-50 px-2 py-1 text-xs text-red-700 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-300">{error}</p>}
       {customMemories.map((memory) => (
@@ -1216,7 +1230,7 @@ function UserMemoryList({ accent, scope }: { accent: 'sky' | 'violet'; scope: 'l
             </div>
           ) : (
             <div className="flex items-start gap-2">
-              <span className="mt-0.5 shrink-0 rounded bg-gray-100 px-1.5 py-0.5 font-mono text-[10px] text-gray-600 dark:bg-gray-700 dark:text-gray-300">{memory.memory_type ?? 'fact'}</span>
+              <span className="mt-0.5 shrink-0 rounded bg-gray-100 px-1.5 py-0.5 font-mono text-[11px] text-gray-600 dark:bg-gray-700 dark:text-gray-300">{memory.memory_type ?? 'fact'}</span>
               <p className="min-w-0 flex-1 whitespace-pre-wrap break-words text-sm text-gray-800 dark:text-gray-100">{memory.memory}</p>
               <div className="flex shrink-0 items-center gap-1">
                 <button type="button" onClick={() => { setEditingId(memory.id); setEditContent(memory.memory) }} disabled={deletingId === memory.id} className="inline-flex items-center gap-1 rounded border border-gray-300 px-1.5 py-0.5 text-xs font-medium text-gray-700 hover:bg-gray-100 disabled:opacity-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700"><Pencil size={11} />{t('memory.l2Edit')}</button>

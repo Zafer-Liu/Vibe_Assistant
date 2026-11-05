@@ -612,7 +612,7 @@ function EmbeddingIndexPanel() {
                 />
                 <span className="text-xs text-[var(--app-secondary)]">{t('settings.semanticSearch.hoursUnit')}</span>
               </span>
-              <span className="mt-1.5 block text-[11px] leading-4 text-[var(--app-secondary)]">{t('settings.semanticSearch.intervalHint')}</span>
+              <span className="mt-1.5 block text-xs leading-4 text-[var(--app-secondary)]">{t('settings.semanticSearch.intervalHint')}</span>
             </label>
           )}
         </div>

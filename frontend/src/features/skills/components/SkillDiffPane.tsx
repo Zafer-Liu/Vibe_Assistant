@@ -43,12 +43,12 @@ export function SkillDiffPane({ files, selected, onSelect }: {
           </button>
         ))}
       </div>
-      <div className="flex items-center gap-3 text-[10px] text-gray-500 dark:text-gray-400">
+      <div className="flex items-center gap-3 text-[11px] text-gray-500 dark:text-gray-400">
         <span className="inline-flex items-center gap-1"><span className="inline-block h-2 w-2 rounded-sm bg-rose-400" />{t('skills.driftLegendShared')}</span>
         <span className="inline-flex items-center gap-1"><span className="inline-block h-2 w-2 rounded-sm bg-emerald-400" />{t('skills.driftLegendLocal')}</span>
       </div>
       {diffNote && <p className="text-xs text-amber-600 dark:text-amber-400">{diffNote}</p>}
-      <pre className="max-h-72 overflow-auto rounded-xl bg-gray-50 p-3 font-mono text-[11px] leading-5 dark:bg-gray-800/60">
+      <pre className="max-h-72 overflow-auto rounded-xl bg-gray-50 p-3 font-mono text-xs leading-5 dark:bg-gray-800/60">
         {diffLines.map((line, index) => (
           <div
             key={index}

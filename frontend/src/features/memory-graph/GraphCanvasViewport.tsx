@@ -17,6 +17,33 @@ interface GraphCanvasViewportProps {
   controllerRef?: Ref<GraphViewportController>
 }
 
+interface CanvasColors {
+  surface: string
+  ink: string
+  muted: string
+  accent: string
+}
+
+// Literal canvas colours. surface, accent and the light muted tone equal the fluent.css tokens
+// (--app-surface, --app-accent, --app-secondary) and are only fallbacks; ink and the dark muted tone map to no token.
+function canvasFallbackColors(isDark: boolean): CanvasColors {
+  return isDark
+    ? { surface: '#272727', ink: '#f3f3f3', muted: '#bdbdbd', accent: '#60cdff' }
+    : { surface: '#ffffff', ink: '#242424', muted: '#616161', accent: '#0067c0' }
+}
+
+function readCanvasColors(isDark: boolean): CanvasColors {
+  const fallback = canvasFallbackColors(isDark)
+  const style = getComputedStyle(document.documentElement)
+  const token = (name: string, hex: string) => style.getPropertyValue(name).trim() || hex
+  return {
+    surface: token('--app-surface', fallback.surface),
+    ink: fallback.ink,
+    muted: isDark ? fallback.muted : token('--app-secondary', fallback.muted),
+    accent: token('--app-accent', fallback.accent),
+  }
+}
+
 export const GraphCanvasViewport = memo(function GraphCanvasViewport(props: GraphCanvasViewportProps) {
   const { t } = useTranslation()
   const { active, topology, controllerRef, onSelectNode } = props
@@ -142,6 +169,18 @@ export const GraphCanvasViewport = memo(function GraphCanvasViewport(props: Grap
     let height = 1
     let dpr = 1
     const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)')
+    // Token colours are read once per theme, never per frame.
+    let colorCache: { isDark: boolean; colors: CanvasColors } | null = null
+    const resolveColors = (isDark: boolean): CanvasColors => {
+      const cached = colorCache
+      if (cached && cached.isDark === isDark) return cached.colors
+      // ThemeProvider flips the root .dark class in an effect; until it matches the prop the tokens still
+      // belong to the previous theme, so draw with the literal values and do not cache.
+      if (document.documentElement.classList.contains('dark') !== isDark) return canvasFallbackColors(isDark)
+      const colors = readCanvasColors(isDark)
+      colorCache = { isDark, colors }
+      return colors
+    }
 
     const renderFrame = () => {
       frameId = 0
@@ -154,10 +193,7 @@ export const GraphCanvasViewport = memo(function GraphCanvasViewport(props: Grap
       cam.x += (cam.targetX - cam.x) * amount
       cam.y += (cam.targetY - cam.y) * amount
       cam.scale += (cam.targetScale - cam.scale) * amount
-      const surface = latest.isDark ? '#272727' : '#ffffff'
-      const ink = latest.isDark ? '#f3f3f3' : '#242424'
-      const muted = latest.isDark ? '#bdbdbd' : '#616161'
-      const accent = latest.isDark ? '#60cdff' : '#0067c0'
+      const { surface, ink, muted, accent } = resolveColors(latest.isDark)
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
       ctx.globalAlpha = 1
       ctx.fillStyle = surface

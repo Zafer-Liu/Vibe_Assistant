@@ -86,11 +86,11 @@ export function EquipDialog({ entry, onClose, onNotice }: {
   }
 
   const stateBadge = (state: string | undefined) => {
-    if (!state) return <span className="text-[10px] text-gray-500 dark:text-gray-400">{t('mcpLibrary.statusUnavailable')}</span>
-    if (state === 'installed') return <span className="rounded-full bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-300">{t('mcpLibrary.stateInstalled')}</span>
-    if (state === 'differs') return <span className="rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300">{t('mcpLibrary.stateDiffers')}</span>
-    if (state === 'missing') return <span className="rounded-full bg-gray-500/10 px-1.5 py-0.5 text-[10px] font-medium text-gray-500 dark:text-gray-400">{t('mcpLibrary.stateMissing')}</span>
-    return <span className="text-[10px] text-gray-500 dark:text-gray-400">{t('mcpLibrary.statusUnavailable')}</span>
+    if (!state) return <span className="text-[11px] text-gray-500 dark:text-gray-400">{t('mcpLibrary.statusUnavailable')}</span>
+    if (state === 'installed') return <span className="rounded-full bg-emerald-500/10 px-1.5 py-0.5 text-[11px] font-medium text-emerald-700 dark:text-emerald-300">{t('mcpLibrary.stateInstalled')}</span>
+    if (state === 'differs') return <span className="rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-300">{t('mcpLibrary.stateDiffers')}</span>
+    if (state === 'missing') return <span className="rounded-full bg-gray-500/10 px-1.5 py-0.5 text-[11px] font-medium text-gray-500 dark:text-gray-400">{t('mcpLibrary.stateMissing')}</span>
+    return <span className="text-[11px] text-gray-500 dark:text-gray-400">{t('mcpLibrary.statusUnavailable')}</span>
   }
 
   return (
@@ -131,10 +131,10 @@ export function EquipDialog({ entry, onClose, onNotice }: {
                   <span className={`h-2 w-2 shrink-0 rounded-full ${target.color}`} />
                   <span className={`min-w-0 flex-1 truncate text-sm ${unsupported ? 'text-gray-500 dark:text-gray-400' : 'text-gray-800 dark:text-gray-100'}`}>{target.label}</span>
                   {unsupported ? (
-                    <span className="text-[10px] text-gray-500 dark:text-gray-400">{t('mcpLibrary.remoteUnsupported')}</span>
+                    <span className="text-[11px] text-gray-500 dark:text-gray-400">{t('mcpLibrary.remoteUnsupported')}</span>
                   ) : (
                     <>
-                      {checked && (mcpStatusState === 'ready' ? stateBadge(status?.state) : <span className="text-[10px] text-gray-500 dark:text-gray-400">{t('mcpLibrary.statusUnavailable')}</span>)}
+                      {checked && (mcpStatusState === 'ready' ? stateBadge(status?.state) : <span className="text-[11px] text-gray-500 dark:text-gray-400">{t('mcpLibrary.statusUnavailable')}</span>)}
                       {checked && busyAgent !== target.id && (
                         <button
                           onClick={() => { void rewrite(target.id) }}

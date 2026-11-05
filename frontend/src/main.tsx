@@ -3,11 +3,10 @@ import { createRoot } from 'react-dom/client'
 import './index.css'
 import './i18n'
 import App from './App.tsx'
-import { ThemeProvider } from './theme.tsx'
+import { ThemeProvider, getInitialTheme } from './theme.tsx'
 
-// Apply saved theme before first render to avoid flash
-const saved = localStorage.getItem('theme') ?? 'light'
-if (saved === 'dark') document.documentElement.classList.add('dark')
+// Apply the initial theme (saved choice, else OS preference) before first render to avoid flash
+if (getInitialTheme() === 'dark') document.documentElement.classList.add('dark')
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

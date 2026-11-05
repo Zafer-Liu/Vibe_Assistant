@@ -88,7 +88,7 @@ export function UpdateChecker({ autoCheck = false, compact = false, sidebar = fa
       return (
         <button
           onClick={openDownload}
-          className="flex items-center gap-1 rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-medium text-blue-700 hover:bg-blue-200 dark:bg-blue-900/40 dark:text-blue-300 dark:hover:bg-blue-800/60"
+          className="flex items-center gap-1 rounded-full bg-blue-100 px-2 py-0.5 text-[11px] font-medium text-blue-700 hover:bg-blue-200 dark:bg-blue-900/40 dark:text-blue-300 dark:hover:bg-blue-800/60"
           title={t('updater.newVersionAvailable', { version: info.latest })}
         >
           <ArrowUpCircle className="h-3 w-3" />

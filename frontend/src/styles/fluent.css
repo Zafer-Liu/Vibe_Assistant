@@ -80,6 +80,8 @@
   --app-focus: #0067c0;
   --app-scrollbar: #88888880;
   --app-ease: cubic-bezier(.16,1,.3,1);
+  /* Single horizontal gutter shared by every page-level content wrapper and header bar, so page title left edges line up across pages. */
+  --app-page-gutter: clamp(20px, 2.5vw, 48px);
 }
 .dark {
   color-scheme: dark;
@@ -146,7 +148,7 @@ body { font-family: var(--font-sans); font-size: 14px; line-height: 1.5; backgro
 .app-icon-button { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 5px; flex-shrink: 0; color: var(--app-secondary); }
 .app-icon-button:hover { background: var(--app-hover); color: var(--app-text); }
 .app-search-button { display: flex; align-items: center; gap: 9px; width: calc(100% - 24px); height: 34px; margin: 0 12px 14px; padding: 0 10px; background: var(--app-surface); border: 1px solid var(--app-control-stroke); border-bottom-color: var(--app-control-bottom); border-radius: 6px; color: var(--app-secondary); font-size: 12px; }
-.app-search-button kbd { margin-left: auto; font-family: inherit; font-size: 10px; opacity: .8; }
+.app-search-button kbd { margin-left: auto; font-family: inherit; font-size: 11px; opacity: .8; }
 .app-navigation { display: flex; min-height: 0; flex: 1; flex-direction: column; gap: 3px; overflow-y: auto; padding: 0 10px 12px; }
 .app-nav-item { position: relative; display: flex; align-items: center; gap: 12px; width: 100%; min-height: 36px; padding: 8px 12px; border-radius: 5px; font-size: 13px; text-align: left; color: var(--app-text); transition: background-color 120ms, color 120ms; }
 .app-nav-item:hover { background: var(--app-hover); }
@@ -180,9 +182,19 @@ body { font-family: var(--font-sans); font-size: 14px; line-height: 1.5; backgro
 .app-page-host > :where(div,main,section):not(.hidden) { min-width: 0; }
 .app-page-host h1 { font-size: 24px; line-height: 1.3; font-weight: 600; letter-spacing: -.025em; }
 .fluent-page-header { gap: 16px; flex-shrink: 0; }
-.fluent-command-header { padding: 24px; background: var(--app-surface); }
+.fluent-command-header { padding: 24px var(--app-page-gutter); background: var(--app-surface); }
 .fluent-page-header h1, .fluent-page-header h2 { letter-spacing: -.025em; }
 .fluent-page-header p { line-height: 1.6; }
+/* Adaptive page width: pages fill the workspace pane instead of a fixed centered column. Gutters scale with the viewport; --app-page-max only guards ultra-wide displays. */
+.app-page-fluid { width: 100%; max-width: var(--app-page-max, 2560px); margin-inline: auto; padding-inline: var(--app-page-gutter); }
+/* Form pages keep a comfortable reading measure, but it grows with the viewport rather than staying a fixed 768px column. */
+.app-page-form { width: 100%; max-width: clamp(48rem, 64vw, 84rem); margin-inline: auto; padding-inline: var(--app-page-gutter); }
+/* Card collections reflow into more columns as the pane widens; a single column below 40rem, exactly like the old stacked list. */
+.app-card-grid { display: grid; align-items: start; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 40rem), 1fr)); }
+/* Reading measure for long-form text and pre blocks only: caps the block at ~110ch so lines stay readable while its fluid container keeps filling the pane. */
+.app-reading-measure { max-width: 110ch; }
+/* Help documents: short independent topics laid out as cards; columns are added as the pane widens, each at least 30rem so line length stays readable. */
+.app-help-grid { display: grid; align-items: start; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 30rem), 1fr)); }
 .fluent-section { background: var(--app-layer); border-color: var(--app-stroke); }
 .app-page-host :where([role=alert],[role=status]) { line-height: 1.6; }
 .fluent-skip-link { position: absolute; left: 8px; top: -80px; z-index: 1000; padding: 8px 16px; border-radius: 6px; background: var(--app-accent); color: var(--app-canvas); }
@@ -200,10 +212,7 @@ body { font-family: var(--font-sans); font-size: 14px; line-height: 1.5; backgro
 .app-command-option[data-selected=true] { background: var(--app-accent-soft); color: var(--app-accent); }
 .app-command-group { margin-left: auto; color: var(--app-secondary); font-size: 12px; }
 .app-command-footer { display: flex; gap: 16px; border-top: 1px solid var(--app-stroke); padding: 10px 20px; font-size: 11px; color: var(--app-secondary); }
-@media (max-width: 1050px) { .fluent-command-header { padding: 20px; } .app-contextbar { padding-inline: 20px; } }
-@media (prefers-reduced-motion: reduce) {
-  .fluent-app *, .fluent-app *::before, .fluent-app *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
-}
+@media (max-width: 1050px) { .fluent-command-header { padding: 20px var(--app-page-gutter); } .app-contextbar { padding-inline: 20px; } }
 
 .app-workspace-home { height: 100%; overflow-y: auto; padding: 32px; }
 .app-workspace-home-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 32px; }
@@ -230,3 +239,14 @@ body { font-family: var(--font-sans); font-size: 14px; line-height: 1.5; backgro
 .app-nav-item[data-current-group=true] { font-weight: 600; }
 .dark .fluent-app :where(.text-gray-500,.text-gray-600,.text-slate-500,.text-slate-600):not([class*="dark:text-"]) { color: var(--app-secondary); }
 .fluent-app dialog .fluent-dialog-panel { animation: none; }
+
+/* Reduced motion keeps short colour/opacity feedback instead of freezing every transition: transform, scale and layout motion is dropped, looping animations stop, dialogs fade in. Kept last so it wins over the base rules above. */
+@keyframes fluent-dialog-fade { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  html, .fluent-app, .fluent-app *, .fluent-app *::before, .fluent-app *::after { scroll-behavior: auto; }
+  .fluent-app *, .fluent-app *::before, .fluent-app *::after { transition-property: color, background-color, border-color, text-decoration-color, fill, stroke, opacity; transition-duration: 120ms; transition-delay: 0s; }
+  .fluent-app :is(.animate-spin, .animate-pulse, .animate-ping, .animate-bounce) { animation: none; }
+  .fluent-app :where(dialog[open]), .fluent-dialog-panel { animation: fluent-dialog-fade 120ms linear both; }
+  .fluent-app button:enabled:active { scale: none; }
+  .app-nav-disclosure { transition: none; }
+}

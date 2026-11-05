@@ -20,6 +20,15 @@ function detectInitialLang(): LangCode {
   return nav.startsWith('en') ? 'en' : 'zh'
 }
 
+// 应用语言代码 -> BCP-47，用于 <html lang>（屏幕阅读器、拼写检查、字体选择依赖它）
+const HTML_LANG: Record<LangCode, string> = { zh: 'zh-CN', en: 'en' }
+
+function applyDocumentLang(lang: LangCode) {
+  document.documentElement.lang = HTML_LANG[lang]
+}
+
+const initialLang = detectInitialLang()
+
 i18n
   .use(initReactI18next)
   .init({
@@ -27,14 +36,16 @@ i18n
       zh: { translation: zh },
       en: { translation: en },
     },
-    lng: detectInitialLang(),
+    lng: initialLang,
     fallbackLng: 'zh',
     interpolation: { escapeValue: false },
     returnNull: false,
   })
+applyDocumentLang(initialLang)
 
 export function setLanguage(lang: LangCode) {
   i18n.changeLanguage(lang)
+  applyDocumentLang(lang)
   localStorage.setItem(STORAGE_KEY, lang)
 }
 

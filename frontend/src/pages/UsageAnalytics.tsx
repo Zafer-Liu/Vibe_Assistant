@@ -229,7 +229,7 @@ function UsageHeatmap({ cells, loading }: { cells: TelemetryUsageHeatCell[]; loa
         <div className="mt-5 overflow-x-auto pb-1">
           <div className="grid min-w-[690px] grid-cols-[3.5rem_repeat(24,minmax(1.25rem,1fr))] gap-1" role="img" aria-label={t('memory.usage.heatmapDesc')}>
             <span />
-            {Array.from({ length: 24 }, (_, hour) => <span key={hour} className="text-center font-mono text-[9px] tabular-nums text-slate-500">{hour % 3 === 0 ? hour.toString().padStart(2, '0') : ''}</span>)}
+            {Array.from({ length: 24 }, (_, hour) => <span key={hour} className="text-center font-mono text-[11px] tabular-nums text-slate-500">{hour % 3 === 0 ? hour.toString().padStart(2, '0') : ''}</span>)}
             {dayOrder.flatMap(weekday => {
               const label = dayLabel(weekday)
               return [
@@ -394,12 +394,12 @@ function UsageCalendar({ buckets, loading }: { buckets: TelemetryUsageBucket[]; 
             <div className="flex w-8 shrink-0 flex-col gap-[3px]">
               <span className="h-4" />
               {[0, 1, 2, 3, 4, 5, 6].map(row => (
-                <span key={row} className="h-[11px] text-[10px] leading-[11px] text-slate-500 dark:text-slate-400">{row % 2 === 0 ? weekdayLabels[row / 2] : ''}</span>
+                <span key={row} className="h-[11px] text-[11px] leading-[11px] text-slate-500 dark:text-slate-400">{row % 2 === 0 ? weekdayLabels[row / 2] : ''}</span>
               ))}
             </div>
             {weeks.map((week, index) => (
               <div key={index} className="flex min-w-[11px] flex-1 flex-col gap-[3px]">
-                <span className="h-4 whitespace-nowrap text-[10px] font-medium leading-4 text-slate-500 dark:text-slate-400">{week.monthLabel}</span>
+                <span className="h-4 whitespace-nowrap text-[11px] font-medium leading-4 text-slate-500 dark:text-slate-400">{week.monthLabel}</span>
                 {week.days.map(day => {
                   if (day.future) return <span key={day.key} className="h-[11px]" />
                   const title = cellTitle(day, week)
@@ -600,11 +600,11 @@ export const UsageAnalytics = memo(function UsageAnalytics({ active = true }: { 
     } finally { setRefreshing(false); setLoading(false) }
   }
 
-  return <main className="fluent-usage h-full overflow-y-auto bg-gray-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
-    <div className="mx-auto max-w-[1500px] px-5 py-6 lg:px-9 lg:py-8">
+  return <div className="fluent-usage h-full overflow-y-auto bg-[var(--app-canvas)] text-slate-900 dark:text-slate-100">
+    <div className="app-page-fluid py-6 lg:py-8">
       <header className="fluent-page-header flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold tracking-[-0.025em]">{t('nav.usage')}</h1>
+          <h1 className="font-bold tracking-[-0.025em]">{t('nav.usage')}</h1>
           <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">{t('memory.usage.desc')}</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -640,7 +640,7 @@ export const UsageAnalytics = memo(function UsageAnalytics({ active = true }: { 
         onToggle={() => setPricingExpanded(value => !value)}
       />
     </div>
-  </main>
+  </div>
 })
 
 function Metric({ icon, label, value, tone }: { icon: React.ReactNode; label: string; value: string; tone: 'blue' | 'violet' | 'emerald' }) { const tones = { blue: 'text-blue-500', violet: 'text-violet-500', emerald: 'text-emerald-500' }; return <div className="rounded-xl border border-slate-100 px-4 py-3 dark:border-slate-800"><div className="flex items-center gap-2 text-sm text-slate-500"><span className={tones[tone]}>{icon}</span>{label}</div><p className="mt-2 font-mono text-xl font-semibold tracking-[-0.02em] tabular-nums">{value}</p></div> }
