@@ -368,6 +368,105 @@ pub struct LocalMemorySnapshot {
     pub updated_at: String,
 }
 
+/// Domain definition carried with a cloud memory, including custom/project topics.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CloudMemoryDomain {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub description: String,
+    pub aliases: Vec<String>,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CloudDomainTombstone {
+    pub domain_id: String,
+    pub deleted_at: String,
+}
+
+#[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CloudDomainCatalog {
+    #[serde(default)]
+    pub domains: Vec<CloudMemoryDomain>,
+    #[serde(default)]
+    pub tombstones: Vec<CloudDomainTombstone>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CloudMemoryDomainLink {
+    pub domain: CloudMemoryDomain,
+    pub weight: f64,
+    pub source: String,
+}
+
+/// Optional tags distinguish an old payload (None) from an explicit removal (Some([])).
+/// `classified_at` is the exporter's classification checkpoint; a newer local
+/// checkpoint (receiver-side retag) keeps the local assignments on refresh.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CloudL1Memory {
+    #[serde(flatten)]
+    pub item: LocalMemorySnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domains: Option<Vec<CloudMemoryDomainLink>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classified_at: Option<String>,
+}
+
+/// Per-device explicit user state: pin decisions merge newest-wins, recall
+/// counts are additive evidence contributed by each device.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CloudUserStateEntry {
+    pub memory_id: String,
+    pub pinned: bool,
+    pub pinned_updated_at: Option<String>,
+    pub recall_count: i64,
+    pub recall_updated_at: Option<String>,
+}
+
+/// A receiver-side retag of a peer-owned memory, published so the source and
+/// other devices converge on the newer classification.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CloudTagOverride {
+    pub memory_id: String,
+    pub domains: Vec<CloudMemoryDomainLink>,
+    pub classified_at: String,
+}
+
+impl std::ops::Deref for CloudL1Memory {
+    type Target = LocalMemorySnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.item
+    }
+}
+
+impl From<LocalMemorySnapshot> for CloudL1Memory {
+    fn from(item: LocalMemorySnapshot) -> Self {
+        Self { item, domains: None, classified_at: None }
+    }
+}
+
+/// Provenance that travels with a published L2/L3 document.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct CloudLayerProvenance {
+    pub source_count: i64,
+    pub window_start: Option<String>,
+    pub window_end: Option<String>,
+    pub created_at: String,
+    pub published_at: Option<String>,
+    #[serde(default)]
+    pub sources: Vec<CloudLayerSourceRef>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CloudLayerSourceRef {
+    pub layer: String,
+    pub id: String,
+}
+
 /// Evidence gathered locally for one durable memory.  This mirrors the
 /// activity-first input to MindMemOS dreaming, but stays independent from its
 /// internal Qdrant and graph collections so Vibe Assistant can score its shared
@@ -395,6 +494,9 @@ pub struct MemoryImportance {
     pub recall_count: i64,
     pub pinned: bool,
     pub updated_at: String,
+    /// 置顶决策的时间戳：跨设备合并时取最新一票。
+    #[serde(default)]
+    pub pinned_updated_at: Option<String>,
 }
 
 /// A local-only, evidence-preserving record of a cloud object that both this

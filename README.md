@@ -267,7 +267,7 @@ Aggregates real input / output / cache usage from local transcripts across Agent
 
 ### ☁️ Cloud Memory Vault (optional)
 
-Sync published L2/L3 documents, custom memories, and usage stats across machines — one brain everywhere. Cross-session extracted memories (short/long-term) are shared as **per-device read-only mirrors**: each machine writes only its own aggregate, deletions and re-organization propagate along, session-scoped memories never leave the device.
+Sync published L2/L3 documents (with their source provenance), custom memories, and usage stats across machines — one brain everywhere. On WebDAV/S3 targets, **all extracted L1 memories — including session-scoped ones — sync as per-device read-only mirrors**: each machine writes only its own aggregate, deletions and re-organization propagate along, receiver-side retagging and pin/recall decisions merge back across devices, and the original scope labels are preserved.
 
 - **AES-256-GCM end-to-end encryption**: keys derived from your sync password, never stored; the server only ever sees ciphertext
 - CAS conflict detection, incremental pulls, tombstone deletions; local SQLite stays authoritative, offline sync failures never block injection

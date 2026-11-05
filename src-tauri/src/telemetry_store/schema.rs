@@ -263,7 +263,9 @@ pub(super) fn initialize_database(mut conn: Connection) -> Result<Connection, St
            duplicate_count INTEGER NOT NULL DEFAULT 0,
            recall_count INTEGER NOT NULL DEFAULT 0,
            pinned INTEGER NOT NULL DEFAULT 0,
-           updated_at TEXT NOT NULL
+           updated_at TEXT NOT NULL,
+           pinned_updated_at TEXT,
+           recall_updated_at TEXT
          );
          CREATE TABLE IF NOT EXISTS local_memory_items (
            id TEXT PRIMARY KEY,
@@ -290,6 +292,25 @@ pub(super) fn initialize_database(mut conn: Connection) -> Result<Connection, St
            enabled INTEGER NOT NULL DEFAULT 1,
            created_at TEXT NOT NULL,
            updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS memory_domain_tombstones (
+           domain_id TEXT PRIMARY KEY,
+           deleted_at TEXT NOT NULL
+         );
+         -- 接收端对镜像记忆的显式重分类：发布给来源端与其他设备收敛。
+         CREATE TABLE IF NOT EXISTS cloud_domain_retags (
+           memory_id TEXT PRIMARY KEY,
+           classified_at TEXT NOT NULL
+         );
+         -- 其他设备发布的显式用户状态（置顶/召回），按设备整表替换。
+         CREATE TABLE IF NOT EXISTS memory_user_state_peer (
+           device TEXT NOT NULL,
+           memory_id TEXT NOT NULL,
+           pinned INTEGER NOT NULL DEFAULT 0,
+           pinned_updated_at TEXT,
+           recall_count INTEGER NOT NULL DEFAULT 0,
+           recall_updated_at TEXT,
+           PRIMARY KEY (device, memory_id)
          );
          CREATE TABLE IF NOT EXISTS local_memory_domains (
            memory_id TEXT NOT NULL REFERENCES local_memory_items(id) ON DELETE CASCADE,
@@ -671,6 +692,19 @@ pub(super) fn initialize_database(mut conn: Connection) -> Result<Connection, St
     ] {
         let _ = add_column_if_missing_in(&conn, "usage_records", column, declaration);
     }
+    // 云端同步的显式用户决策（置顶/召回）各自带时间戳，跨设备按时间戳合并。
+    for (column, declaration) in [
+        ("pinned_updated_at", "TEXT"),
+        ("recall_updated_at", "TEXT"),
+    ] {
+        add_column_if_missing_in(&conn, "memory_importance", column, declaration)?;
+    }
+    // 升级前已置顶的行没有决策时间戳：回填后它们的置顶才能随云端传播。
+    conn.execute_batch(
+        "UPDATE memory_importance SET pinned_updated_at = updated_at
+          WHERE pinned != 0 AND pinned_updated_at IS NULL;",
+    )
+    .map_err(|e| e.to_string())?;
     let _ = crate::provider_catalog::ensure_catalog_table(&conn);
     migrate_mcp_unknown_projection(&mut conn)?;
     crate::llm_trace::initialize(&conn)?;

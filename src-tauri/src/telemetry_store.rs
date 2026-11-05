@@ -37,6 +37,7 @@ struct McpDashboardCache {
     stats: McpDashboardStats,
 }
 
+mod cloud_domains;
 mod schema;
 mod transcripts;
 mod types;
@@ -48,6 +49,8 @@ pub(crate) use types::{
     normalize_l1_memory_type, user_defined_memory_scope, validate_l1_durability,
 };
 pub use types::{
+    CloudDomainCatalog, CloudDomainTombstone, CloudLayerProvenance, CloudLayerSourceRef,
+    CloudL1Memory, CloudMemoryDomain, CloudMemoryDomainLink, CloudTagOverride, CloudUserStateEntry,
     CloudSyncConflict, ConversationSearchHit, L1MemoryCandidate, L1ResetResult, LocalMemory,
     LocalMemorySnapshot, LocalMemoryStats, McpAccessLog, McpCallCoverage, McpCallGroup,
     MemoryDomain, MemoryDomainAssignment,
@@ -1019,13 +1022,20 @@ impl TelemetryStore {
     /// Deleting a domain cascades only its associations. Durable L1 rows remain
     /// and become eligible for classification with the current domain registry.
     pub fn delete_memory_domain(&self, id: &str) -> Result<(), String> {
-        let changed = self.conn.lock().map_err(|_| "telemetry store lock poisoned")?
-            .execute("DELETE FROM memory_domains WHERE id = ?1", [id])
+        let mut conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned")?;
+        let transaction = conn.transaction().map_err(|e| e.to_string())?;
+        let changed = transaction.execute("DELETE FROM memory_domains WHERE id = ?1", [id])
             .map_err(|e| e.to_string())?;
         if changed == 0 {
             return Err("主题不存在，可能已被删除".into());
         }
-        Ok(())
+        transaction.execute(
+            "INSERT INTO memory_domain_tombstones (domain_id, deleted_at)
+             VALUES (?1, ?2)
+             ON CONFLICT(domain_id) DO UPDATE SET deleted_at = excluded.deleted_at",
+            params![id, chrono::Utc::now().to_rfc3339()],
+        ).map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|e| e.to_string())
     }
 
     pub fn memory_ids_for_domains(&self, domains: &[String]) -> Result<HashSet<String>, String> {
@@ -1170,6 +1180,18 @@ impl TelemetryStore {
                     SET content_hash = excluded.content_hash, classified_at = excluded.classified_at",
                 params![item.id, content_hash, now],
             ).map_err(|e| e.to_string())?;
+            // 对镜像记忆的显式重分类要发布出去，让来源端与其他设备收敛。
+            let is_mirror: bool = transaction.query_row(
+                "SELECT origin_device IS NOT NULL FROM local_memory_items WHERE id = ?1",
+                [&item.id], |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            if is_mirror {
+                transaction.execute(
+                    "INSERT INTO cloud_domain_retags (memory_id, classified_at) VALUES (?1, ?2)
+                     ON CONFLICT(memory_id) DO UPDATE SET classified_at = excluded.classified_at",
+                    params![item.id, now],
+                ).map_err(|e| e.to_string())?;
+            }
             return transaction.commit().map_err(|e| e.to_string());
         }
         let detail = last_lock_error.map(|error| format!("{error} ({error:?})")).unwrap_or_default();
@@ -1866,6 +1888,51 @@ impl TelemetryStore {
     /// 云端拉取落地：写入某层的发布版正文。本地已有发布版则覆盖；
     /// 没有则新建一条 published 文档（新设备首次拉取）。
     /// 与本地发布走同一语义：token_estimate 重算，L3 同步镜像 profile_summaries。
+    /// 应用对端 L2/L3 来源证据：整体替换来源引用与窗口/时间元数据。
+    pub fn apply_layer_provenance(
+        &self,
+        layer: &str,
+        provenance: &CloudLayerProvenance,
+    ) -> Result<(), String> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| "telemetry store lock poisoned".to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let doc_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM memory_layer_documents WHERE layer = ?1 AND state = 'published' ORDER BY published_at DESC LIMIT 1",
+                [layer],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(doc_id) = doc_id else { return Ok(()) };
+        tx.execute(
+            "UPDATE memory_layer_documents
+                SET source_count = ?2, window_start = ?3, window_end = ?4,
+                    created_at = ?5, published_at = COALESCE(?6, published_at)
+              WHERE id = ?1",
+            params![
+                doc_id, provenance.source_count,
+                provenance.window_start.clone(), provenance.window_end.clone(),
+                provenance.created_at.clone(), provenance.published_at.clone(),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM memory_layer_sources WHERE document_id = ?1", [&doc_id])
+            .map_err(|e| e.to_string())?;
+        for source in &provenance.sources {
+            tx.execute(
+                "INSERT OR IGNORE INTO memory_layer_sources (document_id, source_layer, source_id)
+                 VALUES (?1, ?2, ?3)",
+                params![doc_id, source.layer, source.id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     pub fn upsert_published_layer_content(&self, layer: &str, content: &str) -> Result<(), String> {
         let content = strip_thinking_blocks(content);
         if content.trim().is_empty() {
@@ -2354,24 +2421,55 @@ impl TelemetryStore {
         memory_type: &str,
         updated_at: &str,
     ) -> Result<(), String> {
+        self.upsert_synced_l1_memory_with_domains(id, memory, memory_type, updated_at, None)
+    }
+
+    pub fn upsert_synced_l1_memory_with_domains(
+        &self,
+        id: &str,
+        memory: &str,
+        memory_type: &str,
+        updated_at: &str,
+        domains: Option<&[CloudMemoryDomainLink]>,
+    ) -> Result<(), String> {
+        self.upsert_synced_l1_memory_full(id, memory, memory_type, updated_at, domains, None, None)
+    }
+
+    /// event_time/created_at 缺省时回退到 updated_at（旧载荷语义）。
+    pub fn upsert_synced_l1_memory_full(
+        &self,
+        id: &str,
+        memory: &str,
+        memory_type: &str,
+        updated_at: &str,
+        domains: Option<&[CloudMemoryDomainLink]>,
+        event_time: Option<&str>,
+        created_at: Option<&str>,
+    ) -> Result<(), String> {
         let memory_type = normalize_l1_memory_type(memory_type);
         if memory.trim().is_empty() {
             return Err("拉取到的自定义记忆内容为空".into());
         }
         let source_event_key = format!("user-defined:{id}");
-        let conn = self
+        let mut conn = self
             .conn
             .lock()
             .map_err(|_| "telemetry store lock poisoned".to_string())?;
-        conn.execute(
+        let transaction = conn.transaction().map_err(|e| e.to_string())?;
+        transaction.execute(
             "INSERT INTO local_memory_items
                 (id, source_event_key, ordinal, memory, memory_type, durability, source, session_id, user_defined, event_time, created_at, updated_at)
-             VALUES (?1, ?2, 0, ?3, ?4, 'long_term', 'user', ?5, 1, ?6, ?6, ?7)
-             ON CONFLICT(id) DO UPDATE SET memory = ?3, memory_type = ?4, updated_at = ?7",
-            params![id, source_event_key, memory.trim(), memory_type, format!("user-defined:{}", user_defined_memory_scope(id)), updated_at, updated_at],
+             VALUES (?1, ?2, 0, ?3, ?4, 'long_term', 'user', ?5, 1, ?6, COALESCE(?7, ?8), ?8)
+             ON CONFLICT(id) DO UPDATE SET memory = ?3, memory_type = ?4, updated_at = ?8,
+               event_time = COALESCE(?6, local_memory_items.event_time),
+               created_at = COALESCE(?7, local_memory_items.created_at)",
+            params![id, source_event_key, memory.trim(), memory_type, format!("user-defined:{}", user_defined_memory_scope(id)), event_time, created_at, updated_at],
         )
         .map_err(|e| e.to_string())?;
-        Ok(())
+        cloud_domains::apply_cloud_domains(
+            &transaction, id, domains, memory.trim(), memory_type, "long_term",
+        )?;
+        transaction.commit().map_err(|e| e.to_string())
     }
 
     /// 云端记忆库：墓碑落地——删除本地对应的用户自定义 L1。
@@ -2395,7 +2493,7 @@ impl TelemetryStore {
     /// 仅按来源排除其他设备的镜像，避免同一批数据在设备间重复广播。
     pub fn exportable_extracted_l1_memories(
         &self,
-    ) -> Result<Vec<LocalMemorySnapshot>, String> {
+    ) -> Result<Vec<CloudL1Memory>, String> {
         let conn = self
             .conn
             .lock()
@@ -2427,8 +2525,9 @@ impl TelemetryStore {
                 })
             })
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())
+        let items = rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        cloud_domains::with_cloud_domains(&conn, items)
     }
 
     /// 云端记忆库：把某台设备的提取记忆聚合镜像到本地（只读对端数据）。
@@ -2440,11 +2539,11 @@ impl TelemetryStore {
     pub fn sync_peer_extracted_l1(
         &self,
         origin_device: &str,
-        rows: &[LocalMemorySnapshot],
+        rows: &[CloudL1Memory],
     ) -> Result<(usize, usize), String> {
         // 用户已删除的 id（l1-auto 墓碑）不随镜像复活；也不算修剪保护对象。
         let tombstoned = self.tombstoned_l1_ids()?;
-        let rows: Vec<LocalMemorySnapshot> = rows
+        let rows: Vec<CloudL1Memory> = rows
             .iter()
             .filter(|row| !tombstoned.contains(&row.id))
             .cloned()
@@ -2480,7 +2579,7 @@ impl TelemetryStore {
                     ],
                 )
                 .map_err(|e| e.to_string())?;
-            landed += transaction
+            let updated = transaction
                 .execute(
                     "UPDATE local_memory_items
                         SET memory = ?2, memory_type = ?3, durability = ?4, updated_at = ?5
@@ -2495,6 +2594,50 @@ impl TelemetryStore {
                     ],
                 )
                 .map_err(|e| e.to_string())?;
+            landed += updated;
+            if updated > 0 {
+                // Only this peer's mirror may replace assignments; ID collisions keep local tags.
+                // A receiver-side retag with a newer checkpoint wins over the source refresh.
+                let local_at: Option<String> = transaction.query_row(
+                    "SELECT classified_at FROM memory_domain_classification_state WHERE memory_id = ?1",
+                    [&row.id], |result| result.get(0),
+                ).optional().map_err(|e| e.to_string())?;
+                let receiver_newer = match (local_at.as_deref(), row.classified_at.as_deref()) {
+                    (Some(local), Some(remote)) => local > remote,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if !receiver_newer {
+                    cloud_domains::apply_cloud_domains(
+                        &transaction, &row.id, row.domains.as_deref(),
+                        &row.memory, &row.memory_type, &row.durability,
+                    )?;
+                    if let Some(at) = row.classified_at.as_deref() {
+                        transaction.execute(
+                            "UPDATE memory_domain_classification_state SET classified_at = ?2 WHERE memory_id = ?1",
+                            params![row.id, at],
+                        ).map_err(|e| e.to_string())?;
+                    }
+                }
+            } else if row.domains.as_ref().is_some_and(|domains| !domains.is_empty()) {
+                // Identical records extracted on both devices may share an ID. Fill missing
+                // tags only when content/scope match and no local classification would be lost.
+                let can_fill: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM local_memory_items m
+                      WHERE m.id = ?1 AND m.memory = ?2 AND m.memory_type = ?3
+                        AND m.durability = ?4
+                        AND NOT EXISTS(SELECT 1 FROM local_memory_domains md WHERE md.memory_id = m.id))",
+                    params![row.id, row.memory, row.memory_type, row.durability],
+                    |result| result.get(0),
+                ).map_err(|e| e.to_string())?;
+                if can_fill {
+                    cloud_domains::apply_cloud_domains(
+                        &transaction, &row.id, row.domains.as_deref(),
+                        &row.memory, &row.memory_type, &row.durability,
+                    )?;
+                    landed += 1;
+                }
+            }
         }
         let mirrored: Vec<String> = {
             let mut statement = transaction
@@ -2523,6 +2666,17 @@ impl TelemetryStore {
         }
         transaction.commit().map_err(|e| e.to_string())?;
         Ok((landed, pruned))
+    }
+
+    /// 云端记忆库：按 LIKE 模式清除同步水位（设备身份轮换后重新对齐用）。
+    pub fn clear_cloud_sync_meta_like(&self, pattern: &str) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "telemetry store lock poisoned".to_string())?;
+        conn.execute("DELETE FROM cloud_sync_meta WHERE object_key LIKE ?1", [pattern])
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// 云端记忆库：清除 `l1-auto-agg:*` 对象的同步水位。L1 重提取会把
@@ -2703,10 +2857,10 @@ impl TelemetryStore {
             .lock()
             .map_err(|_| "telemetry store lock poisoned".to_string())?;
         let mut statement = conn.prepare(
-            "SELECT memory_id, score, supporting_sessions, supporting_agents, duplicate_count, recall_count, pinned, updated_at
+            "SELECT memory_id, score, supporting_sessions, supporting_agents, duplicate_count, recall_count, pinned, updated_at, pinned_updated_at
                FROM memory_importance WHERE memory_id = ?1",
         ).map_err(|e| e.to_string())?;
-        let records = memory_ids
+        let mut records: Vec<MemoryImportance> = memory_ids
             .iter()
             .filter_map(|id| {
                 statement
@@ -2720,13 +2874,44 @@ impl TelemetryStore {
                             recall_count: row.get(5)?,
                             pinned: row.get::<_, i64>(6)? != 0,
                             updated_at: row.get(7)?,
+                            pinned_updated_at: row.get(8)?,
                         })
                     })
                     .optional()
                     .ok()
                     .flatten()
             })
-            .collect::<Vec<_>>();
+            .collect();
+        // 显式用户状态跨设备合并：置顶取时间戳最新的一票，召回按设备累加。
+        let mut peer_statement = conn.prepare(
+            "SELECT memory_id, pinned, pinned_updated_at, recall_count, recall_updated_at
+               FROM memory_user_state_peer WHERE memory_id = ?1",
+        ).map_err(|e| e.to_string())?;
+        for record in &mut records {
+            let rows = peer_statement.query_map([&record.memory_id], |row| {
+                Ok((
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            }).map_err(|e| e.to_string())?;
+            for row in rows {
+                let (peer_pinned, peer_pinned_at, peer_recall, _) = row.map_err(|e| e.to_string())?;
+                record.recall_count += peer_recall;
+                // 没做过置顶决策的设备（无时间戳）不参与置顶合并。
+                if let Some(peer_at) = peer_pinned_at.as_deref() {
+                    let local_newer = record
+                        .pinned_updated_at
+                        .as_deref()
+                        .is_some_and(|local_at| local_at >= peer_at);
+                    if !local_newer {
+                        record.pinned = peer_pinned;
+                        record.pinned_updated_at = peer_pinned_at.clone();
+                    }
+                }
+            }
+        }
         Ok(records)
     }
 
@@ -2738,9 +2923,11 @@ impl TelemetryStore {
         let transaction = conn.transaction().map_err(|e| e.to_string())?;
         for record in records {
             transaction.execute(
-                "INSERT INTO memory_importance (memory_id, score, supporting_sessions, supporting_agents, duplicate_count, recall_count, pinned, updated_at)
+                "INSERT INTO memory_importance (memory_id, score, supporting_sessions, supporting_agents, duplicate_count, recall_count, pinned, updated_at, pinned_updated_at, recall_updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, COALESCE((SELECT recall_count FROM memory_importance WHERE memory_id = ?1), 0),
-                         COALESCE((SELECT pinned FROM memory_importance WHERE memory_id = ?1), 0), ?6)
+                         COALESCE((SELECT pinned FROM memory_importance WHERE memory_id = ?1), 0), ?6,
+                         (SELECT pinned_updated_at FROM memory_importance WHERE memory_id = ?1),
+                         (SELECT recall_updated_at FROM memory_importance WHERE memory_id = ?1))
                  ON CONFLICT(memory_id) DO UPDATE SET score=excluded.score, supporting_sessions=excluded.supporting_sessions,
                    supporting_agents=excluded.supporting_agents, duplicate_count=excluded.duplicate_count, updated_at=excluded.updated_at",
                 params![record.memory_id, record.score, record.supporting_sessions, record.supporting_agents, record.duplicate_count, record.updated_at],
@@ -2750,10 +2937,12 @@ impl TelemetryStore {
     }
 
     pub fn set_memory_pinned(&self, memory_id: &str, pinned: bool) -> Result<(), String> {
+        let now = chrono::Utc::now().to_rfc3339();
         self.conn.lock().map_err(|_| "telemetry store lock poisoned".to_string())?.execute(
-            "INSERT INTO memory_importance (memory_id, pinned, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(memory_id) DO UPDATE SET pinned=excluded.pinned, updated_at=excluded.updated_at",
-            params![memory_id, pinned as i64, chrono::Utc::now().to_rfc3339()],
+            "INSERT INTO memory_importance (memory_id, pinned, updated_at, pinned_updated_at) VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(memory_id) DO UPDATE SET pinned=excluded.pinned, updated_at=excluded.updated_at,
+               pinned_updated_at=excluded.pinned_updated_at",
+            params![memory_id, pinned as i64, now],
         ).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -2764,10 +2953,12 @@ impl TelemetryStore {
             .lock()
             .map_err(|_| "telemetry store lock poisoned".to_string())?;
         for memory_id in memory_ids.iter().filter(|id| !id.is_empty()) {
+            let now = chrono::Utc::now().to_rfc3339();
             conn.execute(
-                "INSERT INTO memory_importance (memory_id, recall_count, updated_at) VALUES (?1, 1, ?2)
-                 ON CONFLICT(memory_id) DO UPDATE SET recall_count=recall_count + 1, updated_at=excluded.updated_at",
-                params![memory_id, chrono::Utc::now().to_rfc3339()],
+                "INSERT INTO memory_importance (memory_id, recall_count, updated_at, recall_updated_at) VALUES (?1, 1, ?2, ?2)
+                 ON CONFLICT(memory_id) DO UPDATE SET recall_count=recall_count + 1, updated_at=excluded.updated_at,
+                   recall_updated_at=excluded.recall_updated_at",
+                params![memory_id, now],
             ).map_err(|e| e.to_string())?;
         }
         Ok(())
@@ -2785,10 +2976,12 @@ impl TelemetryStore {
             .map_err(|e| e.to_string())?;
         let result = (|| {
             for memory_id in memory_ids.iter().filter(|id| !id.is_empty()) {
+                let now = chrono::Utc::now().to_rfc3339();
                 conn.execute(
-                    "INSERT INTO memory_importance (memory_id, recall_count, updated_at) VALUES (?1, 1, ?2)
-                     ON CONFLICT(memory_id) DO UPDATE SET recall_count=recall_count + 1, updated_at=excluded.updated_at",
-                    params![memory_id, chrono::Utc::now().to_rfc3339()],
+                    "INSERT INTO memory_importance (memory_id, recall_count, updated_at, recall_updated_at) VALUES (?1, 1, ?2, ?2)
+                     ON CONFLICT(memory_id) DO UPDATE SET recall_count=recall_count + 1, updated_at=excluded.updated_at,
+                       recall_updated_at=excluded.recall_updated_at",
+                    params![memory_id, now],
                 ).map_err(|e| e.to_string())?;
             }
             Ok(())

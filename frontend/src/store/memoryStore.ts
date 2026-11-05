@@ -414,7 +414,6 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
       // retain old embeddings after a deliberate rebuild, so it is used for
       // retrieval only and never rendered as an independent memory inventory.
       const memories = localMemories.map((memory) => {
-        if (memory.user_defined) return { ...memory, domains: [] as MemoryDomainItem[] }
         const ids = linksByMemory[memory.id] ?? []
         return { ...memory, domains: ids.map((id) => domainIndex.get(id)).filter(Boolean) as MemoryDomainItem[] }
       })

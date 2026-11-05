@@ -1070,6 +1070,7 @@ pub async fn memory_importance_refresh(
                 recall_count,
                 pinned,
                 updated_at: now.clone(),
+                pinned_updated_at: current.and_then(|item| item.pinned_updated_at.clone()),
             }
         })
         .collect::<Vec<_>>();

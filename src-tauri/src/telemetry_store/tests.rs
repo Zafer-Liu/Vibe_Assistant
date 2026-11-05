@@ -497,7 +497,9 @@ fn keyword_search_reaches_memories_beyond_the_recent_window() {
                duplicate_count INTEGER NOT NULL DEFAULT 0,
                recall_count INTEGER NOT NULL DEFAULT 0,
                pinned INTEGER NOT NULL DEFAULT 0,
-               updated_at TEXT NOT NULL
+               updated_at TEXT NOT NULL,
+               pinned_updated_at TEXT,
+               recall_updated_at TEXT
             );",
     )
     .unwrap();

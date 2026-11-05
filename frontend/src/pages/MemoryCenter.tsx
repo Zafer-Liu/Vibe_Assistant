@@ -906,7 +906,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
       </section>
 
       {/* WebDAV/S3 同步全部 L1，作用域标签保持不变。 */}
-      <CloudVaultCard onSynced={() => { void loadMemoryLayers(); void listMemories(true) }} />
+      <CloudVaultCard onSynced={() => { void loadMemoryLayers(); void listMemories(true); void loadMemoryDomains() }} />
 
       {/* 可检索记忆（L1） */}
       <section className="order-20 rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-4 space-y-3">

@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::State;
 
-use crate::telemetry_store::{CloudSyncConflict, TelemetryStore, UsageDayAggregate};
+use crate::telemetry_store::{
+    CloudDomainCatalog, CloudL1Memory, CloudMemoryDomainLink, CloudSyncConflict, TelemetryStore, UsageDayAggregate,
+};
 use crate::vault_remote::{RemoteConfig, RemoteKind};
 
 const SETTING_URL: &str = "cloud_vault.url";
@@ -38,8 +40,11 @@ const SETTING_LAST_AUTO_SYNC: &str = "cloud_vault.last_auto_sync";
 /// revisions: a local write can have a later revision than an unseen remote
 /// object, which would otherwise make that remote object invisible forever.
 const SETTING_PULL_CURSOR: &str = "cloud_vault.pull_cursor";
+/// 备份恢复后轮换掉的设备身份：为新身份让路，并发布空聚合清理对端旧镜像。
+const SETTING_RETIRED_DEVICES: &str = "cloud_vault.retired_devices";
 
 const SYNC_LAYERS: [&str; 2] = ["l3", "l2"];
+const DOMAIN_CATALOG_KEY: &str = "memory-domains:registry";
 
 // ---------- 加密 ----------
 
@@ -221,12 +226,79 @@ struct RemoteList {
     revision: i64,
 }
 
-/// 自定义 L1 的云端载荷：内容 + 类型 + 时间戳（冲突裁决用）。
-#[derive(Serialize, Deserialize)]
+/// 自定义 L1 的云端载荷；旧载荷缺少可选字段时按旧语义处理。
+#[derive(Serialize, Deserialize, Clone)]
 struct L1Payload {
     content: String,
     memory_type: String,
     updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    domains: Option<Vec<CloudMemoryDomainLink>>,
+    /// 原始事件时间与创建时间：编辑只改 updated_at，二者不再被编辑时间顶替。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
+}
+
+fn local_l1_payload(
+    store: &TelemetryStore,
+    item: &crate::telemetry_store::LocalMemorySnapshot,
+) -> Result<L1Payload, String> {
+    Ok(L1Payload {
+        content: item.memory.clone(),
+        memory_type: item.memory_type.clone(),
+        updated_at: item.updated_at.clone(),
+        domains: Some(store.cloud_l1_domains(&item.id)?),
+        event_time: item.event_time.clone(),
+        created_at: Some(item.created_at.clone()),
+    })
+}
+
+/// Compare against the stored schema: adding domains on upgrade is not a local
+/// edit. Once the baseline contains domains, tag changes participate normally.
+fn l1_matches_known_hash(
+    store: &TelemetryStore,
+    key: &str,
+    payload: &L1Payload,
+    known_hash: Option<&str>,
+) -> Result<bool, String> {
+    let Some(known_hash) = known_hash else {
+        return Ok(false);
+    };
+    let plain = serde_json::to_vec(payload).map_err(|error| error.to_string())?;
+    if sha256_hex(&plain) == known_hash {
+        return Ok(true);
+    }
+    let Some(baseline) = store.cloud_sync_snapshot_content(key)? else {
+        return Ok(false);
+    };
+    let baseline: serde_json::Value =
+        serde_json::from_str(&baseline).map_err(|error| error.to_string())?;
+    if !baseline.is_object() {
+        return Ok(false);
+    }
+    let baseline_has_domains = baseline.get("domains").is_some();
+    let baseline_has_times = baseline.get("created_at").is_some();
+    if baseline_has_domains && baseline_has_times {
+        return Ok(false);
+    }
+    // Upgrade-only additions (tags, original timestamps) must not read as local
+    // edits. Nonempty local tags were never tracked by a tag-less baseline, so
+    // they stay protected through conflict review.
+    if !baseline_has_domains && payload.domains.as_ref().is_some_and(|domains| !domains.is_empty()) {
+        return Ok(false);
+    }
+    let mut legacy = payload.clone();
+    if !baseline_has_domains {
+        legacy.domains = None;
+    }
+    if !baseline_has_times {
+        legacy.event_time = None;
+        legacy.created_at = None;
+    }
+    let plain = serde_json::to_vec(&legacy).map_err(|error| error.to_string())?;
+    Ok(sha256_hex(&plain) == known_hash)
 }
 
 #[derive(Serialize)]
@@ -309,6 +381,52 @@ fn device_id(store: &TelemetryStore) -> String {
     let id = format!("{machine}-{suffix}");
     let _ = store.app_setting_set(SETTING_DEVICE_ID, &id);
     id
+}
+
+/// 退休身份的三个单写者对象都已是空版本（或不存在）时，从名单中移除。
+fn prune_retired_devices(store: &TelemetryStore, written: &VaultEnvelope) {
+    let retired = retired_devices(store);
+    if retired.is_empty() {
+        return;
+    }
+    let empty_hash = sha256_hex(b"[]");
+    let remaining: Vec<String> = retired
+        .into_iter()
+        .filter(|suffix| {
+            let safe = suffix.replace(':', "-");
+            !["l1-auto-agg", "user-state", "tag-overrides"].iter().all(|prefix| {
+                match written.objects.iter().find(|object| object.key == format!("{prefix}:{safe}")) {
+                    None => true,
+                    Some(object) => object.content_hash == empty_hash,
+                }
+            })
+        })
+        .collect();
+    let _ = store.app_setting_set(SETTING_RETIRED_DEVICES, &remaining);
+}
+
+fn retired_devices(store: &TelemetryStore) -> Vec<String> {
+    store
+        .app_setting_get::<Vec<String>>(SETTING_RETIRED_DEVICES)
+        .unwrap_or_default()
+}
+
+/// 跨设备恢复（ZIP 导入）会连设备身份一起复制。若原机仍在同步，两台机器会
+/// 争用同一个单写者聚合对象。恢复后轮换身份：旧身份进入退休名单，由本轮
+/// 同步发布空聚合，让对端清理旧镜像；本机记忆以新身份重新发布。
+pub fn retire_cloud_device_identity(store: &TelemetryStore) -> Result<(), String> {
+    let current = device_id(store);
+    let mut retired = retired_devices(store);
+    if !retired.contains(&current) {
+        retired.push(current);
+    }
+    store.app_setting_set(SETTING_RETIRED_DEVICES, &retired)?;
+    store.app_setting_set(SETTING_DEVICE_ID, &String::new())?;
+    // 新身份从零开始对齐水位，否则旧水位会让首轮推送被「哈希未变」短路。
+    for pattern in ["l1-auto-agg:%", "user-state:%", "tag-overrides:%"] {
+        store.clear_cloud_sync_meta_like(pattern)?;
+    }
+    Ok(())
 }
 
 fn http_client() -> reqwest::blocking::Client {
@@ -500,12 +618,14 @@ fn record_l1_conflict(
             return false;
         }
     };
-    let local_plain = serde_json::to_string(&L1Payload {
-        content: local.memory.clone(),
-        memory_type: local.memory_type.clone(),
-        updated_at: local.updated_at.clone(),
-    })
-    .unwrap_or_default();
+    let local_payload = match local_l1_payload(store, local) {
+        Ok(payload) => payload,
+        Err(error) => {
+            report.errors.push(format!("{key}: 读取本地领域标签失败 {error}"));
+            return false;
+        }
+    };
+    let local_plain = serde_json::to_string(&local_payload).unwrap_or_default();
     let conflict = CloudSyncConflict {
         object_key: key.clone(),
         object_kind: "l1".into(),
@@ -663,7 +783,7 @@ fn push_l1(
     vault_key_bytes: &[u8; 32],
     report: &mut CloudSyncReport,
 ) {
-    let items = match store.user_defined_l1_memories() {
+    let items = match store.cloud_user_defined_l1_memories() {
         Ok(items) => items,
         Err(e) => {
             report.errors.push(format!("l1: 读取自定义记忆失败 {e}"));
@@ -682,6 +802,9 @@ fn push_l1(
             content: item.memory.clone(),
             memory_type: item.memory_type.clone(),
             updated_at: item.updated_at.clone(),
+            domains: item.domains.clone(),
+            event_time: item.event_time.clone(),
+            created_at: Some(item.created_at.clone()),
         };
         let plain = serde_json::to_string(&payload).unwrap_or_default();
         let local_hash = sha256_hex(plain.as_bytes());
@@ -724,6 +847,9 @@ fn push_l1(
                     .and_then(|v| v["revision"].as_i64())
                     .unwrap_or(base_revision);
                 let _ = store.cloud_sync_meta_set(&key, rev, Some(&local_hash), "clean");
+                let _ = store.cloud_sync_snapshot_set(
+                    &key, rev, Some(&local_hash), Some(&plain),
+                );
                 report.pushed += 1;
             }
             Ok(r) if r.status().as_u16() == 409 => {
@@ -981,7 +1107,33 @@ fn apply_remote_objects(
     report: &mut CloudSyncReport,
 ) -> bool {
     let errors_before = report.errors.len();
-    for obj in objects.iter().cloned() {
+    // The catalog is independent of memory records. Apply it first so deletion
+    // markers also block definitions embedded in older per-memory payloads.
+    for obj in objects.iter().filter(|obj| obj.key == DOMAIN_CATALOG_KEY) {
+        let meta = store.cloud_sync_meta_row(&obj.key).ok().flatten();
+        if meta.as_ref().is_some_and(|(_, hash, _, _)| hash.as_deref() == Some(obj.content_hash.as_str())) {
+            report.skipped += 1;
+            continue;
+        }
+        let Some(plain) = decrypt_remote_content(vault_key_bytes, obj, report) else { return false };
+        let catalog: CloudDomainCatalog = match serde_json::from_str(&plain) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                report.errors.push(format!("领域标签目录解析失败：{error}"));
+                return false;
+            }
+        };
+        if let Err(error) = store.merge_cloud_domain_catalog(&catalog) {
+            report.errors.push(format!("领域标签目录导入失败：{error}"));
+            return false;
+        }
+        if let Err(error) = store.cloud_sync_meta_set(&obj.key, obj.revision, Some(&obj.content_hash), "clean") {
+            report.errors.push(format!("领域标签目录同步水位保存失败：{error}"));
+            return false;
+        }
+        report.pulled += 1;
+    }
+    for obj in objects.iter().filter(|obj| obj.key != DOMAIN_CATALOG_KEY).cloned() {
         let meta = store.cloud_sync_meta_row(&obj.key).ok().flatten();
         // 信封模式每轮都拿到全量对象，所以必须先问一句「远端其实有没有变」：
         //   · 远端 == 上次同步的水位 → 远端没有新东西。本地若有改动，那是本地的新进度，
@@ -999,7 +1151,13 @@ fn apply_remote_objects(
             // 本机同步过这条却已经删掉：绝不能把它落地回来，否则本机的删除永远传不出去
             // （apply 排在 build 之前，一旦落地，墓碑判定就再也看不见它）。
             // 远端在此期间被人改过则没法自动合并，记成冲突交给用户裁决。
-            let local_gone = store.find_user_defined_l1(id).ok().flatten().is_none();
+            let local_gone = match store.find_user_defined_l1(id) {
+                Ok(local) => local.is_none(),
+                Err(error) => {
+                    report.errors.push(format!("{}: 读取本地记忆失败 {error}", obj.key));
+                    continue;
+                }
+            };
             if local_gone && meta.is_some() {
                 // dirty 只可能来自冲突裁决：用户已经选了「保留本地（删除）」，
                 // 这一票今天就生效，别每轮再记一次同样的冲突把它钉死在原地。
@@ -1021,6 +1179,20 @@ fn apply_remote_objects(
         }
         if let Some(rest) = obj.key.strip_prefix("l1-auto-agg:") {
             apply_remote_extracted(store, rest.to_string(), vault_key_bytes, obj, report);
+            continue;
+        }
+        if let Some(layer) = obj.key.strip_suffix(":provenance").map(str::to_string) {
+            if SYNC_LAYERS.contains(&layer.as_str()) {
+                apply_remote_provenance(store, &layer, vault_key_bytes, obj, report);
+            }
+            continue;
+        }
+        if let Some(rest) = obj.key.strip_prefix("user-state:") {
+            apply_remote_user_state(store, rest.to_string(), vault_key_bytes, obj, report);
+            continue;
+        }
+        if let Some(rest) = obj.key.strip_prefix("tag-overrides:") {
+            apply_remote_tag_overrides(store, rest.to_string(), vault_key_bytes, obj, report);
             continue;
         }
         let Some(layer) = obj.key.strip_suffix(":published").map(str::to_string) else {
@@ -1056,32 +1228,51 @@ fn apply_remote_objects(
         let Some(id) = tomb.key.strip_prefix("l1-user:") else {
             continue;
         };
-        let local = store.find_user_defined_l1(id).ok().flatten();
+        let local = match store.find_user_defined_l1(id) {
+            Ok(local) => local,
+            Err(error) => {
+                report.errors.push(format!("{}: 读取本地记忆失败 {error}", tomb.key));
+                continue;
+            }
+        };
         let meta = store.cloud_sync_meta_row(&tomb.key).ok().flatten();
-        let locally_changed = local.as_ref().is_some_and(|item| {
-            let plain = serde_json::to_string(&L1Payload {
-                content: item.memory.clone(),
-                memory_type: item.memory_type.clone(),
-                updated_at: item.updated_at.clone(),
-            })
-            .unwrap_or_default();
-            meta.as_ref().map_or(true, |(_, hash, state, _)| {
-                state == "dirty" || hash.as_deref() != Some(&sha256_hex(plain.as_bytes()))
-            })
-        });
+        if meta.as_ref().is_some_and(|(_, _, state, _)| state == "conflict") {
+            report.skipped += 1;
+            continue;
+        }
+        let local_payload = match local.as_ref().map(|item| local_l1_payload(store, item)).transpose() {
+            Ok(payload) => payload,
+            Err(error) => {
+                report.errors.push(format!("{}: 读取本地领域标签失败 {error}", tomb.key));
+                continue;
+            }
+        };
+        let locally_changed = if let Some(payload) = local_payload.as_ref() {
+            if meta.as_ref().is_some_and(|(_, _, state, _)| state == "dirty") {
+                true
+            } else {
+                match l1_matches_known_hash(
+                    store,
+                    &tomb.key,
+                    payload,
+                    meta.as_ref().and_then(|(_, hash, _, _)| hash.as_deref()),
+                ) {
+                    Ok(matches) => !matches,
+                    Err(error) => {
+                        report.errors.push(format!("{}: 读取同步基线失败 {error}", tomb.key));
+                        continue;
+                    }
+                }
+            }
+        } else {
+            false
+        };
         if locally_changed {
             let conflict = CloudSyncConflict {
                 object_key: tomb.key.clone(),
                 object_kind: "l1".into(),
                 base_content: store.cloud_sync_snapshot_content(&tomb.key).ok().flatten(),
-                local_content: local.and_then(|item| {
-                    serde_json::to_string(&L1Payload {
-                        content: item.memory,
-                        memory_type: item.memory_type,
-                        updated_at: item.updated_at,
-                    })
-                    .ok()
-                }),
+                local_content: local_payload.as_ref().and_then(|payload| serde_json::to_string(payload).ok()),
                 remote_content: None,
                 local_memory_type: None,
                 remote_memory_type: None,
@@ -1091,18 +1282,22 @@ fn apply_remote_objects(
                 remote_updated_at: Some(tomb.deleted_at),
                 created_at: chrono::Utc::now().to_rfc3339(),
             };
-            if store.cloud_sync_conflict_upsert(&conflict).is_ok() {
-                let _ = store.cloud_sync_meta_set(&tomb.key, tomb.revision, None, "conflict");
-                report.conflicts += 1;
+            match store.cloud_sync_conflict_upsert(&conflict) {
+                Ok(()) => {
+                    let _ = store.cloud_sync_meta_set(&tomb.key, tomb.revision, None, "conflict");
+                    report.conflicts += 1;
+                }
+                Err(error) => report.errors.push(format!("{}: 保存删除冲突失败 {error}", tomb.key)),
             }
             continue;
         }
         match store.delete_synced_l1_memory(id) {
             Ok(true) => report.pulled += 1,
             Ok(false) => {}
-            Err(e) => report
-                .errors
-                .push(format!("{}: 删除落地失败 {e}", tomb.key)),
+            Err(e) => {
+                report.errors.push(format!("{}: 删除落地失败 {e}", tomb.key));
+                continue;
+            }
         }
         let _ = store.cloud_sync_meta_delete(&tomb.key);
     }
@@ -1209,7 +1404,7 @@ fn apply_remote_extracted(
             .push(format!("l1-auto-agg: 远端哈希校验失败，已跳过 ({})", obj.key));
         return false;
     }
-    let rows: Vec<crate::telemetry_store::LocalMemorySnapshot> =
+    let rows: Vec<CloudL1Memory> =
         match serde_json::from_slice(&plain) {
             Ok(rows) => rows,
             Err(e) => {
@@ -1233,6 +1428,157 @@ fn apply_remote_extracted(
             report
                 .errors
                 .push(format!("l1-auto-agg: 落地失败 {e} ({})", obj.key));
+            return false;
+        }
+    }
+    true
+}
+
+/// 远端 L2/L3 来源证据落地：己方对象只对齐水位；对端对象按发布时间较新者胜。
+fn apply_remote_provenance(
+    store: &TelemetryStore,
+    layer: &str,
+    vault_key_bytes: &[u8; 32],
+    obj: RemoteObject,
+    report: &mut CloudSyncReport,
+) -> bool {
+    let Some(blob) = b64_decode(&obj.payload) else {
+        report.errors.push(format!("{}: 远端 payload 编码损坏", obj.key));
+        return false;
+    };
+    let plain = match vault_decrypt(vault_key_bytes, &blob) {
+        Ok(plain) => plain,
+        Err(e) => {
+            report.errors.push(format!("{}: {e}", obj.key));
+            return false;
+        }
+    };
+    if sha256_hex(&plain) != obj.content_hash {
+        report.errors.push(format!("{}: 远端哈希校验失败，已跳过", obj.key));
+        return false;
+    }
+    let provenance: crate::telemetry_store::CloudLayerProvenance = match serde_json::from_slice(&plain) {
+        Ok(provenance) => provenance,
+        Err(e) => {
+            report.errors.push(format!("{}: 载荷解析失败 {e}", obj.key));
+            return false;
+        }
+    };
+    let local = store.cloud_layer_provenance(layer).ok().flatten();
+    let local_newer = local
+        .as_ref()
+        .and_then(|item| item.published_at.as_deref())
+        .zip(provenance.published_at.as_deref())
+        .is_some_and(|(local_at, remote_at)| local_at > remote_at);
+    if local_newer {
+        report.skipped += 1;
+        return true;
+    }
+    match store.apply_layer_provenance(layer, &provenance) {
+        Ok(()) => {
+            let _ = store.cloud_sync_meta_set(&obj.key, obj.revision, Some(&obj.content_hash), "clean");
+            report.pulled += 1;
+        }
+        Err(e) => {
+            report.errors.push(format!("{}: 落地失败 {e}", obj.key));
+            return false;
+        }
+    }
+    true
+}
+
+/// 远端显式用户状态落地：己方对象只对齐水位；对端对象整表替换该设备的贡献。
+fn apply_remote_user_state(
+    store: &TelemetryStore,
+    device_suffix: String,
+    vault_key_bytes: &[u8; 32],
+    obj: RemoteObject,
+    report: &mut CloudSyncReport,
+) -> bool {
+    let device = device_id(store).replace(':', "-");
+    if device_suffix == device {
+        let _ = store.cloud_sync_meta_set(&obj.key, obj.revision, Some(&obj.content_hash), "clean");
+        report.skipped += 1;
+        return true;
+    }
+    let Some(blob) = b64_decode(&obj.payload) else {
+        report.errors.push(format!("user-state: 远端 payload 编码损坏 ({})", obj.key));
+        return false;
+    };
+    let plain = match vault_decrypt(vault_key_bytes, &blob) {
+        Ok(plain) => plain,
+        Err(e) => {
+            report.errors.push(format!("user-state: {e} ({})", obj.key));
+            return false;
+        }
+    };
+    if sha256_hex(&plain) != obj.content_hash {
+        report.errors.push(format!("user-state: 远端哈希校验失败，已跳过 ({})", obj.key));
+        return false;
+    }
+    let entries: Vec<crate::telemetry_store::CloudUserStateEntry> = match serde_json::from_slice(&plain) {
+        Ok(entries) => entries,
+        Err(e) => {
+            report.errors.push(format!("user-state: 载荷解析失败 {e} ({})", obj.key));
+            return false;
+        }
+    };
+    match store.apply_peer_user_state(&device_suffix, &entries) {
+        Ok(()) => {
+            let _ = store.cloud_sync_meta_set(&obj.key, obj.revision, Some(&obj.content_hash), "clean");
+            report.pulled += 1;
+        }
+        Err(e) => {
+            report.errors.push(format!("user-state: 落地失败 {e} ({})", obj.key));
+            return false;
+        }
+    }
+    true
+}
+
+/// 远端重分类落地：检查点较新者胜，镜像与本机记录都可被更新的分类收敛。
+fn apply_remote_tag_overrides(
+    store: &TelemetryStore,
+    device_suffix: String,
+    vault_key_bytes: &[u8; 32],
+    obj: RemoteObject,
+    report: &mut CloudSyncReport,
+) -> bool {
+    let device = device_id(store).replace(':', "-");
+    if device_suffix == device {
+        let _ = store.cloud_sync_meta_set(&obj.key, obj.revision, Some(&obj.content_hash), "clean");
+        report.skipped += 1;
+        return true;
+    }
+    let Some(blob) = b64_decode(&obj.payload) else {
+        report.errors.push(format!("tag-overrides: 远端 payload 编码损坏 ({})", obj.key));
+        return false;
+    };
+    let plain = match vault_decrypt(vault_key_bytes, &blob) {
+        Ok(plain) => plain,
+        Err(e) => {
+            report.errors.push(format!("tag-overrides: {e} ({})", obj.key));
+            return false;
+        }
+    };
+    if sha256_hex(&plain) != obj.content_hash {
+        report.errors.push(format!("tag-overrides: 远端哈希校验失败，已跳过 ({})", obj.key));
+        return false;
+    }
+    let overrides: Vec<crate::telemetry_store::CloudTagOverride> = match serde_json::from_slice(&plain) {
+        Ok(overrides) => overrides,
+        Err(e) => {
+            report.errors.push(format!("tag-overrides: 载荷解析失败 {e} ({})", obj.key));
+            return false;
+        }
+    };
+    match store.apply_peer_tag_overrides(&overrides) {
+        Ok(()) => {
+            let _ = store.cloud_sync_meta_set(&obj.key, obj.revision, Some(&obj.content_hash), "clean");
+            report.pulled += 1;
+        }
+        Err(e) => {
+            report.errors.push(format!("tag-overrides: 落地失败 {e} ({})", obj.key));
             return false;
         }
     }
@@ -1289,11 +1635,20 @@ fn apply_remote_l1(
         return false;
     }
     // 本地已有同 hash → 只对齐水位。
-    if let Ok(Some(item)) = store.find_user_defined_l1(&id) {
-        let local_payload = L1Payload {
-            content: item.memory.clone(),
-            memory_type: item.memory_type.clone(),
-            updated_at: item.updated_at.clone(),
+    let local = match store.find_user_defined_l1(&id) {
+        Ok(local) => local,
+        Err(error) => {
+            report.errors.push(format!("l1-user:{id}: 读取本地记忆失败 {error}"));
+            return false;
+        }
+    };
+    if let Some(item) = local {
+        let local_payload = match local_l1_payload(store, &item) {
+            Ok(payload) => payload,
+            Err(error) => {
+                report.errors.push(format!("l1-user:{id}: 读取本地领域标签失败 {error}"));
+                return false;
+            }
         };
         let local_plain = serde_json::to_string(&local_payload).unwrap_or_default();
         if sha256_hex(local_plain.as_bytes()) == obj.content_hash {
@@ -1310,9 +1665,18 @@ fn apply_remote_l1(
         }
         // 内容不同且本地不是已对齐的旧版本，说明双方都改过同一记忆。
         // 保留双方，等待用户选择，绝不能拿设备时钟静默裁决。
-        let local_changed = meta.as_ref().map_or(true, |(_, known_hash, state, _)| {
-            state == "dirty" || known_hash.as_deref() != Some(&sha256_hex(local_plain.as_bytes()))
-        });
+        let local_changed = match l1_matches_known_hash(
+            store,
+            &obj.key,
+            &local_payload,
+            meta.as_ref().and_then(|(_, hash, _, _)| hash.as_deref()),
+        ) {
+            Ok(matches) => !matches,
+            Err(error) => {
+                report.errors.push(format!("l1-user:{id}: 读取同步基线失败 {error}"));
+                return false;
+            }
+        };
         if local_changed {
             return record_l1_conflict(store, &item, vault_key_bytes, obj, report);
         }
@@ -1323,11 +1687,14 @@ fn apply_remote_l1(
             return false;
         }
     }
-    if let Err(e) = store.upsert_synced_l1_memory(
+    if let Err(e) = store.upsert_synced_l1_memory_full(
         &id,
         &payload.content,
         &payload.memory_type,
         &payload.updated_at,
+        payload.domains.as_deref(),
+        payload.event_time.as_deref(),
+        payload.created_at.as_deref(),
     ) {
         report.errors.push(format!("l1-user:{id}: 落地失败 {e}"));
         return false;
@@ -1641,9 +2008,37 @@ fn build_envelope(
         report.pushed += 1;
     }
 
+    // L2/L3 来源证据：独立对象。旧客户端不认识该 key 会跳过，正文对象保持裸明文。
+    for layer in SYNC_LAYERS {
+        let key = format!("{layer}:provenance");
+        let Some(provenance) = store.cloud_layer_provenance(layer)? else { continue };
+        let plain = serde_json::to_vec(&provenance)
+            .map_err(|error| format!("{key}: 序列化失败 {error}"))?;
+        let local_hash = sha256_hex(&plain);
+        let remote_hash = objects.get(&key).map(|object| object.content_hash.clone());
+        if remote_hash.as_deref() != Some(local_hash.as_str()) {
+            revision += 1;
+            objects.insert(
+                key.clone(),
+                RemoteObject {
+                    key: key.clone(),
+                    revision,
+                    content_hash: local_hash.clone(),
+                    payload: b64_encode(&vault_encrypt(vault_key_bytes, &plain)?),
+                    updated_at: now.clone(),
+                    device_id: device.to_string(),
+                },
+            );
+            pending.push(PendingWrite::Meta {
+                key, revision, hash: Some(local_hash), state: "clean",
+            });
+            report.pushed += 1;
+        }
+    }
+
     // 自定义 L1 记忆。
     let items = store
-        .user_defined_l1_memories()
+        .cloud_user_defined_l1_memories()
         .map_err(|e| format!("l1: 读取自定义记忆失败 {e}"))?;
     for item in &items {
         let key = format!("l1-user:{}", item.id);
@@ -1651,6 +2046,9 @@ fn build_envelope(
             content: item.memory.clone(),
             memory_type: item.memory_type.clone(),
             updated_at: item.updated_at.clone(),
+            domains: item.domains.clone(),
+            event_time: item.event_time.clone(),
+            created_at: Some(item.created_at.clone()),
         };
         let plain = serde_json::to_string(&payload).unwrap_or_default();
         let local_hash = sha256_hex(plain.as_bytes());
@@ -1812,6 +2210,101 @@ fn build_envelope(
         report.pushed += 1;
     }
 
+    // 显式用户状态（置顶/召回）：每台设备只写自己的对象，对端整表替换后合并。
+    let state_key = format!("user-state:{}", device.replace(':', "-"));
+    let state_entries = store.cloud_user_state()?;
+    let state_plain = serde_json::to_vec(&state_entries)
+        .map_err(|error| format!("{state_key}: 序列化失败 {error}"))?;
+    let state_hash = sha256_hex(&state_plain);
+    // 空状态不凭空创建对象；远端已有本设备对象时，空版本仍要传播取消操作。
+    if (!state_entries.is_empty() || objects.contains_key(&state_key))
+        && objects.get(&state_key).map(|object| object.content_hash.as_str()) != Some(state_hash.as_str())
+    {
+        revision += 1;
+        objects.insert(state_key.clone(), RemoteObject {
+            key: state_key.clone(), revision,
+            content_hash: state_hash.clone(),
+            payload: b64_encode(&vault_encrypt(vault_key_bytes, &state_plain)?),
+            updated_at: now.clone(), device_id: device.to_string(),
+        });
+        pending.push(PendingWrite::Meta {
+            key: state_key, revision, hash: Some(state_hash), state: "clean",
+        });
+        report.pushed += 1;
+    }
+
+    // 接收端对镜像记忆的显式重分类：发布出去让来源端与其他设备收敛。
+    let retag_key = format!("tag-overrides:{}", device.replace(':', "-"));
+    let retag_entries = store.cloud_tag_overrides()?;
+    let retag_plain = serde_json::to_vec(&retag_entries)
+        .map_err(|error| format!("{retag_key}: 序列化失败 {error}"))?;
+    let retag_hash = sha256_hex(&retag_plain);
+    if (!retag_entries.is_empty() || objects.contains_key(&retag_key))
+        && objects.get(&retag_key).map(|object| object.content_hash.as_str()) != Some(retag_hash.as_str())
+    {
+        revision += 1;
+        objects.insert(retag_key.clone(), RemoteObject {
+            key: retag_key.clone(), revision,
+            content_hash: retag_hash.clone(),
+            payload: b64_encode(&vault_encrypt(vault_key_bytes, &retag_plain)?),
+            updated_at: now.clone(), device_id: device.to_string(),
+        });
+        pending.push(PendingWrite::Meta {
+            key: retag_key, revision, hash: Some(retag_hash), state: "clean",
+        });
+        report.pushed += 1;
+    }
+
+    // 退休身份（备份恢复轮换掉的旧设备 ID）：发布空版本，让对端清理旧镜像，
+    // 避免两台机器继续争用同一个单写者聚合对象。
+    for retired in retired_devices(store) {
+        let safe = retired.replace(':', "-");
+        for prefix in ["l1-auto-agg", "user-state", "tag-overrides"] {
+            let key = format!("{prefix}:{safe}");
+            let empty_hash = sha256_hex(b"[]");
+            match objects.get(&key).map(|object| object.content_hash.clone()) {
+                Some(hash) if hash == empty_hash => {}
+                Some(_) => {
+                    revision += 1;
+                    objects.insert(
+                        key.clone(),
+                        RemoteObject {
+                            key: key.clone(),
+                            revision,
+                            content_hash: empty_hash.clone(),
+                            payload: b64_encode(&vault_encrypt(vault_key_bytes, b"[]")?),
+                            updated_at: now.clone(),
+                            device_id: device.to_string(),
+                        },
+                    );
+                    pending.push(PendingWrite::Meta {
+                        key, revision, hash: Some(empty_hash), state: "clean",
+                    });
+                    report.pushed += 1;
+                }
+                None => {}
+            }
+        }
+    }
+
+    // Publish the merged registry even when no memory uses a custom label yet.
+    let catalog = store.cloud_domain_catalog()?;
+    let plain = serde_json::to_vec(&catalog).map_err(|error| format!("领域标签目录序列化失败：{error}"))?;
+    let hash = sha256_hex(&plain);
+    if objects.get(DOMAIN_CATALOG_KEY).map(|object| object.content_hash.as_str()) != Some(hash.as_str()) {
+        revision += 1;
+        objects.insert(DOMAIN_CATALOG_KEY.into(), RemoteObject {
+            key: DOMAIN_CATALOG_KEY.into(), revision,
+            content_hash: hash.clone(),
+            payload: b64_encode(&vault_encrypt(vault_key_bytes, &plain)?),
+            updated_at: now.clone(), device_id: device.into(),
+        });
+        pending.push(PendingWrite::Meta {
+            key: DOMAIN_CATALOG_KEY.into(), revision, hash: Some(hash), state: "clean",
+        });
+        report.pushed += 1;
+    }
+
     let objects: Vec<RemoteObject> = objects.into_values().collect();
     let tombstones: Vec<RemoteTombstone> = tombstones.into_values().collect();
     let revision = objects
@@ -1903,6 +2396,7 @@ fn run_sync_envelope(
             Ok(PutOutcome::Written(_)) => {
                 // 只有真正写进远端，本地才承认这次同步发生过。
                 apply_pending_writes(store, pending);
+                prune_retired_devices(store, &next);
                 break;
             }
             Ok(PutOutcome::Changed) if attempt == 0 => {
@@ -2266,6 +2760,9 @@ pub fn cloud_vault_resolve_conflict(
                             .ok_or("合并内容不能为空")?,
                         memory_type: local.memory_type,
                         updated_at: chrono::Utc::now().to_rfc3339(),
+                        domains: local.domains,
+                        event_time: local.event_time,
+                        created_at: local.created_at,
                     })
                     .map_err(|error| error.to_string())?,
                 )
@@ -2275,11 +2772,14 @@ pub fn cloud_vault_resolve_conflict(
             Some(raw) => {
                 let payload: L1Payload =
                     serde_json::from_str(&raw).map_err(|_| "所选记忆载荷损坏")?;
-                telemetry.upsert_synced_l1_memory(
+                telemetry.upsert_synced_l1_memory_full(
                     id,
                     &payload.content,
                     &payload.memory_type,
                     &payload.updated_at,
+                    payload.domains.as_deref(),
+                    payload.event_time.as_deref(),
+                    payload.created_at.as_deref(),
                 )?;
                 let hash = sha256_hex(raw.as_bytes());
                 if resolution == "remote" {
@@ -2534,6 +3034,23 @@ mod tests {
             .expect("写入本地自定义记忆");
     }
 
+    fn domain_links() -> Vec<CloudMemoryDomainLink> {
+        serde_json::from_value(serde_json::json!([{
+            "domain": {
+                "id": "cloud-test-domain",
+                "name": "Cloud domain",
+                "kind": "custom",
+                "description": "Shared domain definition",
+                "aliases": ["cloud"],
+                "enabled": true,
+                "created_at": "2026-11-02T00:00:00Z",
+                "updated_at": "2026-11-02T00:00:00Z"
+            },
+            "weight": 0.9,
+            "source": "manual"
+        }])).unwrap()
+    }
+
     fn l1_of(store: &TelemetryStore, id: &str) -> Option<String> {
         store
             .find_user_defined_l1(id)
@@ -2603,6 +3120,9 @@ mod tests {
             content: content.to_string(),
             memory_type: "fact".to_string(),
             updated_at: "2026-10-08T10:00:00Z".to_string(),
+            domains: None,
+            event_time: None,
+            created_at: None,
         };
         let plain = serde_json::to_vec(&payload).expect("序列化 L1 载荷");
         VaultEnvelope {
@@ -2632,6 +3152,150 @@ mod tests {
         }
     }
 
+    #[test]
+    fn custom_domain_upgrade_uses_legacy_baseline_without_false_conflict() {
+        let store = new_store();
+        let legacy = envelope_with("original");
+        let mut report = CloudSyncReport {
+            pushed: 0, pulled: 0, skipped: 0, conflicts: 0, usage_imported: 0, errors: Vec::new(),
+        };
+        assert!(apply_remote_objects(&store, &legacy.objects, &[], &key(), &mut report));
+        let old_hash = legacy.objects[0].content_hash.clone();
+        let local = store.find_user_defined_l1("shared").unwrap().unwrap();
+        let mut payload = local_l1_payload(&store, &local).unwrap();
+        assert!(l1_matches_known_hash(&store, "l1-user:shared", &payload, Some(&old_hash)).unwrap());
+        let mut locally_tagged = payload.clone();
+        locally_tagged.domains = Some(domain_links());
+        assert!(!l1_matches_known_hash(&store, "l1-user:shared", &locally_tagged, Some(&old_hash)).unwrap(),
+            "旧基线不能证明本机的非空分类没有变化");
+        payload.content = "remote edit".into();
+        payload.domains = Some(domain_links());
+        let plain = serde_json::to_vec(&payload).unwrap();
+        let mut remote = legacy.objects[0].clone();
+        remote.revision += 1;
+        remote.content_hash = sha256_hex(&plain);
+        remote.payload = b64_encode(&vault_encrypt(&key(), &plain).unwrap());
+        assert!(apply_remote_objects(&store, &[remote], &[], &key(), &mut report));
+        assert_eq!(report.conflicts, 0);
+        assert_eq!(l1_of(&store, "shared").as_deref(), Some("remote edit"));
+        assert_eq!(store.cloud_l1_domains("shared").unwrap(), domain_links());
+
+        // A domain-aware baseline must detect an explicit local tag removal.
+        let item = store.find_user_defined_l1("shared").unwrap().unwrap();
+        let mut local = local_l1_payload(&store, &item).unwrap();
+        let known = store.cloud_sync_meta_row("l1-user:shared").unwrap().unwrap().1;
+        local.domains = Some(Vec::new());
+        assert!(!l1_matches_known_hash(&store, "l1-user:shared", &local, known.as_deref()).unwrap());
+    }
+
+    #[test]
+    fn custom_local_edit_conflict_snapshots_and_exports_keep_domains() {
+        let store = new_store();
+        let legacy = envelope_with("original");
+        let mut report = CloudSyncReport {
+            pushed: 0, pulled: 0, skipped: 0, conflicts: 0, usage_imported: 0, errors: Vec::new(),
+        };
+        assert!(apply_remote_objects(&store, &legacy.objects, &[], &key(), &mut report));
+        let item = store.find_user_defined_l1("shared").unwrap().unwrap();
+        store.upsert_synced_l1_memory_with_domains(
+            "shared", "local edit", "fact", &item.updated_at, Some(&domain_links()),
+        ).unwrap();
+        let mut remote = envelope_with("remote edit").objects.remove(0);
+        remote.revision += 1;
+        assert!(apply_remote_objects(&store, &[remote], &[], &key(), &mut report));
+        assert_eq!(report.conflicts, 1);
+        let conflict = store.cloud_sync_conflict_get("l1-user:shared").unwrap().unwrap();
+        let local: L1Payload = serde_json::from_str(conflict.local_content.as_deref().unwrap()).unwrap();
+        assert_eq!(local.domains.unwrap(), domain_links());
+        assert_eq!(l1_of(&store, "shared").as_deref(), Some("local edit"));
+
+        let exporter = new_store();
+        exporter.upsert_synced_l1_memory_with_domains(
+            "shared", "export", "fact", &item.updated_at, Some(&domain_links()),
+        ).unwrap();
+        let (envelope, _) = build_envelope(
+            &exporter, &VaultEnvelope::default(), &key(), "source", &mut report,
+        ).unwrap();
+        let payload: L1Payload = serde_json::from_str(&plain_of(object(&envelope, "l1-user:shared").unwrap())).unwrap();
+        assert_eq!(payload.domains.unwrap(), domain_links());
+    }
+
+    #[test]
+    fn legacy_custom_baseline_accepts_tombstone_without_schema_conflict() {
+        let store = new_store();
+        let legacy = envelope_with("original");
+        let mut report = CloudSyncReport {
+            pushed: 0, pulled: 0, skipped: 0, conflicts: 0, usage_imported: 0, errors: Vec::new(),
+        };
+        assert!(apply_remote_objects(&store, &legacy.objects, &[], &key(), &mut report));
+        let tomb = RemoteTombstone {
+            key: "l1-user:shared".into(),
+            revision: 2,
+            deleted_at: "2026-11-02T00:00:00Z".into(),
+        };
+        assert!(apply_remote_objects(&store, &[], &[tomb], &key(), &mut report));
+        assert!(l1_of(&store, "shared").is_none());
+        assert_eq!(report.conflicts, 0);
+    }
+
+    #[test]
+    fn extracted_domain_upgrade_backfills_existing_mirror() {
+        let source = new_store();
+        let receiver = new_store();
+        add_extracted(&source, "local-l1:tagged", "shared memory", "session");
+        let mut rows = source.exportable_extracted_l1_memories().unwrap();
+        rows[0].domains = None;
+        let plain = serde_json::to_vec(&rows).unwrap();
+        let mut remote = RemoteObject {
+            key: "l1-auto-agg:source".into(),
+            revision: 1,
+            content_hash: sha256_hex(&plain),
+            payload: b64_encode(&vault_encrypt(&key(), &plain).unwrap()),
+            updated_at: "2026-11-02T00:00:00Z".into(),
+            device_id: "source".into(),
+        };
+        let mut report = CloudSyncReport {
+            pushed: 0, pulled: 0, skipped: 0, conflicts: 0, usage_imported: 0, errors: Vec::new(),
+        };
+        assert!(apply_remote_objects(&receiver, &[remote.clone()], &[], &key(), &mut report));
+        let mirror_id = extracted_inventory(&receiver)[0].0.clone();
+        assert!(receiver.cloud_l1_domains(&mirror_id).unwrap().is_empty());
+        rows[0].domains = Some(domain_links());
+        let plain = serde_json::to_vec(&rows).unwrap();
+        assert_ne!(sha256_hex(&plain), remote.content_hash);
+        remote.revision += 1;
+        remote.content_hash = sha256_hex(&plain);
+        remote.payload = b64_encode(&vault_encrypt(&key(), &plain).unwrap());
+        assert!(apply_remote_objects(&receiver, &[remote], &[], &key(), &mut report));
+        assert_eq!(extracted_inventory(&receiver).len(), 1);
+        assert_eq!(receiver.cloud_l1_domains(&mirror_id).unwrap(), domain_links());
+    }
+
+    #[test]
+    fn failed_custom_domain_import_does_not_advance_watermark() {
+        let store = new_store();
+        let legacy = envelope_with("original");
+        let mut report = CloudSyncReport {
+            pushed: 0, pulled: 0, skipped: 0, conflicts: 0, usage_imported: 0, errors: Vec::new(),
+        };
+        assert!(apply_remote_objects(&store, &legacy.objects, &[], &key(), &mut report));
+        let before = store.cloud_sync_meta_row("l1-user:shared").unwrap();
+        let mut payload: L1Payload = serde_json::from_str(&plain_of(&legacy.objects[0])).unwrap();
+        payload.domains = Some(domain_links());
+        store.conn.lock().unwrap().execute_batch(
+            "CREATE TRIGGER fail_cloud_domain_import BEFORE INSERT ON local_memory_domains
+             BEGIN SELECT RAISE(ABORT, 'domain import failed'); END;",
+        ).unwrap();
+        let plain = serde_json::to_vec(&payload).unwrap();
+        let mut remote = legacy.objects[0].clone();
+        remote.revision += 1;
+        remote.content_hash = sha256_hex(&plain);
+        remote.payload = b64_encode(&vault_encrypt(&key(), &plain).unwrap());
+        assert!(!apply_remote_objects(&store, &[remote], &[], &key(), &mut report));
+        assert_eq!(store.cloud_sync_meta_row("l1-user:shared").unwrap(), before);
+        assert!(store.cloud_l1_domains("shared").unwrap().is_empty());
+    }
+
     // ---------- 信封的编码与容错 ----------
 
     #[test]
@@ -2640,6 +3304,9 @@ mod tests {
             content: "记住这一条".to_string(),
             memory_type: "fact".to_string(),
             updated_at: "2026-10-08T10:00:00Z".to_string(),
+            domains: None,
+            event_time: None,
+            created_at: None,
         })
         .expect("序列化载荷");
         let source = VaultEnvelope {
@@ -2861,6 +3528,44 @@ mod tests {
             Some("第二版长期记忆".to_string()),
             "本机应保留自己重新发布的内容"
         );
+    }
+
+    #[test]
+    fn unused_custom_domain_catalog_syncs_changes_and_deletions() {
+        let server = fake_dav::Server::start();
+        let a = paired(&server.url);
+        let b = paired(&server.url);
+        let label = a.save_memory_domain(None, "图谱自定义标签", "无记忆关联也应同步", &["alias".into()], false).unwrap();
+        let first = run_sync(&a).unwrap();
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        let catalog_before = object(&remote_envelope(&server), DOMAIN_CATALOG_KEY).unwrap().content_hash.clone();
+        let pulled = run_sync(&b).unwrap();
+        assert!(pulled.errors.is_empty(), "{:?}", pulled.errors);
+        let label_b = b.memory_domains().unwrap().into_iter().find(|item| item.id == label.id).unwrap();
+        assert_eq!(label_b.name, label.name);
+        assert_eq!(label_b.memory_count, 0);
+        assert!(!label_b.enabled);
+        b.save_memory_domain(Some(&label.id), "重命名标签", "更新说明", &["updated-alias".into()], true).unwrap();
+        let changed = run_sync(&b).unwrap();
+        assert!(changed.errors.is_empty(), "{:?}", changed.errors);
+        assert_ne!(object(&remote_envelope(&server), DOMAIN_CATALOG_KEY).unwrap().content_hash, catalog_before);
+        let backfilled = run_sync(&a).unwrap();
+        assert!(backfilled.errors.is_empty(), "{:?}", backfilled.errors);
+        let renamed = a.memory_domains().unwrap().into_iter().find(|item| item.id == label.id).unwrap();
+        assert_eq!(renamed.name, "重命名标签");
+        assert_eq!(renamed.description, "更新说明");
+        assert_eq!(renamed.aliases, vec!["updated-alias".to_string()]);
+        assert!(renamed.enabled);
+        b.delete_memory_domain(&label.id).unwrap();
+        let deleted = run_sync(&b).unwrap();
+        assert!(deleted.errors.is_empty(), "{:?}", deleted.errors);
+        let deletion_pull = run_sync(&a).unwrap();
+        assert!(deletion_pull.errors.is_empty(), "{:?}", deletion_pull.errors);
+        assert!(!a.memory_domains().unwrap().iter().any(|item| item.id == label.id));
+        assert!(!b.memory_domains().unwrap().iter().any(|item| item.id == label.id));
+        let stable = run_sync(&a).unwrap();
+        assert!(stable.errors.is_empty(), "{:?}", stable.errors);
+        assert_eq!(stable.pushed, 0, "目录合并后无变化不应重复写回");
     }
 
     /// 没有变化时不应重写远端文件：信封每次加密的 nonce 都是随机的，
@@ -3094,6 +3799,60 @@ mod tests {
         assert_eq!(extracted_inventory(&b).len(), 6001, "重复同步不得增加副本");
     }
 
+    #[test]
+    fn pins_recalls_and_receiver_retags_round_trip() {
+        let server = fake_dav::Server::start();
+        let a = paired(&server.url);
+        let b = paired(&server.url);
+        add_extracted(&a, "local-l1:state", "带状态的记忆", "long_term");
+        run_sync(&a).expect("A 首轮");
+        run_sync(&b).expect("B 镜像");
+        a.set_memory_pinned("local-l1:state", true).unwrap();
+        a.record_memory_recall(&["local-l1:state".to_string()]).unwrap();
+        run_sync(&a).expect("A 推状态");
+        run_sync(&b).expect("B 收状态");
+        // B 先产生一条本机召回，让本机重要性行存在，合并视图才有落点。
+        b.record_memory_recall(&["local-l1:state".to_string()]).unwrap();
+        let seen = b.importance_records(&["local-l1:state".to_string()]).unwrap().remove(0);
+        assert!(seen.pinned, "置顶应跨设备可见");
+        assert_eq!(seen.recall_count, 2, "B 本机 1 + A 的 1");
+        run_sync(&b).expect("B 推召回");
+        run_sync(&a).expect("A 收召回");
+        let merged = a.importance_records(&["local-l1:state".to_string()]).unwrap().remove(0);
+        assert_eq!(merged.recall_count, 2, "召回按设备累加：A 1 + B 1");
+        assert!(merged.pinned, "A 自己的置顶不应被 B 的无决策状态覆盖");
+        b.set_memory_pinned("local-l1:state", false).unwrap();
+        run_sync(&b).expect("B 推取消置顶");
+        run_sync(&a).expect("A 收取消置顶");
+        let unpinned = a.importance_records(&["local-l1:state".to_string()]).unwrap().remove(0);
+        assert!(!unpinned.pinned, "较新的取消置顶应覆盖旧置顶");
+
+        // B 对镜像记忆重分类：回传后 A 收敛，且 B 不被 A 的旧聚合覆盖。
+        b.save_memory_domain(
+            None, "接收端分类", "重分类回传", &[], true,
+        ).unwrap();
+        let domains = b.memory_domains().unwrap();
+        let target = domains.iter().find(|item| item.name == "接收端分类").unwrap().id.clone();
+        b.save_memory_domain_classification(
+            &b.local_l1_memory_snapshot()
+                .unwrap()
+                .into_iter()
+                .find(|item| item.id == "local-l1:state")
+                .unwrap(),
+            &[crate::telemetry_store::MemoryDomainAssignment { domain_id: target.clone(), weight: 0.8 }],
+        )
+        .unwrap();
+        run_sync(&b).expect("B 推重分类");
+        run_sync(&a).expect("A 收敛重分类");
+        let a_tags = a.cloud_l1_domains("local-l1:state").unwrap();
+        assert_eq!(a_tags.len(), 1);
+        assert_eq!(a_tags[0].domain.id, target, "来源端应收敛到接收端的新分类");
+        run_sync(&a).expect("A 再同步");
+        run_sync(&b).expect("B 再同步：收敛后的聚合不应覆盖 B 的重分类");
+        let b_tags = b.cloud_l1_domains("local-l1:state").unwrap();
+        assert_eq!(b_tags[0].domain.id, target, "B 的重分类不应被 A 覆盖");
+    }
+
     /// 对端删除（或重整理后聚合变短）通过整体替换传播：B 修剪掉不再
     /// 出现在 A 聚合里的镜像。
     #[test]
@@ -3176,7 +3935,7 @@ mod tests {
             updated_at: "2026-11-02T00:00:00Z".to_string(),
         };
         let (landed, pruned) = b
-            .sync_peer_extracted_l1(&a_device, std::slice::from_ref(&snapshot))
+            .sync_peer_extracted_l1(&a_device, &[snapshot.into()])
             .expect("镜像应用");
         assert_eq!((landed, pruned), (0, 0), "墓碑挡住复活");
         assert!(extracted_inventory(&b).is_empty());

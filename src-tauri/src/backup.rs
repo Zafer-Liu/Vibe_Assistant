@@ -247,6 +247,12 @@ pub fn config_import(
     let skills_restored = extract_dir(&mut archive, SKILLS_DIR, &dir.join(SKILLS_DIR))?;
     let backups_restored = extract_dir(&mut archive, BACKUPS_DIR, &dir.join(BACKUPS_DIR))?;
 
+    // 恢复的数据库带着源机器的云端设备身份。若源机仍在同步，两台机器会争用
+    // 同一个单写者聚合对象；轮换身份并让旧身份退休，避免互相覆盖。
+    if tables_restored > 0 {
+        crate::cloud_sync::retire_cloud_device_identity(store.inner())?;
+    }
+
     Ok(ImportResult {
         tables_restored,
         skills_restored,
