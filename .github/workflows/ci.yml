@@ -37,6 +37,9 @@ jobs:
       - name: MCP configuration regression tests
         run: node --test ../tools/test-mcp-configuration.mjs
 
+      - name: Installer configuration regression tests
+        run: node --test ../tools/test-installer-config.mjs
+
   rust:
     name: Rust tests
     runs-on: ubuntu-22.04

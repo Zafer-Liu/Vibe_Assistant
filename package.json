@@ -14,7 +14,9 @@
     "lint": "npm --prefix frontend run lint",
     "test:mcp": "node --test tools/test-mcp-configuration.mjs",
     "test:dev": "node --test tools/test-prepare-dev.mjs",
-    "test": "npm run test:dev && npm run test:mcp && npm run frontend:check && npm run rust:test",
+    "test:installer": "node --test tools/test-installer-config.mjs",
+    "installer:assets": "node tools/generate-installer-assets.mjs",
+    "test": "npm run test:dev && npm run test:mcp && npm run test:installer && npm run frontend:check && npm run rust:test",
     "ci": "npm test"
   },
   "devDependencies": {
