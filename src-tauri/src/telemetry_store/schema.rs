@@ -138,6 +138,44 @@ mod tests {
     }
 
     #[test]
+    fn classification_upgrade_replays_clean_objects_only_once() {
+        let conn = initialize_database(Connection::open_in_memory().unwrap()).unwrap();
+        conn.execute_batch(
+            "DELETE FROM app_settings WHERE setting_key = 'cloud_classification_replay_v1';
+             INSERT INTO app_settings (setting_key, value_json, updated_at)
+             VALUES ('cloud_vault.pull_cursor', '42', datetime('now'));
+             INSERT INTO cloud_sync_meta (object_key, revision, content_hash, sync_state, updated_at) VALUES
+                ('l1-auto-agg:peer', 1, 'hash', 'clean', datetime('now')),
+                ('tag-overrides:peer', 2, 'hash', 'clean', datetime('now')),
+                ('l1-user:edited', 3, 'hash', 'conflict', datetime('now')),
+                ('usage-agg:peer', 4, 'hash', 'clean', datetime('now'));",
+        ).unwrap();
+        let conn = initialize_database(conn).unwrap();
+        let keys = {
+            let mut statement = conn.prepare("SELECT object_key FROM cloud_sync_meta ORDER BY object_key").unwrap();
+            let rows = statement.query_map([], |row| row.get::<_, String>(0)).unwrap();
+            rows.collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        assert_eq!(keys, vec!["l1-user:edited", "usage-agg:peer"]);
+        let cursor_exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM app_settings WHERE setting_key = 'cloud_vault.pull_cursor')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(!cursor_exists);
+        conn.execute(
+            "INSERT INTO cloud_sync_meta (object_key, revision, content_hash, sync_state, updated_at)
+             VALUES ('l1-auto-agg:peer', 1, 'hash', 'clean', datetime('now'))",
+            [],
+        ).unwrap();
+        let conn = initialize_database(conn).unwrap();
+        let replayed_exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cloud_sync_meta WHERE object_key = 'l1-auto-agg:peer')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(replayed_exists, "后续启动不应再次清除同步水位");
+    }
+
+    #[test]
     fn rejects_read_only_connections_without_changing_existing_data() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("telemetry.sqlite3");
@@ -654,6 +692,31 @@ pub(super) fn initialize_database(mut conn: Connection) -> Result<Connection, St
     // 跨设备镜像来源：NULL = 本机提取/本机自定义；非空 = 从该设备的
     // l1-auto-agg 聚合镜像来的提取记忆（只读，重提取/整理不得触碰）。
     add_local_memory_column_if_missing(&conn, "origin_device", "TEXT")?;
+    // Replay classification-bearing objects once after upgrading. Their hashes
+    // may be unchanged even though the old importer skipped the assignments.
+    {
+        let transaction = conn.transaction().map_err(|e| e.to_string())?;
+        transaction.execute_batch(
+            "DELETE FROM cloud_sync_meta
+              WHERE (object_key LIKE 'l1-auto-agg:%' OR object_key LIKE 'tag-overrides:%')
+                AND sync_state = 'clean'
+                AND NOT EXISTS (SELECT 1 FROM app_settings WHERE setting_key = 'cloud_classification_replay_v1');
+             DELETE FROM app_settings
+              WHERE setting_key = 'cloud_vault.pull_cursor'
+                AND NOT EXISTS (SELECT 1 FROM app_settings WHERE setting_key = 'cloud_classification_replay_v1');
+             DELETE FROM memory_domain_classification_state
+              WHERE memory_id IN (
+                    SELECT m.id FROM local_memory_items m
+                     WHERE m.origin_device IS NOT NULL
+                       AND NOT EXISTS (SELECT 1 FROM cloud_domain_retags r WHERE r.memory_id = m.id)
+                       AND NOT EXISTS (SELECT 1 FROM local_memory_domains md
+                                        WHERE md.memory_id = m.id AND md.source IN ('manual', 'backfill')))
+                AND NOT EXISTS (SELECT 1 FROM app_settings WHERE setting_key = 'cloud_classification_replay_v1');
+             INSERT OR IGNORE INTO app_settings (setting_key, value_json, updated_at)
+             VALUES ('cloud_classification_replay_v1', 'true', datetime('now'));",
+        ).map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|e| e.to_string())?;
+    }
     // Older releases created one TranscriptSync event for every append to
     // the same native session. Keep only the newest revision's memories;
     // its transcript already contains the prior turns.

@@ -59,7 +59,7 @@ pub(super) fn with_cloud_domains(
     }).collect())
 }
 
-fn domain_timestamp(value: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+pub(super) fn domain_timestamp(value: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
     if let Ok(time) = chrono::DateTime::parse_from_rfc3339(value) {
         return Ok(time.with_timezone(&chrono::Utc));
     }
@@ -147,7 +147,8 @@ pub(super) fn apply_cloud_domains(
             params![memory_id, link.domain.id, link.weight, link.source, now],
         ).map_err(|error| error.to_string())?;
     }
-    if active.is_empty() {
+    if !active.iter().any(|link| link.source == "backfill") {
+        // Extraction-time auto labels are not a completed classification decision.
         transaction.execute("DELETE FROM memory_domain_classification_state WHERE memory_id = ?1", [memory_id])
             .map_err(|error| error.to_string())?;
     } else {
@@ -158,6 +159,29 @@ pub(super) fn apply_cloud_domains(
              ON CONFLICT(memory_id) DO UPDATE SET
                 content_hash = excluded.content_hash, classified_at = excluded.classified_at",
             params![memory_id, hash, now],
+        ).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// Restore the source checkpoint even for a completed decision with no active tags.
+pub(super) fn apply_cloud_l1_domains(
+    transaction: &Transaction,
+    row: &CloudL1Memory,
+) -> Result<(), String> {
+    apply_cloud_domains(
+        transaction, &row.id, row.domains.as_deref(),
+        &row.memory, &row.memory_type, &row.durability,
+    )?;
+    if let Some(at) = row.classified_at.as_deref() {
+        domain_timestamp(at)?;
+        let hash = memory_domain_content_hash(&row.memory, &row.memory_type, &row.durability);
+        transaction.execute(
+            "INSERT INTO memory_domain_classification_state (memory_id, content_hash, classified_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(memory_id) DO UPDATE SET
+                content_hash = excluded.content_hash, classified_at = excluded.classified_at",
+            params![row.id, hash, at],
         ).map_err(|error| error.to_string())?;
     }
     Ok(())

@@ -2596,45 +2596,44 @@ impl TelemetryStore {
                 .map_err(|e| e.to_string())?;
             landed += updated;
             if updated > 0 {
-                // Only this peer's mirror may replace assignments; ID collisions keep local tags.
-                // A receiver-side retag with a newer checkpoint wins over the source refresh.
+                // Only explicit receiver-side decisions can outrank the source. Older
+                // imports stamped checkpoints with receive time, which is not a retag.
+                let hash = memory_domain_content_hash(&row.memory, &row.memory_type, &row.durability);
                 let local_at: Option<String> = transaction.query_row(
-                    "SELECT classified_at FROM memory_domain_classification_state WHERE memory_id = ?1",
-                    [&row.id], |result| result.get(0),
+                    "SELECT r.classified_at FROM cloud_domain_retags r
+                       JOIN memory_domain_classification_state s ON s.memory_id = r.memory_id
+                      WHERE r.memory_id = ?1 AND s.content_hash = ?2",
+                    params![row.id, hash], |result| result.get(0),
                 ).optional().map_err(|e| e.to_string())?;
-                // 仅当双方都带检查点时才能比较新旧；旧载荷（无检查点）按来源权威处理。
+                // Legacy payloads without a source checkpoint remain authoritative.
                 let receiver_newer = match (local_at.as_deref(), row.classified_at.as_deref()) {
-                    (Some(local), Some(remote)) => local > remote,
+                    (Some(local), Some(remote)) => {
+                        cloud_domains::domain_timestamp(local)? > cloud_domains::domain_timestamp(remote)?
+                    }
                     _ => false,
                 };
                 if !receiver_newer {
-                    cloud_domains::apply_cloud_domains(
-                        &transaction, &row.id, row.domains.as_deref(),
-                        &row.memory, &row.memory_type, &row.durability,
-                    )?;
-                    if let Some(at) = row.classified_at.as_deref() {
-                        transaction.execute(
-                            "UPDATE memory_domain_classification_state SET classified_at = ?2 WHERE memory_id = ?1",
-                            params![row.id, at],
-                        ).map_err(|e| e.to_string())?;
-                    }
+                    cloud_domains::apply_cloud_l1_domains(&transaction, row)?;
                 }
-            } else if row.domains.as_ref().is_some_and(|domains| !domains.is_empty()) {
-                // Identical records extracted on both devices may share an ID. Fill missing
-                // tags only when content/scope match and no local classification would be lost.
+            } else if row.domains.as_ref().is_some_and(|domains| !domains.is_empty())
+                || row.classified_at.is_some()
+            {
+                // Identical local extractions may already have automatic fallback tags.
+                // Fill those too, but preserve manual tags and completed local decisions.
+                let hash = memory_domain_content_hash(&row.memory, &row.memory_type, &row.durability);
                 let can_fill: bool = transaction.query_row(
                     "SELECT EXISTS(SELECT 1 FROM local_memory_items m
                       WHERE m.id = ?1 AND m.memory = ?2 AND m.memory_type = ?3
-                        AND m.durability = ?4
-                        AND NOT EXISTS(SELECT 1 FROM local_memory_domains md WHERE md.memory_id = m.id))",
-                    params![row.id, row.memory, row.memory_type, row.durability],
+                        AND m.durability = ?4 AND m.user_defined = 0
+                        AND NOT EXISTS(SELECT 1 FROM local_memory_domains md
+                                        WHERE md.memory_id = m.id AND md.source IN ('manual', 'backfill'))
+                        AND NOT EXISTS(SELECT 1 FROM memory_domain_classification_state s
+                                        WHERE s.memory_id = m.id AND s.content_hash = ?5))",
+                    params![row.id, row.memory, row.memory_type, row.durability, hash],
                     |result| result.get(0),
                 ).map_err(|e| e.to_string())?;
                 if can_fill {
-                    cloud_domains::apply_cloud_domains(
-                        &transaction, &row.id, row.domains.as_deref(),
-                        &row.memory, &row.memory_type, &row.durability,
-                    )?;
+                    cloud_domains::apply_cloud_l1_domains(&transaction, row)?;
                     landed += 1;
                 }
             }

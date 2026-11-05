@@ -129,6 +129,88 @@ fn identical_untagged_local_record_can_receive_missing_remote_tags() {
 }
 
 #[test]
+fn automatic_fallback_on_an_identical_local_memory_accepts_cloud_classification() {
+    let store = TelemetryStore::in_memory();
+    let mut fallback = domain_link("unclassified", "未分类");
+    fallback.domain.kind = "builtin".into();
+    fallback.source = "auto".into();
+    let mut record = cloud_record("local-l1:auto-fallback", Some(vec![fallback]));
+    store.sync_peer_extracted_l1("initial-device", &[record.clone()]).unwrap();
+    assert!(!store.completed_memory_domain_classification_ids().unwrap().contains(&record.id));
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute("UPDATE local_memory_items SET origin_device = NULL WHERE id = ?1", [&record.id]).unwrap();
+    }
+    let link = domain_link("custom:classified", "正式分类");
+    record.domains = Some(vec![link.clone()]);
+    record.classified_at = Some("2026-11-02T00:00:00Z".into());
+    store.sync_peer_extracted_l1("source-device", &[record.clone()]).unwrap();
+    assert_eq!(store.cloud_l1_domains(&record.id).unwrap(), vec![link.clone()]);
+    assert_eq!(store.cloud_classification_checkpoint(&record.id).unwrap(), record.classified_at);
+    assert!(store.completed_memory_domain_classification_ids().unwrap().contains(&record.id));
+    assert_eq!(store.exportable_extracted_l1_memories().unwrap().len(), 1);
+
+    // A second device must not replace the now-completed local decision.
+    record.domains = Some(vec![domain_link("custom:other", "其他分类")]);
+    store.sync_peer_extracted_l1("other-device", &[record.clone()]).unwrap();
+    assert_eq!(store.cloud_l1_domains(&record.id).unwrap(), vec![link]);
+}
+
+#[test]
+fn receive_time_checkpoint_does_not_block_the_source_classification() {
+    let store = TelemetryStore::in_memory();
+    let mut fallback = domain_link("unclassified", "未分类");
+    fallback.domain.kind = "builtin".into();
+    fallback.source = "auto".into();
+    let mut record = cloud_record("local-l1:receive-time", Some(vec![fallback]));
+    store.sync_peer_extracted_l1("source-device", &[record.clone()]).unwrap();
+    {
+        // Simulate the old importer inventing a checkpoint later than the source.
+        let conn = store.conn.lock().unwrap();
+        let hash = memory_domain_content_hash(&record.memory, &record.memory_type, &record.durability);
+        conn.execute(
+            "INSERT INTO memory_domain_classification_state (memory_id, content_hash, classified_at)
+             VALUES (?1, ?2, '2099-01-01T00:00:00Z')",
+            params![record.id, hash],
+        ).unwrap();
+    }
+    let link = domain_link("custom:source-decision", "来源分类");
+    record.domains = Some(vec![link.clone()]);
+    record.classified_at = Some("2026-11-02T00:00:00Z".into());
+    store.sync_peer_extracted_l1("source-device", &[record.clone()]).unwrap();
+    assert_eq!(store.cloud_l1_domains(&record.id).unwrap(), vec![link]);
+    assert_eq!(store.cloud_classification_checkpoint(&record.id).unwrap(), record.classified_at);
+}
+
+#[test]
+fn completed_cloud_decision_without_active_tags_keeps_its_checkpoint() {
+    let store = TelemetryStore::in_memory();
+    let mut record = cloud_record("local-l1:empty-decision", Some(Vec::new()));
+    record.classified_at = Some("2026-11-02T00:00:00Z".into());
+    store.sync_peer_extracted_l1("source-device", &[record.clone()]).unwrap();
+    assert!(store.cloud_l1_domains(&record.id).unwrap().is_empty());
+    assert!(store.completed_memory_domain_classification_ids().unwrap().contains(&record.id));
+    assert_eq!(store.cloud_classification_checkpoint(&record.id).unwrap(), record.classified_at);
+}
+
+#[test]
+fn same_content_manual_tags_are_not_replaced_by_cloud_classification() {
+    let store = TelemetryStore::in_memory();
+    let mut manual = domain_link("custom:manual", "手动分类");
+    manual.source = "manual".into();
+    let mut record = cloud_record("local-l1:manual", Some(vec![manual.clone()]));
+    store.sync_peer_extracted_l1("initial-device", &[record.clone()]).unwrap();
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute("UPDATE local_memory_items SET origin_device = NULL WHERE id = ?1", [&record.id]).unwrap();
+    }
+    record.domains = Some(vec![domain_link("custom:remote", "远端分类")]);
+    record.classified_at = Some("2026-11-02T00:00:00Z".into());
+    store.sync_peer_extracted_l1("source-device", &[record.clone()]).unwrap();
+    assert_eq!(store.cloud_l1_domains(&record.id).unwrap(), vec![manual]);
+}
+
+#[test]
 fn builtin_tags_with_sqlite_timestamps_are_accepted() {
     let store = TelemetryStore::in_memory();
     let mut link = domain_link("work", "工作");

@@ -1174,7 +1174,10 @@ fn apply_remote_objects(
         }
         report.pulled += 1;
     }
-    for obj in objects.iter().filter(|obj| obj.key != DOMAIN_CATALOG_KEY).cloned() {
+    // Retags reference L1 IDs: land memories first, regardless of server order.
+    let mut ordered_objects: Vec<_> = objects.iter().filter(|obj| obj.key != DOMAIN_CATALOG_KEY).collect();
+    ordered_objects.sort_by_key(|obj| obj.key.starts_with("tag-overrides:"));
+    for obj in ordered_objects.into_iter().cloned() {
         let meta = store.cloud_sync_meta_row(&obj.key).ok().flatten();
         // 信封模式每轮都拿到全量对象，所以必须先问一句「远端其实有没有变」：
         //   · 远端 == 上次同步的水位 → 远端没有新东西。本地若有改动，那是本地的新进度，
@@ -3340,6 +3343,34 @@ mod tests {
         assert!(apply_remote_objects(&receiver, &[remote], &[], &key(), &mut report));
         assert_eq!(extracted_inventory(&receiver).len(), 1);
         assert_eq!(receiver.cloud_l1_domains(&mirror_id).unwrap(), domain_links());
+    }
+
+    #[test]
+    fn tag_overrides_land_after_memories_even_when_listed_first() {
+        let source = new_store();
+        let receiver = new_store();
+        let id = "local-l1:retag-order";
+        add_extracted(&source, id, "shared memory", "session");
+        let rows = source.exportable_extracted_l1_memories().unwrap();
+        let overrides = vec![crate::telemetry_store::CloudTagOverride {
+            memory_id: id.into(), domains: domain_links(),
+            classified_at: "2026-11-03T00:00:00Z".into(),
+        }];
+        let objects = [
+            ("tag-overrides:retagger", serde_json::to_vec(&overrides).unwrap()),
+            ("l1-auto-agg:source", serde_json::to_vec(&rows).unwrap()),
+        ].into_iter().map(|(name, plain)| RemoteObject {
+            key: name.into(), revision: 1, content_hash: sha256_hex(&plain),
+            payload: b64_encode(&vault_encrypt(&key(), &plain).unwrap()),
+            updated_at: "2026-11-03T00:00:00Z".into(), device_id: "source".into(),
+        }).collect::<Vec<_>>();
+        let mut report = CloudSyncReport {
+            pushed: 0, pulled: 0, skipped: 0, conflicts: 0, usage_imported: 0, errors: Vec::new(),
+        };
+        assert!(apply_remote_objects(&receiver, &objects, &[], &key(), &mut report));
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(receiver.cloud_l1_domains(id).unwrap()[0].domain.id, "cloud-test-domain");
+        assert_eq!(receiver.cloud_classification_checkpoint(id).unwrap().as_deref(), Some("2026-11-03T00:00:00Z"));
     }
 
     #[test]
