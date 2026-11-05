@@ -88,6 +88,11 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), String> {
         CREATE TABLE IF NOT EXISTS model_legacy_cleanups(namespace TEXT NOT NULL,path TEXT NOT NULL,original_hash TEXT NOT NULL,sanitized BLOB NOT NULL,PRIMARY KEY(namespace,path));").map_err(|e| e.to_string())
 }
 
+/// 云端同步使用与生产相同的系统主密钥后端。
+pub(crate) fn native_master_keys() -> Arc<dyn MasterKeys> {
+    Arc::new(NativeKeys)
+}
+
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -137,6 +142,10 @@ impl Registry {
             store,
             keys: Arc::new(NativeKeys),
         })
+    }
+    /// 云端同步与测试共用：注入指定存储与主密钥后端。
+    pub(crate) fn with_store(store: TelemetryStore, keys: Arc<dyn MasterKeys>) -> Self {
+        Self { store: Arc::new(store), keys }
     }
     fn master(&self) -> Result<(String, Zeroizing<Vec<u8>>), String> {
         let conn = self.store.conn.lock().map_err(|_| "模型注册表锁已损坏")?;
@@ -560,6 +569,22 @@ impl Registry {
             .map(Zeroizing::new)
             .map_err(|_| "模型凭证格式损坏")?;
         Ok((document, identity, secret))
+    }
+    /// 云端同步落地后对齐来源端的修订号：本地自增会让对端的后续编辑
+    /// 在修订号比较中被判为「更旧」而丢失。
+    pub(crate) fn set_sync_revision(
+        &self,
+        namespace: &str,
+        legacy_id: &str,
+        revision: i64,
+    ) -> Result<(), String> {
+        let conn = self.store.conn.lock().map_err(|_| "模型注册表锁已损坏")?;
+        conn.execute(
+            "UPDATE model_provider_connections SET revision=?3 WHERE namespace=?1 AND legacy_id=?2",
+            params![namespace, legacy_id, revision],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
     }
     pub fn delete(&self, namespace: &str, id: &str) -> Result<(), String> {
         let _guard = CONFIG_LOCK

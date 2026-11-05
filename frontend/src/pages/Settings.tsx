@@ -317,6 +317,7 @@ interface VaultSettingsView {
   region: string
   path_style: boolean
   auto_interval_min: number
+  sync_models: boolean
 }
 
 type VaultStatus =
@@ -335,6 +336,7 @@ function CloudVaultSettings() {
   const [passwordSet, setPasswordSet] = useState(false)
   const [autoInterval, setAutoInterval] = useState(0)
   const [enabled, setEnabled] = useState(false)
+  const [syncModels, setSyncModels] = useState(false)
   const [patSet, setPatSet] = useState(false)
   const [endpoint, setEndpoint] = useState('')
   const [region, setRegion] = useState('')
@@ -356,6 +358,7 @@ function CloudVaultSettings() {
       setRegion(v.region ?? '')
       setPathStyle(Boolean(v.path_style))
       setAutoInterval(v.auto_interval_min)
+      setSyncModels(Boolean(v.sync_models))
       setLoaded(true)
     })
   }, [])
@@ -428,6 +431,7 @@ function CloudVaultSettings() {
         pathStyle,
         autoIntervalMin: autoInterval,
         enabled,
+        syncModels,
       })
       if (pat) {
         setPat('')
@@ -628,6 +632,16 @@ function CloudVaultSettings() {
         />
         {t('settings.cloudVault.enable')}
       </label>
+      <label className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-300">
+        <input
+          type="checkbox"
+          checked={syncModels}
+          onChange={(e) => setSyncModels(e.target.checked)}
+          className="h-3.5 w-3.5 rounded border-gray-300"
+        />
+        {t('settings.cloudVault.syncModels')}
+      </label>
+      <p className="text-xs text-gray-500 dark:text-gray-400">{t('settings.cloudVault.syncModelsHint')}</p>
       <div className="flex flex-wrap gap-2">
         <button
           onClick={handleTest}

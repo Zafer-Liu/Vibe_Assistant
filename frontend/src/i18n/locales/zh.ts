@@ -1814,6 +1814,8 @@ const zh = {
      autoOff: '关闭（仅手动）',
      autoEvery: '每 {{min}} 分钟',
      enable: '启用云端同步',
+     syncModels: '同步模型配置',
+     syncModelsHint: 'WebDAV/S3 目标下，随云端记忆库同步模型连接、Key、决策模型与语义嵌入配置。Key 在传输中由同步密码加密，落地时用本机系统密钥重新封存。',
      test: '连接测试',
      testing: '测试中…',
      testOk: '连接成功（服务端版本 v{{version}}）',

@@ -1816,6 +1816,8 @@ const en: TranslationSchema = {
      autoOff: 'Off (manual only)',
      autoEvery: 'Every {{min}} minutes',
      enable: 'Enable cloud sync',
+     syncModels: 'Sync model configuration',
+     syncModelsHint: 'On WebDAV/S3 targets, sync model connections, keys, decision model and semantic embedding settings with the vault. Keys travel encrypted by the sync password and are re-sealed with this device’s system key on arrival.',
      test: 'Test Connection',
      testing: 'Testing…',
      testOk: 'Connected (server v{{version}})',

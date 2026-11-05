@@ -14,6 +14,7 @@ mod equipment_profiles;
 mod llm;
 mod llm_trace;
 mod model_registry;
+pub(crate) mod model_sync;
 mod mcp;
 mod mcp_fallback_resolver;
 #[path = "../mcp-launcher/src/installation.rs"]

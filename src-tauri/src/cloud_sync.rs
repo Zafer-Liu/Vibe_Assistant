@@ -31,6 +31,9 @@ const SETTING_PATH_STYLE: &str = "cloud_vault.path_style";
 /// 自建服务端的 PAT 去当坚果云密码，既连不上，又把旧凭据发给了另一个服务器。
 const SETTING_CRED_KIND: &str = "cloud_vault.cred_kind";
 const SETTING_ENABLED: &str = "cloud_vault.enabled";
+/// 模型配置（连接、Key、决策/语义模型）是否随云端记忆库同步。默认关闭。
+const SETTING_SYNC_MODELS: &str = "cloud_vault.sync_models";
+const MODEL_CONFIG_KEY: &str = "model-config:shared";
 const SETTING_DEVICE_ID: &str = "cloud_vault.device_id";
 const SETTING_LAST_SYNC: &str = "cloud_vault.last_sync";
 const SETTING_PASSWORD: &str = "cloud_vault.password";
@@ -67,7 +70,7 @@ fn sha256_hex(data: &[u8]) -> String {
         .collect()
 }
 
-fn vault_encrypt(key: &[u8; 32], plain: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn vault_encrypt(key: &[u8; 32], plain: &[u8]) -> Result<Vec<u8>, String> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let sealed = cipher
@@ -78,7 +81,7 @@ fn vault_encrypt(key: &[u8; 32], plain: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn vault_decrypt(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn vault_decrypt(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, String> {
     if blob.len() <= 12 {
         return Err("云端密文损坏".into());
     }
@@ -93,7 +96,7 @@ fn vault_decrypt(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, String> {
 
 const B64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-fn b64_encode(data: &[u8]) -> String {
+pub(crate) fn b64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     let mut buf: u32 = 0;
     let mut bits = 0u32;
@@ -111,7 +114,7 @@ fn b64_encode(data: &[u8]) -> String {
     out
 }
 
-fn b64_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn b64_decode(s: &str) -> Option<Vec<u8>> {
     let trimmed: Vec<u8> = s
         .bytes()
         .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
@@ -160,6 +163,7 @@ pub struct CloudVaultSettingsView {
     pub path_style: bool,
     pub enabled: bool,
     pub auto_interval_min: i64,
+    pub sync_models: bool,
 }
 
 #[derive(Serialize)]
@@ -316,6 +320,7 @@ struct VaultConfig {
     remote: RemoteConfig,
     enabled: bool,
     password: String,
+    sync_models: bool,
 }
 
 fn vault_config(store: &TelemetryStore) -> Result<VaultConfig, String> {
@@ -362,6 +367,7 @@ fn vault_config(store: &TelemetryStore) -> Result<VaultConfig, String> {
         },
         enabled: store.app_setting_get::<bool>(SETTING_ENABLED).unwrap_or(false),
         password: decrypt(SETTING_PASSWORD),
+        sync_models: store.app_setting_get::<bool>(SETTING_SYNC_MODELS).unwrap_or(false),
     })
 }
 
@@ -1109,6 +1115,41 @@ fn apply_remote_objects(
     let errors_before = report.errors.len();
     // The catalog is independent of memory records. Apply it first so deletion
     // markers also block definitions embedded in older per-memory payloads.
+    for obj in objects.iter().filter(|obj| obj.key == MODEL_CONFIG_KEY) {
+        let meta = store.cloud_sync_meta_row(&obj.key).ok().flatten();
+        if meta.as_ref().is_some_and(|(_, hash, _, _)| hash.as_deref() == Some(obj.content_hash.as_str())) {
+            report.skipped += 1;
+            continue;
+        }
+        let Some(plain) = decrypt_remote_content(vault_key_bytes, obj, report) else { return false };
+        let config: crate::model_sync::CloudModelConfig = match serde_json::from_str(&plain) {
+            Ok(config) => config,
+            Err(error) => {
+                report.errors.push(format!("模型配置解析失败：{error}"));
+                return false;
+            }
+        };
+        match crate::model_sync::apply_model_config(
+            store,
+            crate::model_registry::native_master_keys(),
+            vault_key_bytes,
+            &config,
+        ) {
+            Ok((applied, skipped_items)) => {
+                let _ = store.cloud_sync_meta_set(&obj.key, obj.revision, Some(&obj.content_hash), "clean");
+                if applied > 0 {
+                    report.pulled += 1;
+                } else {
+                    report.skipped += 1;
+                }
+                report.skipped += skipped_items as u32;
+            }
+            Err(error) => {
+                report.errors.push(format!("模型配置落地失败：{error}"));
+                return false;
+            }
+        }
+    }
     for obj in objects.iter().filter(|obj| obj.key == DOMAIN_CATALOG_KEY) {
         let meta = store.cloud_sync_meta_row(&obj.key).ok().flatten();
         if meta.as_ref().is_some_and(|(_, hash, _, _)| hash.as_deref() == Some(obj.content_hash.as_str())) {
@@ -2287,6 +2328,31 @@ fn build_envelope(
         }
     }
 
+    // 模型配置（连接 + Key + 决策/语义）：开关开启时整体共享一个对象。
+    if store.app_setting_get::<bool>(SETTING_SYNC_MODELS).unwrap_or(false) {
+        let model_config = crate::model_sync::export_model_config(
+            store,
+            crate::model_registry::native_master_keys(),
+            vault_key_bytes,
+        )?;
+        let plain = serde_json::to_vec(&model_config)
+            .map_err(|error| format!("{MODEL_CONFIG_KEY}: 序列化失败 {error}"))?;
+        let hash = sha256_hex(&plain);
+        if objects.get(MODEL_CONFIG_KEY).map(|object| object.content_hash.as_str()) != Some(hash.as_str()) {
+            revision += 1;
+            objects.insert(MODEL_CONFIG_KEY.into(), RemoteObject {
+                key: MODEL_CONFIG_KEY.into(), revision,
+                content_hash: hash.clone(),
+                payload: b64_encode(&vault_encrypt(vault_key_bytes, &plain)?),
+                updated_at: now.clone(), device_id: device.to_string(),
+            });
+            pending.push(PendingWrite::Meta {
+                key: MODEL_CONFIG_KEY.into(), revision, hash: Some(hash), state: "clean",
+            });
+            report.pushed += 1;
+        }
+    }
+
     // Publish the merged registry even when no memory uses a custom label yet.
     let catalog = store.cloud_domain_catalog()?;
     let plain = serde_json::to_vec(&catalog).map_err(|error| format!("领域标签目录序列化失败：{error}"))?;
@@ -2495,6 +2561,7 @@ pub fn cloud_vault_get_settings(
         auto_interval_min: telemetry
             .app_setting_get::<i64>(SETTING_AUTO_INTERVAL_MIN)
             .unwrap_or(0),
+        sync_models: config.sync_models,
     })
 }
 
@@ -2511,6 +2578,7 @@ pub fn cloud_vault_save_settings(
     path_style: Option<bool>,
     auto_interval_min: i64,
     enabled: bool,
+    sync_models: Option<bool>,
 ) -> Result<(), String> {
     // 地址带 s3:// 前缀时自动判为 S3，与 Magpie 的做法一致。
     let kind = match kind {
@@ -2570,6 +2638,9 @@ pub fn cloud_vault_save_settings(
     }
     telemetry.app_setting_set(SETTING_AUTO_INTERVAL_MIN, &auto_interval_min.clamp(0, 1440))?;
     telemetry.app_setting_set(SETTING_ENABLED, &enabled)?;
+    if let Some(sync_models) = sync_models {
+        telemetry.app_setting_set(SETTING_SYNC_MODELS, &sync_models)?;
+    }
     Ok(())
 }
 
