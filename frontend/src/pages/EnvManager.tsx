@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { invoke } from '@tauri-apps/api/core'
 import { RefreshCw, Plus, Pencil, Trash2, AlertTriangle, Search, Variable } from 'lucide-react'
 import { ErrorRecovery } from '../components/ErrorRecovery'
+import { useConfirmDialog } from '../components/ConfirmDialog'
+import { Modal } from '../components/Modal'
 
 // ── 后端 env_manager.rs 的返回结构（字段为后端 snake_case 原样） ──
 
@@ -33,15 +35,23 @@ function joinLines(lines: string[]): string {
 function VarDialog({
   scope,
   initial,
+  existing,
   onClose,
   onSaved,
 }: {
   scope: Scope
   initial: EnvVar | null
+  /** 当前作用域里已有的变量：新增时用来识别「同名覆盖」。 */
+  existing: readonly EnvVar[]
   onClose: () => void
   onSaved: () => void
 }) {
   const { t } = useTranslation()
+  const titleId = useId()
+  const { confirm, confirmDialog } = useConfirmDialog()
+  // 作用域在句子里的叫法由代码给出，不用 ICU 的 select 语法：本项目的 i18next 没有 ICU 插件，
+  // `{{scope, select, ...}}` 会原样漏出（曾让删除确认显示成「确定从user}变量中删除…」）。
+  const scopeText = (scope === 'user' ? t('envVars.scopeUser') : t('envVars.scopeSystem')).toLowerCase()
   const [name, setName] = useState(initial?.name ?? '')
   const [raw, setRaw] = useState(initial?.value ?? '')
   const [lines, setLines] = useState<string[]>(() => (initial?.value ?? '').split(';'))
@@ -72,10 +82,28 @@ function VarDialog({
   }
 
   const save = async () => {
+    const trimmed = name.trim()
+    // 同名覆盖、以及写入系统变量，保存后都没有撤销入口：先弹出确认，并列出新旧值供核对。
+    const current = editing ? initial : existing.find(item => item.name.toLowerCase() === trimmed.toLowerCase()) ?? null
+    const overwrite = !editing && current !== null
+    if (overwrite || scope === 'system') {
+      const confirmed = await confirm({
+        title: overwrite ? t('envVars.overwriteTitle') : t('envVars.systemWriteTitle'),
+        message: overwrite ? t('envVars.overwriteMessage', { name: trimmed, scopeLabel: scopeText }) : t('envVars.systemWriteMessage'),
+        detailLines: [
+          { label: t('envVars.name'), value: trimmed },
+          ...(current ? [{ label: t('envVars.currentValue'), value: current.value }] : []),
+          { label: t('envVars.newValue'), value },
+        ],
+        confirmLabel: overwrite ? t('envVars.overwriteConfirm') : t('envVars.systemWriteConfirm'),
+        tone: overwrite ? 'danger' : 'default',
+      })
+      if (!confirmed) return
+    }
     setSaving(true)
     setError('')
     try {
-      await invoke('env_var_set', { scope, name: name.trim(), value })
+      await invoke('env_var_set', { scope, name: trimmed, value })
       onSaved()
     } catch (cause) {
       setError(String(cause))
@@ -83,16 +111,12 @@ function VarDialog({
     }
   }
 
+  // 点背景不关闭：编辑 PATH 这类长列表时一次误点会丢掉全部输入；Esc 与取消按钮仍可关闭。
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
-      role="dialog"
-      aria-modal="true"
-      aria-label={editing ? t('envVars.edit') : t('envVars.add')}
-      onClick={e => { if (e.target === e.currentTarget) onClose() }}
-    >
+    <>
+    <Modal labelledBy={titleId} busy={saving} onClose={onClose}>
       <div className="w-[min(560px,100%)] rounded-2xl border border-gray-200 bg-white p-5 shadow-xl dark:border-gray-700 dark:bg-gray-900">
-        <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+        <h3 id={titleId} className="text-sm font-semibold text-gray-900 dark:text-gray-100">
           {editing ? t('envVars.editTitle', { name: initial.name }) : t('envVars.add')}
         </h3>
         <div className="mt-4 space-y-3">
@@ -170,11 +194,16 @@ function VarDialog({
           </button>
         </div>
       </div>
-    </div>
+    </Modal>
+    {confirmDialog}
+    </>
   )
 }
 
-/** 删除确认：受保护变量（PATH 等）由后端直接拒绝，这里只做普通确认。 */
+/**
+ * 删除确认（二次确认）：先列出将被删除的变量名、作用域和当前值，再要求手动输入变量名才能点「删除」，
+ * 避免误点或手滑；系统变量额外给出影响范围提示。受保护变量（PATH 等）仍由后端直接拒绝，错误在弹窗内显示。
+ */
 function DeleteDialog({
   scope,
   item,
@@ -187,10 +216,19 @@ function DeleteDialog({
   onSaved: () => void
 }) {
   const { t } = useTranslation()
+  const titleId = useId()
+  const scopeText = (scope === 'user' ? t('envVars.scopeUser') : t('envVars.scopeSystem')).toLowerCase()
+  const [typed, setTyped] = useState('')
   const [deleting, setDeleting] = useState(false)
   const [error, setError] = useState('')
+  const matched = typed.trim() === item.name
+  // 路径列表逐条分行展示，和列表页保持一致。
+  const currentValue = isPathListVar(item.name, item.value)
+    ? item.value.split(';').filter(entry => entry !== '').join('\n')
+    : item.value
 
   const remove = async () => {
+    if (!matched || deleting) return
     setDeleting(true)
     setError('')
     try {
@@ -203,48 +241,74 @@ function DeleteDialog({
   }
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
-      role="dialog"
-      aria-modal="true"
-      aria-label={t('envVars.deleteTitle')}
-      onClick={e => { if (e.target === e.currentTarget) onClose() }}
-    >
-      <div className="w-[min(440px,100%)] rounded-2xl border border-gray-200 bg-white p-5 shadow-xl dark:border-gray-700 dark:bg-gray-900">
+    <Modal labelledBy={titleId} busy={deleting} onClose={onClose}>
+      <form
+        onSubmit={event => { event.preventDefault(); void remove() }}
+        className="w-[min(480px,100%)] rounded-2xl border border-gray-200 bg-white p-5 shadow-xl dark:border-gray-700 dark:bg-gray-900"
+      >
         <div className="flex items-start gap-2.5">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-500" />
           <div className="min-w-0">
-            <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100">{t('envVars.deleteTitle')}</h3>
+            <h3 id={titleId} className="text-sm font-semibold text-gray-900 dark:text-gray-100">{t('envVars.deleteTitle')}</h3>
             <p className="mt-1 break-all text-xs text-gray-500 dark:text-gray-400">
-              {t('envVars.deleteConfirm', { name: item.name, scope })}
+              {t('envVars.deleteConfirm', { name: item.name, scopeLabel: scopeText })}
             </p>
           </div>
         </div>
+        <dl className="mt-3 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 rounded-lg bg-gray-50 px-3 py-2 text-xs dark:bg-gray-800/60">
+          <dt className="text-gray-500 dark:text-gray-400">{t('envVars.name')}</dt>
+          <dd className="break-all font-mono font-medium text-gray-900 dark:text-gray-100">
+            {item.name}
+            <span className={`ml-2 rounded px-1.5 py-0.5 font-sans text-[11px] font-medium ${scope === 'system' ? 'bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300' : 'bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-200'}`}>
+              {scope === 'user' ? t('envVars.scopeUser') : t('envVars.scopeSystem')}
+            </span>
+          </dd>
+          <dt className="text-gray-500 dark:text-gray-400">{t('envVars.currentValue')}</dt>
+          <dd className="max-h-28 overflow-y-auto whitespace-pre-wrap break-all font-mono text-gray-700 dark:text-gray-200">{currentValue}</dd>
+        </dl>
+        {scope === 'system' && (
+          <p role="note" className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs leading-5 text-red-700 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300">
+            {t('envVars.deleteSystemWarn')}
+          </p>
+        )}
+        <label className="mt-4 block">
+          <span className="text-xs font-medium text-gray-700 dark:text-gray-300">{t('envVars.deleteTypeLabel', { name: item.name })}</span>
+          <input
+            value={typed}
+            onChange={event => { setTyped(event.target.value) }}
+            data-autofocus
+            autoComplete="off"
+            spellCheck={false}
+            disabled={deleting}
+            placeholder={t('envVars.deleteTypePlaceholder')}
+            className="mt-1 w-full rounded-lg border border-gray-300 bg-white px-3 py-2 font-mono text-sm text-gray-900 placeholder:text-gray-400 focus:border-red-500 focus:outline-none dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+          />
+        </label>
         {error && (
           <div role="alert" className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300">
             <p className="break-words">{error}</p>
-            <ErrorRecovery error={error} onRetry={() => { void remove() }} disabled={deleting} />
+            <ErrorRecovery error={error} onRetry={() => { void remove() }} disabled={deleting || !matched} />
           </div>
         )}
         <div className="mt-5 flex justify-end gap-2">
           <button
             type="button"
             onClick={onClose}
-            className="rounded-lg border border-gray-200 px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-800"
+            disabled={deleting}
+            className="rounded-lg border border-gray-200 px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-800"
           >
             {t('common.cancel')}
           </button>
           <button
-            type="button"
-            onClick={() => { void remove() }}
-            disabled={deleting}
+            type="submit"
+            disabled={deleting || !matched}
             className="rounded-lg bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 dark:bg-red-500 dark:hover:bg-red-600"
           >
             {deleting ? t('common.saving') : t('envVars.delete')}
           </button>
         </div>
-      </div>
-    </div>
+      </form>
+    </Modal>
   )
 }
 
@@ -445,6 +509,7 @@ export function EnvManager() {
         <VarDialog
           scope={scope}
           initial={editing}
+          existing={vars}
           onClose={() => { setDialogOpen(false); setEditing(null) }}
           onSaved={() => { setDialogOpen(false); setEditing(null); setChanged(true); void refresh() }}
         />

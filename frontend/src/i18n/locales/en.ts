@@ -1661,7 +1661,7 @@ const en: TranslationSchema = {
     editTitle: 'Edit {{name}}',
     delete: 'Delete',
     deleteTitle: 'Delete environment variable',
-    deleteConfirm: 'Delete "{{name}}" from {{scope, select, user {user} system {system} other {}}} variables? This cannot be undone.',
+    deleteConfirm: 'Delete "{{name}}" from the {{scopeLabel}} variables? This cannot be undone.',
     name: 'Name',
     value: 'Value',
     namePlaceholder: 'e.g. CUDA_PATH',
@@ -1676,6 +1676,17 @@ const en: TranslationSchema = {
     footerHint: 'Equivalent to Windows "Edit environment variables": user variables are per-account, system variables apply to all accounts. Running processes only see changes after restart.',
     empty: 'No variables match the filter',
     loadFailed: 'Failed to load environment variables',
+    currentValue: 'Current value',
+    newValue: 'New value',
+    deleteSystemWarn: 'This is a system variable and applies to every account on this machine. Programs that depend on it may stop working, and it can only be recreated by hand.',
+    deleteTypeLabel: 'Type the variable name "{{name}}" to confirm deletion',
+    deleteTypePlaceholder: 'Variable name',
+    overwriteTitle: 'Overwrite existing variable',
+    overwriteMessage: '"{{name}}" already exists in the {{scopeLabel}} variables. Saving replaces its current value and cannot be undone.',
+    overwriteConfirm: 'Overwrite',
+    systemWriteTitle: 'Change a system variable',
+    systemWriteMessage: 'System variables apply to every account on this machine, and running programs need a restart to see the new value. Write it?',
+    systemWriteConfirm: 'Write system variable',
   },
   updater: {
     title: 'Check for Updates',
@@ -1875,7 +1886,12 @@ const en: TranslationSchema = {
   onboarding: {
     guideTitle: "Vibe Assistant setup guide",
     progress: "{{current}} / {{total}} · {{label}}",
+    language: {
+      hint: "The interface switches as soon as you choose. You can change it again anytime from the language button at the bottom of the sidebar.",
+      continue: "Continue",
+    },
     steps: {
+      language: "Language",
       welcome: "Your workspace",
       memory: "Memory Center",
       skills: "Skills",
@@ -1886,12 +1902,7 @@ const en: TranslationSchema = {
     modules: {
       firstAction: "A useful first step",
       memory: {
-    language: {
-      hint: "The interface switches as soon as you choose. You can change it again anytime from the language button at the bottom of the sidebar.",
-      continue: "Continue",
-    },
         title: "Memory Center",
-      language: "Language",
         desc: "Keep project context, recent progress, and lasting preferences in your workspace so new sessions need less repetition.",
         one: {
           title: "Capture and search",

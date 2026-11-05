@@ -1659,7 +1659,7 @@ const zh = {
     editTitle: '编辑 {{name}}',
     delete: '删除',
     deleteTitle: '删除环境变量',
-    deleteConfirm: '确定从{{scope, select, user {用户} system {系统} other {}}}变量中删除「{{name}}」吗？此操作不可撤销。',
+    deleteConfirm: '确定从{{scopeLabel}}中删除「{{name}}」吗？此操作不可撤销。',
     name: '变量名',
     value: '变量值',
     namePlaceholder: '例如 CUDA_PATH',
@@ -1674,6 +1674,17 @@ const zh = {
     footerHint: '等价于 Windows「编辑系统环境变量」对话框：用户变量按账户隔离，系统变量对所有账户生效；已运行的进程需重启才能看到变化。',
     empty: '没有匹配的变量',
     loadFailed: '环境变量读取失败',
+    currentValue: '当前值',
+    newValue: '新值',
+    deleteSystemWarn: '这是系统变量，对本机所有账户生效。删除后依赖它的程序可能无法启动，且只能手动重新创建。',
+    deleteTypeLabel: '请输入变量名「{{name}}」以确认删除',
+    deleteTypePlaceholder: '输入变量名',
+    overwriteTitle: '覆盖已有变量',
+    overwriteMessage: '{{scopeLabel}}中已有「{{name}}」，保存会直接覆盖它的当前值，且无法撤销。',
+    overwriteConfirm: '覆盖',
+    systemWriteTitle: '修改系统变量',
+    systemWriteMessage: '系统变量对本机所有账户生效，已运行的程序需重启才能读到新值。确认写入吗？',
+    systemWriteConfirm: '写入系统变量',
   },
   updater: {
     title: '检查更新',
@@ -1873,7 +1884,12 @@ const zh = {
   onboarding: {
     guideTitle: "智管使用指引",
     progress: "{{current}} / {{total}} · {{label}}",
+    language: {
+      hint: "选择后界面会立即切换；之后可随时通过侧栏底部的语言按钮更改。",
+      continue: "继续",
+    },
     steps: {
+      language: "语言",
       welcome: "认识工作空间",
       memory: "记忆中心",
       skills: "Skill 技能库",
@@ -1884,12 +1900,7 @@ const zh = {
     modules: {
       firstAction: "第一次可以这样开始",
       memory: {
-    language: {
-      hint: "选择后界面会立即切换；之后可随时通过侧栏底部的语言按钮更改。",
-      continue: "继续",
-    },
         title: "记忆中心",
-      language: "语言",
         desc: "把项目背景、工作进展和长期偏好留在工作空间，减少新会话中重复交代的内容。",
         one: {
           title: "采集与检索",
