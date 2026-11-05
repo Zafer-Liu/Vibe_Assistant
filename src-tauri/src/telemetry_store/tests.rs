@@ -500,6 +500,15 @@ fn keyword_search_reaches_memories_beyond_the_recent_window() {
                updated_at TEXT NOT NULL,
                pinned_updated_at TEXT,
                recall_updated_at TEXT
+            );
+            CREATE TABLE memory_user_state_peer (
+               device TEXT NOT NULL,
+               memory_id TEXT NOT NULL,
+               pinned INTEGER NOT NULL DEFAULT 0,
+               pinned_updated_at TEXT,
+               recall_count INTEGER NOT NULL DEFAULT 0,
+               recall_updated_at TEXT,
+               PRIMARY KEY (device, memory_id)
             );",
     )
     .unwrap();

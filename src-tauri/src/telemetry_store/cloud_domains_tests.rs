@@ -213,6 +213,12 @@ fn receiver_retag_publishes_and_survives_source_refresh() {
     // 接收端显式重分类：登记回传，且不被来源端旧聚合覆盖。
     let new_link = domain_link("custom:retagged", "接收端分类");
     receiver
+        .merge_cloud_domain_catalog(&CloudDomainCatalog {
+            domains: vec![new_link.domain.clone()],
+            tombstones: Vec::new(),
+        })
+        .unwrap();
+    receiver
         .save_memory_domain_classification(
             &record.item,
             &[crate::telemetry_store::MemoryDomainAssignment {

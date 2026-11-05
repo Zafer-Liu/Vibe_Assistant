@@ -2602,9 +2602,9 @@ impl TelemetryStore {
                     "SELECT classified_at FROM memory_domain_classification_state WHERE memory_id = ?1",
                     [&row.id], |result| result.get(0),
                 ).optional().map_err(|e| e.to_string())?;
+                // 仅当双方都带检查点时才能比较新旧；旧载荷（无检查点）按来源权威处理。
                 let receiver_newer = match (local_at.as_deref(), row.classified_at.as_deref()) {
                     (Some(local), Some(remote)) => local > remote,
-                    (Some(_), None) => true,
                     _ => false,
                 };
                 if !receiver_newer {
