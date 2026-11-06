@@ -466,6 +466,7 @@ pub(super) fn initialize_database(mut conn: Connection) -> Result<Connection, St
          );",
     )
     .map_err(|e| e.to_string())?;
+    super::cloud_usage::initialize(&conn)?;
     // Seed exactly once so user-deleted built-ins are not recreated on restart.
     let domains_seeded = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM app_settings WHERE setting_key = 'memory_domains_seeded_v1')",

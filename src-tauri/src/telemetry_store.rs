@@ -38,6 +38,7 @@ struct McpDashboardCache {
 }
 
 mod cloud_domains;
+mod cloud_usage;
 mod schema;
 mod transcripts;
 mod types;
@@ -51,7 +52,7 @@ pub(crate) use types::{
 pub use types::{
     CloudDomainCatalog, CloudDomainTombstone, CloudLayerProvenance, CloudLayerSourceRef,
     CloudL1Memory, CloudMemoryDomain, CloudMemoryDomainLink, CloudTagOverride, CloudUserStateEntry,
-    CloudSyncConflict, ConversationSearchHit, L1MemoryCandidate, L1ResetResult, LocalMemory,
+    CloudSyncConflict, CloudUsageLedger, CloudUsageRecord, ConversationSearchHit, L1MemoryCandidate, L1ResetResult, LocalMemory,
     LocalMemorySnapshot, LocalMemoryStats, McpAccessLog, McpCallCoverage, McpCallGroup,
     MemoryDomain, MemoryDomainAssignment,
     McpCallObservation, McpCallRefresh, McpCallStats, McpDashboardStats, McpToolHealth, McpFailedCallPage, McpFailureCategoryCount,
@@ -2718,20 +2719,10 @@ impl TelemetryStore {
             .map_err(|_| "telemetry store lock poisoned".to_string())?;
         let mut stmt = conn
             .prepare(
-                "WITH feed AS (
-                   SELECT occurred_at, source, input_tokens, output_tokens, cached_tokens FROM usage_records
-                   UNION ALL
-                   SELECT usage.refreshed_at, usage.source, usage.input_tokens, usage.output_tokens, usage.cached_tokens
-                     FROM session_token_usage usage
-                    WHERE NOT EXISTS (
-                      SELECT 1 FROM usage_records record
-                       WHERE record.source = usage.source AND record.session_id = usage.session_id
-                    )
-                 )
-                 SELECT strftime('%Y-%m-%d', occurred_at, 'localtime'), source,
+                &format!("{} SELECT strftime('%Y-%m-%d', occurred_at, 'localtime'), source,
                         COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
                         COALESCE(SUM(cached_tokens), 0), COUNT(*)
-                   FROM feed GROUP BY 1, 2 ORDER BY 1, 2",
+                   FROM local_feed GROUP BY 1, 2 ORDER BY 1, 2", cloud_usage::local_feed_sql()),
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -2751,7 +2742,7 @@ impl TelemetryStore {
     }
 
     /// 云端记忆库（Token 用量）：整设备覆盖式落地远端总量统计。
-    /// 返回写入的行数。occurred_at 用当天正午，保证日期过滤与按天分桶稳定。
+    /// 返回写入的行数。旧版日汇总保留日期，不伪造发生时间。
     pub fn replace_remote_usage_totals(
         &self,
         device: &str,
@@ -2768,6 +2759,10 @@ impl TelemetryStore {
         )
         .map_err(|e| e.to_string())?;
         for row in rows {
+            if chrono::NaiveDate::parse_from_str(&row.day, "%Y-%m-%d").is_err()
+                || row.source.trim().is_empty() || row.input_tokens < 0 || row.output_tokens < 0
+                || row.cached_tokens < 0 || row.cached_tokens > row.input_tokens || row.record_count < 0
+            { return Err("云端每日用量统计无效".into()); }
             tx.execute(
                 "INSERT OR REPLACE INTO usage_remote_totals
                     (device, day, source, input_tokens, output_tokens, cached_tokens, record_count)
@@ -3692,29 +3687,18 @@ impl TelemetryStore {
                 // Totals come from the same detail-first feed as the usage
                 // dashboard, so the Memory Center panel and the analytics
                 // page can never show different numbers for one ledger.
-                "WITH sessions AS (
+                &format!("{}, sessions AS (
                    SELECT DISTINCT source, session_id FROM agent_events WHERE session_id != 'unknown'
                    UNION
                    SELECT source, session_id FROM session_token_usage
                  ), usage AS (
                    SELECT source, session_id, input_tokens, output_tokens, cached_tokens, origin, refreshed_at
                      FROM session_token_usage
-                 ), feed AS (
-                   SELECT input_tokens, output_tokens, cached_tokens FROM usage_records
-                   UNION ALL
-                   SELECT usage.input_tokens, usage.output_tokens, usage.cached_tokens
-                     FROM session_token_usage usage
-                    WHERE NOT EXISTS (
-                      SELECT 1 FROM usage_records record
-                       WHERE record.source = usage.source AND record.session_id = usage.session_id
-                    )
-                   UNION ALL
-                   SELECT input_tokens, output_tokens, cached_tokens FROM usage_remote_totals
                  ), feed_totals AS (
                    SELECT COALESCE(SUM(input_tokens), 0) AS input_tokens,
                           COALESCE(SUM(output_tokens), 0) AS output_tokens,
                           COALESCE(SUM(cached_tokens), 0) AS cached_tokens
-                     FROM feed
+                     FROM usage_feed
                  )
                  SELECT
                    (SELECT COUNT(*) FROM agent_events),
@@ -3726,7 +3710,7 @@ impl TelemetryStore {
                    COALESCE(SUM(CASE WHEN usage.origin LIKE 'estimated%' THEN 1 ELSE 0 END), 0),
                    (SELECT MAX(refreshed_at) FROM session_token_usage)
                  FROM sessions
-                 LEFT JOIN usage ON usage.source = sessions.source AND usage.session_id = sessions.session_id",
+                 LEFT JOIN usage ON usage.source = sessions.source AND usage.session_id = sessions.session_id", cloud_usage::feed_sql()),
                 [],
                 |row| {
                     let input: i64 = row.get(2)?;
@@ -4500,28 +4484,12 @@ impl TelemetryStore {
             .conn
             .lock()
             .map_err(|_| "telemetry store lock poisoned".to_string())?;
-        let mut statement = conn.prepare(
-            "SELECT record_id, source, session_id, occurred_at, model, record_kind,
+        let mut statement = conn.prepare(&format!(
+            "{} SELECT record_id, source, session_id, occurred_at, model, record_kind,
                     input_tokens, output_tokens, cached_tokens, origin
-               FROM (
-                 SELECT record_id, source, session_id, occurred_at, model, record_kind,
-                        input_tokens, output_tokens, cached_tokens, origin
-                   FROM usage_records
-                 UNION ALL
-                 SELECT 'session-total:' || usage.source || ':' || usage.session_id,
-                        usage.source, usage.session_id,
-                        strftime('%Y-%m-%dT%H:%M:%fZ', COALESCE((SELECT MAX(event.occurred_at) FROM agent_events event
-                                   WHERE event.source = usage.source AND event.session_id = usage.session_id), usage.refreshed_at)),
-                        NULL, 'session_total', usage.input_tokens, usage.output_tokens,
-                        usage.cached_tokens, usage.origin
-                   FROM session_token_usage usage
-                  WHERE NOT EXISTS (
-                    SELECT 1 FROM usage_records record
-                     WHERE record.source = usage.source AND record.session_id = usage.session_id
-                  )
-               )
-              ORDER BY occurred_at DESC LIMIT ?1",
-        ).map_err(|e| e.to_string())?;
+               FROM usage_feed WHERE day_only IS NULL
+              ORDER BY occurred_at DESC, record_id LIMIT ?1", cloud_usage::feed_sql(),
+        )).map_err(|e| e.to_string())?;
         let rows = statement
             .query_map([limit.clamp(1, 1000)], |row| {
                 Ok(TelemetryUsageRecord {
@@ -4554,60 +4522,23 @@ impl TelemetryStore {
             .conn
             .lock()
             .map_err(|_| "telemetry store lock poisoned".to_string())?;
-        // Request-level records are primary. A session-total fallback is only
-        // added when that session has no request records, so totals cannot be
-        // inflated by counting both representations.
-        const FEED: &str = "
-            WITH usage_feed AS (
-              SELECT record_id, source, session_id, occurred_at, model, record_kind,
-                     input_tokens, output_tokens, cached_tokens, origin
-                FROM usage_records
-              UNION ALL
-              SELECT 'session-total:' || usage.source || ':' || usage.session_id,
-                     usage.source, usage.session_id,
-                     strftime('%Y-%m-%dT%H:%M:%fZ', COALESCE((SELECT MAX(event.occurred_at) FROM agent_events event
-                               WHERE event.source = usage.source AND event.session_id = usage.session_id), usage.refreshed_at)),
-                     NULL, 'session_total', usage.input_tokens, usage.output_tokens,
-                     usage.cached_tokens, usage.origin
-                FROM session_token_usage usage
-               WHERE NOT EXISTS (
-                 SELECT 1 FROM usage_records record
-                  WHERE record.source = usage.source AND record.session_id = usage.session_id
-               )
-              UNION ALL
-              -- 其他设备经云端记忆库同步来的总量统计（无逐条明细）。
-              SELECT 'remote:' || device || ':' || day || ':' || source,
-                     source, device, day || 'T12:00:00',
-                     NULL, 'remote_total', input_tokens, output_tokens, cached_tokens, 'remote'
-                FROM usage_remote_totals
-            ) ";
-        const FILTER: &str = " WHERE (?1 IS NULL OR occurred_at >= ?1)
-                                   AND (?2 IS NULL OR occurred_at < ?2)
-                                   AND (?3 IS NULL OR source = ?3) ";
-        let totals_sql = format!("{FEED} SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_tokens), 0), COALESCE(SUM(CASE WHEN origin LIKE 'estimated%' THEN input_tokens + output_tokens ELSE 0 END), 0) FROM usage_feed {FILTER}");
-        let (record_count, input_tokens, output_tokens, cached_tokens, estimated_tokens): (
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-        ) = conn
+        // One deduplicated feed for local and synced records. Legacy daily
+        // totals retain their count weight, but never invent an activity hour.
+        let feed = cloud_usage::feed_sql();
+        let filter = cloud_usage::FILTER;
+        let totals_sql = format!("{feed} SELECT COALESCE(SUM(record_count), 0), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_tokens), 0), COALESCE(SUM(CASE WHEN origin LIKE 'estimated%' THEN input_tokens + output_tokens ELSE 0 END), 0), COALESCE(SUM(CASE WHEN day_only IS NOT NULL THEN input_tokens + output_tokens ELSE 0 END), 0), COALESCE(SUM(day_only IS NULL), 0) FROM usage_feed {filter}");
+        let (record_count, input_tokens, output_tokens, cached_tokens, estimated_tokens, daily_only_tokens, detail_count):
+            (i64, i64, i64, i64, i64, i64, i64) = conn
             .query_row(&totals_sql, params![start_at, end_at, source], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
             })
             .map_err(|e| e.to_string())?;
 
         // 缓存命中率只对携带提供商计数（原生转录/适配器上报）的行有意义；
         // 估算与远端总量行没有缓存字段，混合展示会把命中率压成误导性低值。
         let capable_sql = format!(
-            "{FEED} SELECT EXISTS(SELECT 1 FROM usage_feed {FILTER} \
-              AND (origin LIKE 'native%' OR origin LIKE 'adapter%'))"
+            "{feed} SELECT EXISTS(SELECT 1 FROM usage_feed {filter} \
+              AND (origin LIKE 'native%' OR origin LIKE 'adapter%' OR origin = 'dsh_plugin'))"
         );
         let cache_capable: bool = conn
             .query_row(&capable_sql, params![start_at, end_at, source], |row| {
@@ -4616,7 +4547,7 @@ impl TelemetryStore {
             .map_err(|e| e.to_string())?;
 
         let cap = record_limit.clamp(50, 1_000);
-        let records_sql = format!("{FEED} SELECT record_id, source, session_id, occurred_at, model, record_kind, input_tokens, output_tokens, cached_tokens, origin FROM usage_feed {FILTER} ORDER BY occurred_at DESC LIMIT ?4");
+        let records_sql = format!("{feed} SELECT record_id, source, session_id, occurred_at, model, record_kind, input_tokens, output_tokens, cached_tokens, origin FROM usage_feed {filter} AND day_only IS NULL ORDER BY occurred_at DESC, record_id LIMIT ?4");
         let mut statement = conn.prepare(&records_sql).map_err(|e| e.to_string())?;
         let records = statement
             .query_map(params![start_at, end_at, source, cap], |row| {
@@ -4642,9 +4573,10 @@ impl TelemetryStore {
         let group = if bucket == "hour" {
             "strftime('%Y-%m-%d %H:00', occurred_at, 'localtime')"
         } else {
-            "strftime('%Y-%m-%d', occurred_at, 'localtime')"
+            "COALESCE(day_only, strftime('%Y-%m-%d', occurred_at, 'localtime'))"
         };
-        let buckets_sql = format!("{FEED} SELECT {group}, COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_tokens), 0), COUNT(*) FROM usage_feed {FILTER} GROUP BY 1 ORDER BY 1");
+        let precision_filter = if bucket == "hour" { " AND day_only IS NULL" } else { "" };
+        let buckets_sql = format!("{feed} SELECT {group}, COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_tokens), 0), SUM(record_count) FROM usage_feed {filter}{precision_filter} GROUP BY 1 ORDER BY 1");
         let mut bucket_statement = conn.prepare(&buckets_sql).map_err(|e| e.to_string())?;
         let buckets = bucket_statement
             .query_map(params![start_at, end_at, source], |row| {
@@ -4661,10 +4593,10 @@ impl TelemetryStore {
             .map_err(|e| e.to_string())?;
 
         let heatmap_sql = format!(
-            "{FEED} SELECT CAST(strftime('%w', occurred_at, 'localtime') AS INTEGER), \
+            "{feed} SELECT CAST(strftime('%w', occurred_at, 'localtime') AS INTEGER), \
               CAST(strftime('%H', occurred_at, 'localtime') AS INTEGER), \
-              COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COUNT(*) \
-              FROM usage_feed {FILTER} GROUP BY 1, 2 ORDER BY 1, 2"
+              COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), SUM(record_count) \
+              FROM usage_feed {filter} AND day_only IS NULL GROUP BY 1, 2 ORDER BY 1, 2"
         );
         let mut heatmap_statement = conn.prepare(&heatmap_sql).map_err(|e| e.to_string())?;
         let heatmap = heatmap_statement
@@ -4682,11 +4614,11 @@ impl TelemetryStore {
             .map_err(|e| e.to_string())?;
 
         let cost_groups_sql = format!(
-            "{FEED} SELECT source, COALESCE(NULLIF(TRIM(model), ''), ''), \
+            "{feed} SELECT source, COALESCE(NULLIF(TRIM(model), ''), ''), \
               COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), \
               COALESCE(SUM(cached_tokens), 0), \
               COALESCE(SUM(CASE WHEN origin LIKE 'estimated%' THEN input_tokens + output_tokens ELSE 0 END), 0) \
-              FROM usage_feed {FILTER} GROUP BY 1, 2 ORDER BY 1, 2"
+              FROM usage_feed {filter} GROUP BY 1, 2 ORDER BY 1, 2"
         );
         let mut cost_groups_statement = conn
             .prepare(&cost_groups_sql)
@@ -4707,7 +4639,7 @@ impl TelemetryStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
 
-        let sources_sql = format!("{FEED} SELECT DISTINCT source FROM usage_feed ORDER BY source");
+        let sources_sql = format!("{feed} SELECT DISTINCT source FROM usage_feed ORDER BY source");
         let mut sources_statement = conn.prepare(&sources_sql).map_err(|e| e.to_string())?;
         let sources = sources_statement
             .query_map([], |row| row.get(0))
@@ -4721,7 +4653,8 @@ impl TelemetryStore {
             cached_tokens,
             estimated_tokens,
             cache_capable,
-            truncated_records: record_count > records.len() as i64,
+            daily_only_tokens,
+            truncated_records: detail_count > records.len() as i64,
             records,
             buckets,
             heatmap,

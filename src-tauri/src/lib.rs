@@ -133,7 +133,7 @@ pub fn run() {
             // 用量账本周期性重扫：常开应用也能持续采集新会话的 Token 用量。
             telemetry_store::start_usage_refresh_scheduler(_app.handle().clone());
             // 云端记忆库定时同步（每分钟检查设置，无需重启）
-            cloud_sync::start_cloud_sync_scheduler();
+            cloud_sync::start_cloud_sync_scheduler(_app.handle().clone());
             // 向量索引定时增量构建：新整理的记忆无需等检索即可被语义命中。
             memory_backend::start_embedding_auto_build_scheduler(_app.handle().clone());
 

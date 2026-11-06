@@ -54,6 +54,8 @@ export interface TelemetryUsageAnalytics {
   estimated_tokens?: number
   /** False 当所选范围只有估算/远端总量行（无缓存计数）；旧后端缺省视为 true。 */
   cache_capable?: boolean
+  /** Legacy synced daily totals excluded from hourly views. */
+  daily_only_tokens?: number
   records: TelemetryUsageRecord[]
   truncated_records: boolean
   buckets: TelemetryUsageBucket[]

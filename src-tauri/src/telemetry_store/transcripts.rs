@@ -269,7 +269,7 @@ pub(super) fn normalize_occurred_at(value: Option<&str>) -> Option<String> {
     }
     chrono::DateTime::parse_from_rfc3339(value)
         .ok()
-        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .map(|time| time.with_timezone(&chrono::Utc).to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
 pub(super) fn opaque_proxy_id(value: &str) -> Result<String, String> {

@@ -66,7 +66,7 @@ pub(super) struct TranscriptUsageRecord {
     pub(super) cached_tokens: i64,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub struct TelemetryUsageRecord {
     pub record_id: String,
@@ -131,6 +131,8 @@ pub struct TelemetryUsageAnalytics {
     /// False 当所选范围只有估算/远端总量行：它们没有缓存计数，
     /// 前端据此把「缓存命中率」显示为不可用而不是误导性的 0.0%。
     pub cache_capable: bool,
+    /// Legacy daily totals have no reliable hour, model or estimation provenance.
+    pub daily_only_tokens: i64,
     pub records: Vec<TelemetryUsageRecord>,
     pub truncated_records: bool,
     pub buckets: Vec<TelemetryUsageBucket>,
@@ -336,11 +338,22 @@ pub struct LocalMemoryStats {
     pub long_term: i64,
 }
 
-/// Complete native row retained in a consolidation checkpoint.  Keeping the
-/// source metadata means a rollback restores the exact L1 library rather than
-/// recreating synthetic memories detached from their original conversation.
-/// 云端记忆库（Token 用量）同步：每台设备只上报「天 × 来源」的总量统计，
-/// 不上传播逐条账本。远端统计落到 usage_remote_totals，只参与总量/趋势展示。
+/// Versioned usage ledger; contains counters and identifiers, never conversation text.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CloudUsageLedger {
+    pub format: u32,
+    pub records: Vec<CloudUsageRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CloudUsageRecord {
+    #[serde(flatten)]
+    pub record: TelemetryUsageRecord,
+    /// Changes only when the exported record changes, not on every sync/scan.
+    pub updated_at: String,
+}
+
+/// Legacy daily totals retained for compatibility with older clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageDayAggregate {
     pub day: String,

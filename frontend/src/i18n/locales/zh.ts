@@ -489,6 +489,7 @@ const zh = {
       cacheLabel: '缓存读取',
       cacheHitLabel: '缓存命中率',
       cacheUnavailable: '当前范围无提供商计数（仅估算/远端总量），缓存数据不可用',
+      dailyOnlyHint: '有 {{tokens}} Tokens 仅保留了每日总量，尚不能展示活跃时段和完整模型信息。请更新来源设备并再次同步，以补齐明细。',
       tablistLabel: '使用统计视图',
       tabTrend: '使用趋势',
       tabRecords: '用量明细',

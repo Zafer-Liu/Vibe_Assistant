@@ -491,6 +491,7 @@ const en: TranslationSchema = {
       cacheLabel: 'Cache read',
       cacheHitLabel: 'Cache hit rate',
       cacheUnavailable: 'No provider counters in this range (estimates/remote totals only); cache data unavailable',
+      dailyOnlyHint: '{{tokens}} tokens have daily totals only, so active hours and full model details are unavailable. Update and sync the source device to fill in the details.',
       tablistLabel: 'Usage analytics view',
       tabTrend: 'Trend',
       tabRecords: 'Records',

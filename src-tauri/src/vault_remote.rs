@@ -110,11 +110,49 @@ pub fn open(config: &RemoteConfig) -> Result<Box<dyn Remote>, String> {
     }
 }
 
-fn client() -> reqwest::blocking::Client {
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn request_timeout(method: &reqwest::Method) -> std::time::Duration {
+    if *method == reqwest::Method::GET || *method == reqwest::Method::PUT {
+        TRANSFER_TIMEOUT
+    } else {
+        METADATA_TIMEOUT
+    }
+}
+
+fn client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(TRANSFER_TIMEOUT)
         .build()
-        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+        .map_err(|error| format!("创建云端 HTTP 客户端失败：{}", error.without_url()))
+}
+
+/// Preserve transport causes without logging URLs, credentials or request headers.
+fn request_error(
+    kind: &str,
+    operation: &str,
+    body_bytes: usize,
+    elapsed: std::time::Duration,
+    error: reqwest::Error,
+) -> String {
+    let category = if error.is_timeout() { "请求超时" }
+        else if error.is_connect() { "连接失败" }
+        else if error.is_body() { "传输失败" }
+        else { "请求失败" };
+    let error = error.without_url();
+    let mut details = vec![error.to_string()];
+    let mut cause = std::error::Error::source(&error);
+    while let Some(source) = cause {
+        let detail = source.to_string();
+        if details.last() != Some(&detail) { details.push(detail); }
+        if details.len() >= 8 { break; }
+        cause = source.source();
+    }
+    format!("{kind} {operation} {category}（请求体 {body_bytes} 字节，耗时 {:.1} 秒）：{}",
+        elapsed.as_secs_f64(), details.join(" → ").replace('\r', " ").replace('\n', " "))
 }
 
 /// 429 / 503：服务端在限流。坚果云按账号统计请求数，此时只能退避重试。
@@ -169,7 +207,7 @@ impl WebDav {
             base: url,
             user: config.user.clone(),
             pass: config.credential.clone(),
-            client: client(),
+            client: client()?,
         })
     }
 
@@ -188,9 +226,12 @@ impl WebDav {
         body: Vec<u8>,
         headers: Vec<(&str, String)>,
     ) -> Result<reqwest::blocking::Response, String> {
+        let started = std::time::Instant::now();
+        let body_bytes = body.len();
         let mut req = self
             .client
-            .request(method, url)
+            .request(method.clone(), url)
+            .timeout(request_timeout(&method))
             .basic_auth(&self.user, Some(&self.pass));
         for (name, value) in headers {
             req = req.header(name, value);
@@ -198,7 +239,7 @@ impl WebDav {
         let resp = req
             .body(body)
             .send()
-            .map_err(|e| format!("连接 WebDAV 服务端失败：{e}"))?;
+            .map_err(|error| request_error("WebDAV", method.as_str(), body_bytes, started.elapsed(), error))?;
         match resp.status().as_u16() {
             401 => Err(
                 "WebDAV 服务端拒绝了这个用户名或密码（HTTP 401）：坚果云请填「应用密码」而不是登录密码"
@@ -286,9 +327,10 @@ impl Remote for WebDav {
             return Err(format!("读取 WebDAV 信封失败：HTTP {status}"));
         }
         let etag = etag_of(&resp);
+        let started = std::time::Instant::now();
         let bytes = resp
             .bytes()
-            .map_err(|e| format!("读取 WebDAV 信封失败：{e}"))?
+            .map_err(|error| request_error("WebDAV", "GET 读取响应体", 0, started.elapsed(), error))?
             .to_vec();
         Ok(Some((bytes, etag)))
     }
@@ -479,7 +521,7 @@ impl S3 {
             region,
             access_key: config.user.clone(),
             secret_key: config.credential.clone(),
-            client: client(),
+            client: client()?,
         })
     }
 
@@ -592,14 +634,16 @@ impl S3 {
     ) -> Result<reqwest::blocking::Response, String> {
         let method_str = method.to_string();
         let headers = self.signed_headers(&method_str, &body, extra)?;
-        let mut req = self.client.request(method.clone(), self.url());
+        let started = std::time::Instant::now();
+        let body_bytes = body.len();
+        let mut req = self.client.request(method.clone(), self.url()).timeout(request_timeout(&method));
         for (name, value) in &headers {
             req = req.header(name.as_str(), value.as_str());
         }
         let resp = req
             .body(body.clone())
             .send()
-            .map_err(|e| format!("连接 S3 服务端失败：{e}"))?;
+            .map_err(|error| request_error("S3", &method_str, body_bytes, started.elapsed(), error))?;
         match resp.status().as_u16() {
             401 | 403 => Err(
                 "S3 服务端拒绝了 Access Key（HTTP 403/401）：请检查 Key 是否有该桶的读写权限"
@@ -660,9 +704,10 @@ impl Remote for S3 {
             return Err(format!("读取 S3 信封失败：HTTP {status}"));
         }
         let etag = etag_of(&resp);
+        let started = std::time::Instant::now();
         let bytes = resp
             .bytes()
-            .map_err(|e| format!("读取 S3 信封失败：{e}"))?
+            .map_err(|error| request_error("S3", "GET 读取响应体", 0, started.elapsed(), error))?
             .to_vec();
         Ok(Some((bytes, etag)))
     }
@@ -742,7 +787,7 @@ mod tests {
             region: "us-east-1".to_string(),
             access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
-            client: client(),
+            client: client().expect("create HTTP client"),
         };
         let headers = s3
             .sign("GET", b"", &[("range", "bytes=0-9")], "20130524T000000Z", "20130524")

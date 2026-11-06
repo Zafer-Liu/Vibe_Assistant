@@ -11,10 +11,11 @@ use aes_gcm::aead::{Aead, AeadCore, Key, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::State;
+use tauri::{Emitter, State};
 
 use crate::telemetry_store::{
-    CloudDomainCatalog, CloudL1Memory, CloudMemoryDomainLink, CloudSyncConflict, TelemetryStore, UsageDayAggregate,
+    CloudDomainCatalog, CloudL1Memory, CloudMemoryDomainLink, CloudSyncConflict, CloudUsageLedger,
+    TelemetryStore, UsageDayAggregate,
 };
 use crate::vault_remote::{RemoteConfig, RemoteKind};
 
@@ -918,9 +919,7 @@ fn push_l1(
     }
 }
 
-/// Token 用量推送：每台设备只写一个小对象 `usage-agg:{device}`，
-/// 内容是「天 × 来源」的总量统计（不含逐条明细）。单写者，无并发冲突；
-/// 内容变化由 hash 比对发现后整体重推。
+/// Publish the precise ledger and a daily projection for older clients.
 fn push_usage(
     store: &TelemetryStore,
     client: &reqwest::blocking::Client,
@@ -930,22 +929,34 @@ fn push_usage(
     vault_key_bytes: &[u8; 32],
     report: &mut CloudSyncReport,
 ) {
-    let key = format!("usage-agg:{}", device.replace(':', "-"));
-    let rows = match store.usage_day_aggregates() {
-        Ok(rows) => rows,
-        Err(e) => {
-            report.errors.push(format!("{key}: 统计读取失败 {e}"));
-            return;
-        }
-    };
-    let plain = match serde_json::to_vec(&rows) {
-        Ok(p) => p,
-        Err(e) => {
-            report.errors.push(format!("{key}: 序列化失败 {e}"));
-            return;
-        }
-    };
-    let local_hash = sha256_hex(&plain);
+    let payloads = store.cloud_usage_ledger().and_then(|ledger| {
+        let rows = store.usage_day_aggregates()?;
+        Ok([
+            ("usage-ledger", serde_json::to_vec(&ledger).map_err(|e| e.to_string())?),
+            ("usage-agg", serde_json::to_vec(&rows).map_err(|e| e.to_string())?),
+        ])
+    });
+    match payloads {
+        Ok(payloads) => for (prefix, plain) in payloads {
+            let key = format!("{prefix}:{}", device.replace(':', "-"));
+            push_usage_payload(store, client, url, pat, device, vault_key_bytes, report, &key, &plain);
+        },
+        Err(error) => report.errors.push(format!("用量导出失败：{error}")),
+    }
+}
+
+fn push_usage_payload(
+    store: &TelemetryStore,
+    client: &reqwest::blocking::Client,
+    url: &str,
+    pat: &str,
+    device: &str,
+    vault_key_bytes: &[u8; 32],
+    report: &mut CloudSyncReport,
+    key: &str,
+    plain: &[u8],
+) {
+    let local_hash = sha256_hex(plain);
     if let Some((_, Some(hash), state, _)) = store.cloud_sync_meta_row(&key).ok().flatten() {
         if hash == local_hash && state == "clean" {
             return;
@@ -1176,7 +1187,9 @@ fn apply_remote_objects(
     }
     // Retags reference L1 IDs: land memories first, regardless of server order.
     let mut ordered_objects: Vec<_> = objects.iter().filter(|obj| obj.key != DOMAIN_CATALOG_KEY).collect();
-    ordered_objects.sort_by_key(|obj| obj.key.starts_with("tag-overrides:"));
+    ordered_objects.sort_by_key(|obj| (
+        obj.key.starts_with("tag-overrides:"), !obj.key.starts_with("usage-ledger:"),
+    ));
     for obj in ordered_objects.into_iter().cloned() {
         let meta = store.cloud_sync_meta_row(&obj.key).ok().flatten();
         // 信封模式每轮都拿到全量对象，所以必须先问一句「远端其实有没有变」：
@@ -1215,6 +1228,10 @@ fn apply_remote_objects(
                 continue;
             }
             apply_remote_l1(store, id.to_string(), vault_key_bytes, obj, report);
+            continue;
+        }
+        if let Some(rest) = obj.key.strip_prefix("usage-ledger:") {
+            apply_remote_usage_ledger(store, rest.to_string(), vault_key_bytes, obj, report);
             continue;
         }
         if let Some(rest) = obj.key.strip_prefix("usage-agg:") {
@@ -1349,6 +1366,40 @@ fn apply_remote_objects(
     report.errors.len() == errors_before
 }
 
+fn apply_remote_usage_ledger(
+    store: &TelemetryStore,
+    device_suffix: String,
+    vault_key_bytes: &[u8; 32],
+    obj: RemoteObject,
+    report: &mut CloudSyncReport,
+) -> bool {
+    if device_suffix == device_id(store).replace(':', "-") {
+        let _ = store.cloud_sync_meta_set(&obj.key, obj.revision, Some(&obj.content_hash), "clean");
+        report.skipped += 1;
+        return true;
+    }
+    let Some(plain) = decrypt_remote_content(vault_key_bytes, &obj, report) else { return false };
+    let ledger: CloudUsageLedger = match serde_json::from_str(&plain) {
+        Ok(ledger) => ledger,
+        Err(error) => {
+            report.errors.push(format!("{}: 用量账本解析失败 {error}", obj.key));
+            return false;
+        }
+    };
+    match store.replace_remote_usage_ledger(&device_suffix, obj.revision, &ledger) {
+        Ok(imported) => {
+            let _ = store.cloud_sync_meta_set(&obj.key, obj.revision, Some(&obj.content_hash), "clean");
+            report.pulled += 1;
+            report.usage_imported += imported as u32;
+            true
+        }
+        Err(error) => {
+            report.errors.push(format!("{}: 用量账本落地失败 {error}", obj.key));
+            false
+        }
+    }
+}
+
 /// 远端用量总量统计落地：解密验哈希 → 整设备覆盖 usage_remote_totals。
 /// 本设备自己的对象跳过落地（推送阶段保证本地为源），只对齐水位。
 fn apply_remote_usage(
@@ -1359,7 +1410,7 @@ fn apply_remote_usage(
     report: &mut CloudSyncReport,
 ) -> bool {
     let device = device_id(store).replace(':', "-");
-    if device_suffix == device {
+    if device_suffix == device || store.has_remote_usage_ledger(&device_suffix).unwrap_or(false) {
         let _ = store.cloud_sync_meta_set(&obj.key, obj.revision, Some(&obj.content_hash), "clean");
         report.skipped += 1;
         return true;
@@ -2184,6 +2235,24 @@ fn build_envelope(
         report.pushed += 1;
     }
 
+    // Precise counters/IDs/timestamps; the old daily object below remains for old clients.
+    let ledger_key = format!("usage-ledger:{}", device.replace(':', "-"));
+    let ledger = store.cloud_usage_ledger()?;
+    let ledger_plain = serde_json::to_vec(&ledger).map_err(|error| error.to_string())?;
+    let ledger_hash = sha256_hex(&ledger_plain);
+    if objects.get(&ledger_key).map(|object| object.content_hash.as_str()) != Some(ledger_hash.as_str()) {
+        revision += 1;
+        objects.insert(ledger_key.clone(), RemoteObject {
+            key: ledger_key.clone(), revision, content_hash: ledger_hash.clone(),
+            payload: b64_encode(&vault_encrypt(vault_key_bytes, &ledger_plain)?),
+            updated_at: now.clone(), device_id: device.to_string(),
+        });
+        pending.push(PendingWrite::Meta {
+            key: ledger_key, revision, hash: Some(ledger_hash), state: "clean",
+        });
+        report.pushed += 1;
+    }
+
     // 用量总量：每台设备只写自己那一个对象，内容变了就整体覆盖。
     let usage_key = format!("usage-agg:{}", device.replace(':', "-"));
     let rows = store
@@ -2452,6 +2521,10 @@ fn run_sync_envelope(
             break;
         }
         let (next, pending) = build_envelope(store, &current, &key, &device, &mut report)?;
+        // build_envelope counts candidate changes; only a confirmed file write
+        // may turn those candidates into successfully pushed objects.
+        let planned_pushed = report.pushed;
+        report.pushed = mark.0;
         let changed = match (serde_json::to_vec(&next), serde_json::to_vec(&current)) {
             (Ok(a), Ok(b)) => a != b,
             // 序列化失败是无处安放的异常，继续写一次让错误自然浮出来，别当成「无变化」。
@@ -2464,6 +2537,7 @@ fn run_sync_envelope(
         match remote.put(&payload, etag.as_deref()) {
             Ok(PutOutcome::Written(_)) => {
                 // 只有真正写进远端，本地才承认这次同步发生过。
+                report.pushed = planned_pushed;
                 apply_pending_writes(store, pending);
                 prune_retired_devices(store, &next);
                 break;
@@ -2479,7 +2553,7 @@ fn run_sync_envelope(
                 break;
             }
             Err(e) => {
-                report.errors.push(format!("{label} 写入失败：{e}"));
+                report.errors.push(format!("{label} 写入失败（信封 {} 字节）：{e}", payload.len()));
                 break;
             }
         }
@@ -2743,19 +2817,24 @@ pub async fn cloud_vault_test_connection(
 }
 
 #[tauri::command]
-pub async fn cloud_vault_sync() -> Result<CloudSyncReport, String> {
+pub async fn cloud_vault_sync(app: tauri::AppHandle) -> Result<CloudSyncReport, String> {
     let store = crate::telemetry_store::shared_store().ok_or("telemetry store 未初始化")?;
-    tauri::async_runtime::spawn_blocking(move || run_sync(&store))
+    let result = tauri::async_runtime::spawn_blocking(move || run_sync(&store))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    // A later push may fail after usage was imported; invalidate either way.
+    let _ = app.emit("telemetry-updated", ());
+    result
 }
 
 #[tauri::command]
-pub async fn cloud_vault_pull() -> Result<CloudSyncReport, String> {
+pub async fn cloud_vault_pull(app: tauri::AppHandle) -> Result<CloudSyncReport, String> {
     let store = crate::telemetry_store::shared_store().ok_or("telemetry store 未初始化")?;
-    tauri::async_runtime::spawn_blocking(move || run_pull_only(&store))
+    let result = tauri::async_runtime::spawn_blocking(move || run_pull_only(&store))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("telemetry-updated", ());
+    result
 }
 
 #[tauri::command]
@@ -2931,7 +3010,7 @@ pub fn cloud_vault_status(
 
 /// 定时同步调度：每分钟检查一次设置（改设置无需重启），
 /// 到期则触发一轮完整推拉。失败静默，下个周期重试。
-pub fn start_cloud_sync_scheduler() {
+pub fn start_cloud_sync_scheduler(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -2958,6 +3037,7 @@ pub fn start_cloud_sync_scheduler() {
             let _ = store.app_setting_set(SETTING_LAST_AUTO_SYNC, &now.to_rfc3339());
             let task_store = store.clone();
             let _ = tauri::async_runtime::spawn_blocking(move || run_sync(&task_store)).await;
+            let _ = app.emit("telemetry-updated", ());
         }
     });
 }
@@ -3709,6 +3789,7 @@ mod tests {
             "写入失败必须落到 report.errors：{:?}",
             report.errors
         );
+        assert_eq!(report.pushed, 0, "未确认写入的对象不能计为推送成功");
         assert_eq!(
             server.body(REMOTE_PATH).as_ref(),
             Some(&before),
@@ -4133,6 +4214,53 @@ mod tests {
         let pulled = run_sync(&b).unwrap();
         assert!(pulled.errors.is_empty(), "{:?}", pulled.errors);
         assert_eq!(pulled.usage_imported, 3000);
+    }
+
+    #[test]
+    fn precise_usage_upgrade_replaces_an_already_imported_daily_object() {
+        let server = fake_dav::Server::start();
+        let a = paired(&server.url);
+        let b = paired(&server.url);
+        let suffix = device_id(&a).replace(':', "-");
+        let old_rows = vec![UsageDayAggregate {
+            day: "2026-11-05".into(), source: "claude".into(),
+            input_tokens: 100, output_tokens: 20, cached_tokens: 80, record_count: 1,
+        }];
+        let plain = serde_json::to_vec(&old_rows).unwrap();
+        let old = RemoteObject {
+            key: format!("usage-agg:{suffix}"), revision: 1, content_hash: sha256_hex(&plain),
+            payload: b64_encode(&vault_encrypt(&key(), &plain).unwrap()),
+            updated_at: "2026-11-05T01:00:00Z".into(), device_id: suffix.clone(),
+        };
+        let mut report = CloudSyncReport {
+            pushed: 0, pulled: 0, skipped: 0, conflicts: 0, usage_imported: 0, errors: Vec::new(),
+        };
+        assert!(apply_remote_objects(&b, &[old], &[], &key(), &mut report));
+        assert!(!b.has_remote_usage_ledger(&suffix).unwrap());
+        a.conn.lock().unwrap().execute(
+            "INSERT INTO usage_records
+             (record_id, source, session_id, occurred_at, model, record_kind,
+              input_tokens, output_tokens, cached_tokens, origin)
+             VALUES ('stable-request', 'claude', 'session', '2026-11-05T01:00:00Z',
+                     'original-model', 'response', 100, 20, 80, 'native_transcript')", [],
+        ).unwrap();
+        let pushed = run_sync(&a).unwrap();
+        assert!(pushed.errors.is_empty(), "{:?}", pushed.errors);
+        let envelope = remote_envelope(&server);
+        let ledger: CloudUsageLedger = serde_json::from_str(
+            &plain_of(object(&envelope, &format!("usage-ledger:{suffix}")).unwrap()),
+        ).unwrap();
+        assert_eq!(ledger.records[0].record.model.as_deref(), Some("original-model"));
+        assert_eq!(ledger.records[0].record.occurred_at, "2026-11-05T01:00:00.000Z");
+        let pulled = run_sync(&b).unwrap();
+        assert!(pulled.errors.is_empty(), "{:?}", pulled.errors);
+        assert_eq!(pulled.usage_imported, 1, "完整账本和兼容日汇总不能重复计数");
+        assert!(b.has_remote_usage_ledger(&suffix).unwrap());
+        let old_count: i64 = b.conn.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM usage_remote_totals WHERE device = ?1", [&suffix], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(old_count, 0);
+        assert!(b.cloud_usage_ledger().unwrap().records.is_empty(), "不得把 A 的账本作为 B 的本机数据再发布");
     }
 
     /// 用量统计是「每台设备只写自己那一个对象」：本机变了就重写自己的，

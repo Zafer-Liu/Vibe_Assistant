@@ -630,6 +630,7 @@ export const UsageAnalytics = memo(function UsageAnalytics({ active = true }: { 
         {tab === 'trend' ? <><div className="mt-6 flex items-center justify-between"><h2 className="text-lg font-semibold tracking-[-0.015em]">{t('memory.usage.trendTitle')}</h2><div className="hidden items-center gap-3 text-xs text-slate-500 sm:flex"><Legend color="bg-blue-500" label={t('memory.usage.legendInput')} /><Legend color="bg-violet-500" label={t('memory.usage.legendOutput')} /><Legend color="bg-emerald-500" label={t('memory.usage.legendCache')} /></div></div>{loading ? <div className="mt-5 h-64 animate-pulse rounded-xl bg-slate-100 dark:bg-slate-800" /> : <UsageTrend buckets={analytics?.buckets ?? []} range={range} />}</> : <UsageRecords events={analytics?.records ?? []} truncated={Boolean(analytics?.truncated_records)} />}
       </section>
 
+      {(analytics?.daily_only_tokens ?? 0) > 0 && <p role="status" className="mt-5 text-sm text-amber-700 dark:text-amber-300">{t('memory.usage.dailyOnlyHint', { tokens: amount(analytics?.daily_only_tokens ?? 0) })}</p>}
       <UsageHeatmap cells={analytics?.heatmap ?? []} loading={loading} />
 
       <PricingEstimator

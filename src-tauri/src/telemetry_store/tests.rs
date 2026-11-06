@@ -1052,6 +1052,7 @@ fn usage_feed_prefers_response_records_and_falls_back_to_session_totals() {
             "INSERT INTO usage_records VALUES ('codex:1', 'codex', 'with-details', '2026-08-16T08:00:02Z', 'gpt-5.6-terra', 'response', 100, 10, 80, 'native_transcript')",
             [],
         ).unwrap();
+    cloud_usage::initialize(&conn).unwrap();
     let store = TelemetryStore::from_connection(conn);
     let rows = store.usage_records(20).unwrap();
     assert_eq!(rows.len(), 2);
