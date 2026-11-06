@@ -205,6 +205,140 @@ fn unchanged_exports_keep_versions_and_new_corrections_can_reduce_counts() {
 }
 
 #[test]
+fn codex_counter_corrections_roundtrip_without_clipping_or_inflating_totals() {
+    let source = TelemetryStore::in_memory();
+    let receiver = TelemetryStore::in_memory();
+    let counts = [
+        (1_000_000, 100_000, 300_000),
+        (87_558, -28_341, 58_624),
+        (270_736, -17_479, 140_416),
+        (244_611, -9_973, 95_488),
+        (123_058, 27_700, -16_768),
+    ];
+    for (index, (input, output, cached)) in counts.into_iter().enumerate() {
+        let mut row = record(&format!("correction-{index}"), "2026-11-05T01:00:00Z", "native_transcript", "model-a");
+        row.source = "codex".into();
+        row.session_id = "corrected-session".into();
+        row.input_tokens = input;
+        row.output_tokens = output;
+        row.cached_tokens = cached;
+        write_record(&source, &row);
+    }
+    let ledger = source.cloud_usage_ledger().unwrap();
+    assert_eq!(receiver.replace_remote_usage_ledger("source", 1, &ledger).unwrap(), 5);
+    let seen = analytics(&receiver);
+    assert_eq!(seen.input_tokens, 1_725_963);
+    assert_eq!(seen.output_tokens, 71_907);
+    assert_eq!(seen.cached_tokens, 577_760);
+    assert_eq!(serde_json::to_value(analytics(&source)).unwrap(), serde_json::to_value(seen).unwrap());
+    assert!(receiver.usage_records(20).unwrap().iter().any(|row| row.output_tokens < 0));
+}
+
+#[test]
+fn codex_cache_delta_is_validated_against_the_session_total() {
+    let source = TelemetryStore::in_memory();
+    let receiver = TelemetryStore::in_memory();
+    for (id, input, cached) in [("base", 100, 0), ("correction", 10, 50)] {
+        let mut row = record(id, "2026-11-05T01:00:00Z", "native_transcript", "model-a");
+        row.source = "codex".into();
+        row.session_id = "corrected-session".into();
+        row.input_tokens = input;
+        row.cached_tokens = cached;
+        write_record(&source, &row);
+    }
+    receiver.replace_remote_usage_ledger("source", 1, &source.cloud_usage_ledger().unwrap()).unwrap();
+    assert_eq!(analytics(&receiver).input_tokens, 110);
+    assert_eq!(analytics(&receiver).cached_tokens, 50);
+}
+
+#[test]
+fn legacy_anonymous_sessions_have_the_same_stable_identity_on_both_devices() {
+    let source = TelemetryStore::in_memory();
+    let receiver = TelemetryStore::in_memory();
+    source.conn.lock().unwrap().execute_batch(
+        "INSERT INTO session_token_usage VALUES
+         ('qoder', '', 100, 20, 0, 'estimated_event_payload', '2026-11-05T01:00:00Z');",
+    ).unwrap();
+    let exported = source.cloud_usage_ledger().unwrap();
+    assert_eq!(exported.records[0].record.session_id, "legacy-session:session-total:qoder:");
+    // Older senders already published the same record with an empty session_id.
+    let mut old_payload = exported.clone();
+    old_payload.records[0].record.session_id.clear();
+    receiver.replace_remote_usage_ledger("source", 1, &old_payload).unwrap();
+    receiver.replace_remote_usage_ledger("source", 2, &exported).unwrap();
+    assert_eq!(analytics(&receiver).record_count, 1);
+    assert_eq!(serde_json::to_value(analytics(&source)).unwrap(), serde_json::to_value(analytics(&receiver)).unwrap());
+}
+
+#[test]
+fn anonymous_response_identity_is_stable_across_imports_too() {
+    let source = TelemetryStore::in_memory();
+    let receiver = TelemetryStore::in_memory();
+    let mut row = record("anonymous", "2026-11-05T01:00:00Z", "native_transcript", "model-a");
+    row.session_id.clear();
+    write_record(&source, &row);
+    let exported = source.cloud_usage_ledger().unwrap();
+    assert_eq!(exported.records[0].record.session_id, format!("legacy-session:{}", row.record_id));
+    receiver.replace_remote_usage_ledger("source", 1, &exported).unwrap();
+    assert_eq!(serde_json::to_value(analytics(&source)).unwrap(), serde_json::to_value(analytics(&receiver)).unwrap());
+}
+
+#[test]
+fn invalid_correction_totals_preserve_the_previous_remote_snapshot() {
+    let source = TelemetryStore::in_memory();
+    let receiver = TelemetryStore::in_memory();
+    let mut row = record("invalid-correction", "2026-11-05T01:00:00Z", "native_transcript", "model-a");
+    row.source = "codex".into();
+    write_record(&source, &row);
+    let mut ledger = source.cloud_usage_ledger().unwrap();
+    receiver.replace_remote_usage_ledger("source", 1, &ledger).unwrap();
+    ledger.records[0].record.output_tokens = -1;
+    let error = receiver.replace_remote_usage_ledger("source", 2, &ledger).unwrap_err();
+    assert!(error.contains("会话合计无效"), "{error}");
+    assert_eq!(analytics(&receiver).output_tokens, 20);
+    let saved_revision: i64 = receiver.conn.lock().unwrap().query_row(
+        "SELECT revision FROM usage_remote_ledgers WHERE device = 'source'", [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(saved_revision, 1);
+}
+
+#[test]
+fn validation_errors_identify_the_field_without_exposing_record_ids() {
+    let source = TelemetryStore::in_memory();
+    let receiver = TelemetryStore::in_memory();
+    let row = record("private-record-id", "2026-11-05T01:00:00Z", "native_transcript", "model-a");
+    write_record(&source, &row);
+    let valid = source.cloud_usage_ledger().unwrap();
+    let mut unsupported = valid.clone();
+    unsupported.records[0].record.record_kind = "unexpected".into();
+    let error = receiver.replace_remote_usage_ledger("source", 1, &unsupported).unwrap_err();
+    assert!(error.contains("第 1 条") && error.contains("record_kind"), "{error}");
+    assert!(!error.contains("private-record-id"));
+    let mut duplicate = valid.clone();
+    duplicate.records.push(valid.records[0].clone());
+    let error = receiver.replace_remote_usage_ledger("source", 1, &duplicate).unwrap_err();
+    assert!(error.contains("第 2 条") && error.contains("record_id 重复"), "{error}");
+    let mut bad_time = valid;
+    bad_time.records[0].updated_at = "not-a-timestamp".into();
+    let error = receiver.replace_remote_usage_ledger("source", 1, &bad_time).unwrap_err();
+    assert!(error.contains("updated_at"), "{error}");
+}
+
+#[test]
+fn exporting_invalid_usage_does_not_commit_sync_versions() {
+    let source = TelemetryStore::in_memory();
+    let mut row = record("invalid-export", "2026-11-05T01:00:00Z", "native_transcript", "model-a");
+    row.output_tokens = -1;
+    write_record(&source, &row);
+    let error = source.cloud_usage_ledger().unwrap_err();
+    assert!(error.contains("不能为负数"), "{error}");
+    let count: i64 = source.conn.lock().unwrap().query_row(
+        "SELECT COUNT(*) FROM usage_sync_local_state", [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
 fn invalid_remote_ledger_rolls_back_and_does_not_hide_legacy_data() {
     let store = TelemetryStore::in_memory();
     store.replace_remote_usage_totals("source", &[legacy()]).unwrap();

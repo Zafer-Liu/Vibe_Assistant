@@ -1,4 +1,5 @@
 use super::*;
+use std::borrow::Cow;
 
 #[cfg(test)]
 #[path = "cloud_usage_tests.rs"]
@@ -6,12 +7,15 @@ mod tests;
 
 /// The local export and every dashboard use the same session-fallback timestamp.
 const LOCAL_FEED: &str = "
-    SELECT record_id, source, session_id,
+    SELECT record_id, source,
+           CASE WHEN trim(session_id) = '' THEN 'legacy-session:' || record_id ELSE session_id END AS session_id,
            strftime('%Y-%m-%dT%H:%M:%fZ', occurred_at) AS occurred_at,
            model, record_kind, input_tokens, output_tokens, cached_tokens, origin
       FROM usage_records
     UNION ALL
-    SELECT 'session-total:' || u.source || ':' || u.session_id, u.source, u.session_id,
+    SELECT 'session-total:' || u.source || ':' || u.session_id, u.source,
+           CASE WHEN trim(u.session_id) = '' THEN 'legacy-session:session-total:' || u.source || ':' || u.session_id
+                ELSE u.session_id END,
            strftime('%Y-%m-%dT%H:%M:%fZ', COALESCE(
                (SELECT MAX(e.occurred_at) FROM agent_events e
                  WHERE e.source = u.source AND e.session_id = u.session_id), u.refreshed_at)),
@@ -100,6 +104,69 @@ pub(super) fn initialize(conn: &Connection) -> Result<(), String> {
     ).map_err(|error| error.to_string())
 }
 
+fn usage_session_id(row: &TelemetryUsageRecord) -> Cow<'_, str> {
+    if row.session_id.trim().is_empty() {
+        Cow::Owned(format!("legacy-session:{}", row.record_id))
+    } else {
+        Cow::Borrowed(&row.session_id)
+    }
+}
+
+fn usage_record_error(index: usize, record_id: &str, reason: &str) -> String {
+    // Identify the failing row without exposing session IDs or conversation data.
+    let digest = hex(&Sha256::digest(record_id.as_bytes()));
+    format!("云端用量记录无效（第 {} 条，记录摘要 {}）：{reason}", index + 1, &digest[..12])
+}
+
+/// Codex cumulative snapshots can correct an earlier counter downwards while
+/// other counters increase. Preserve those signed deltas; validate their session
+/// total instead of rejecting the correction or inflating it by clipping to zero.
+fn validate_usage_records(records: &[CloudUsageRecord]) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    let mut sessions: HashMap<(&str, Cow<'_, str>), (i128, i128, i128, usize)> = HashMap::new();
+    for (index, item) in records.iter().enumerate() {
+        let row = &item.record;
+        let invalid = |reason: &str| usage_record_error(index, &row.record_id, reason);
+        if row.record_id.trim().is_empty() { return Err(invalid("record_id 不能为空")); }
+        if row.source.trim().is_empty() { return Err(invalid("source 不能为空")); }
+        if row.origin.trim().is_empty() { return Err(invalid("origin 不能为空")); }
+        if !matches!(row.record_kind.as_str(), "response" | "session_total" | "estimated") {
+            return Err(invalid("record_kind 不受支持"));
+        }
+        if !seen.insert(row.record_id.as_str()) { return Err(invalid("record_id 重复")); }
+        if normalize_occurred_at(Some(&row.occurred_at)).is_none() {
+            return Err(invalid("occurred_at 不是有效的 RFC3339 时间"));
+        }
+        if normalize_occurred_at(Some(&item.updated_at)).is_none() {
+            return Err(invalid("updated_at 不是有效的 RFC3339 时间"));
+        }
+        let codex_delta = row.source == "codex" && row.origin == "native_transcript"
+            && row.record_kind == "response";
+        if !codex_delta {
+            if row.input_tokens < 0 || row.output_tokens < 0 || row.cached_tokens < 0 {
+                return Err(invalid("input_tokens/output_tokens/cached_tokens 不能为负数"));
+            }
+            if row.cached_tokens > row.input_tokens {
+                return Err(invalid("cached_tokens 超过 input_tokens"));
+            }
+        }
+        let total = sessions.entry((row.source.as_str(), usage_session_id(row)))
+            .or_insert((0, 0, 0, index));
+        total.0 += i128::from(row.input_tokens);
+        total.1 += i128::from(row.output_tokens);
+        total.2 += i128::from(row.cached_tokens);
+    }
+    for (_, (input, output, cached, index)) in sessions {
+        if input < 0 || output < 0 || cached < 0 || cached > input
+            || input > i128::from(i64::MAX) || output > i128::from(i64::MAX)
+        {
+            return Err(usage_record_error(index, &records[index].record.record_id,
+                "会话合计无效：Token 合计须非负、缓存不超过输入且计数不溢出"));
+        }
+    }
+    Ok(())
+}
+
 impl TelemetryStore {
     /// Only locally captured records are exported; downloaded rows never echo.
     pub fn cloud_usage_ledger(&self) -> Result<CloudUsageLedger, String> {
@@ -126,6 +193,8 @@ impl TelemetryStore {
             })).map_err(|error| error.to_string())?;
             rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?
         };
+        // Export and import must agree on what constitutes a valid full ledger.
+        validate_usage_records(&records)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(CloudUsageLedger { format: 2, records })
     }
@@ -140,25 +209,20 @@ impl TelemetryStore {
             "SELECT revision FROM usage_remote_ledgers WHERE device = ?1", [device], |row| row.get(0),
         ).optional().map_err(|error| error.to_string())?;
         if previous.is_some_and(|saved| saved > revision) { return Ok(0); }
+        validate_usage_records(&ledger.records)?;
         tx.execute("DELETE FROM usage_remote_records WHERE device = ?1", [device])
             .map_err(|error| error.to_string())?;
-        let mut seen = HashSet::new();
         for item in &ledger.records {
             let row = &item.record;
+            let session_id = usage_session_id(row);
             let occurred_at = normalize_occurred_at(Some(&row.occurred_at)).ok_or("云端用量时间无效")?;
             let updated_at = normalize_occurred_at(Some(&item.updated_at)).ok_or("云端用量更新时间无效")?;
-            if row.record_id.trim().is_empty() || row.source.trim().is_empty()
-                || row.session_id.trim().is_empty() || row.origin.trim().is_empty()
-                || row.input_tokens < 0 || row.output_tokens < 0 || row.cached_tokens < 0
-                || row.cached_tokens > row.input_tokens || !seen.insert(&row.record_id)
-                || !matches!(row.record_kind.as_str(), "response" | "session_total" | "estimated")
-            { return Err("云端用量记录无效".into()); }
             tx.execute(
                 "INSERT INTO usage_remote_records
                  (device, record_id, source, session_id, occurred_at, model, record_kind,
                   input_tokens, output_tokens, cached_tokens, origin, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                params![device, row.record_id, row.source, row.session_id, occurred_at, row.model,
+                params![device, row.record_id, row.source, session_id.as_ref(), occurred_at, row.model,
                     row.record_kind, row.input_tokens, row.output_tokens, row.cached_tokens, row.origin, updated_at],
             ).map_err(|error| error.to_string())?;
         }
