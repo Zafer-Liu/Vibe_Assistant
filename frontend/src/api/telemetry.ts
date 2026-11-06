@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { TelemetryEvent, TelemetryLiveStatus, TelemetrySummary, TelemetryUsageAnalytics, TelemetryUsageRecord, TelemetryUsageRefresh } from '../types/telemetry'
+import type { TelemetryEvent, TelemetryLiveStatus, TelemetrySummary, TelemetryUsageAnalytics, TelemetryUsageBucket, TelemetryUsageRecord, TelemetryUsageRefresh } from '../types/telemetry'
 
 export const telemetryApi = {
   telemetryBackfillConversations: () => invoke<number>('telemetry_backfill_conversations'),
@@ -9,4 +9,5 @@ export const telemetryApi = {
   telemetryUsageRecords: (args: { limit: number }) => invoke<TelemetryUsageRecord[]>('telemetry_usage_records', args),
   telemetryLiveStatus: () => invoke<TelemetryLiveStatus>('telemetry_live_status'),
   telemetryUsageAnalytics: (args: { startAt: string | null; endAt: string | null; source: string | null; bucket: 'hour' | 'day'; recordLimit: number }) => invoke<TelemetryUsageAnalytics>('telemetry_usage_analytics', args),
+  telemetryUsageCalendar: (args: { startAt: string | null; endAt: string | null; source: string | null }) => invoke<TelemetryUsageBucket[]>('telemetry_usage_calendar', args),
 }

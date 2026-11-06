@@ -28,6 +28,12 @@ pub fn shared_store() -> Option<Arc<TelemetryStore>> {
 pub struct TelemetryStore {
     pub(crate) conn: Arc<Mutex<Connection>>,
     mcp_dashboard_cache: Arc<Mutex<Option<McpDashboardCache>>>,
+    usage_query_cache: Arc<Mutex<Option<UsageQueryCache>>>,
+}
+
+struct UsageQueryCache {
+    data_version: i64,
+    total_changes: i64,
 }
 
 struct McpDashboardCache {
@@ -44,7 +50,7 @@ mod transcripts;
 mod types;
 
 pub use transcripts::discover_all_native_transcripts;
-pub(crate) use transcripts::hex;
+pub(crate) use transcripts::{discover_native_transcripts, hex};
 use transcripts::*;
 pub(crate) use types::{
     normalize_l1_memory_type, user_defined_memory_scope, validate_l1_durability,
@@ -119,7 +125,11 @@ impl TelemetryStore {
     }
 
     pub(crate) fn from_connection(conn: Connection) -> Self {
-        Self { conn: Arc::new(Mutex::new(conn)), mcp_dashboard_cache: Default::default() }
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+            mcp_dashboard_cache: Default::default(),
+            usage_query_cache: Default::default(),
+        }
     }
 
     #[cfg(test)]
@@ -3680,10 +3690,9 @@ impl TelemetryStore {
     }
 
     fn summary(&self) -> Result<TelemetrySummary, String> {
-        self.conn
-            .lock()
-            .map_err(|_| "telemetry store lock poisoned".to_string())?
-            .query_row(
+        let mut conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned".to_string())?;
+        self.prepare_usage_query_feed(&mut conn)?;
+        conn.query_row(
                 // Totals come from the same detail-first feed as the usage
                 // dashboard, so the Memory Center panel and the analytics
                 // page can never show different numbers for one ledger.
@@ -3710,7 +3719,7 @@ impl TelemetryStore {
                    COALESCE(SUM(CASE WHEN usage.origin LIKE 'estimated%' THEN 1 ELSE 0 END), 0),
                    (SELECT MAX(refreshed_at) FROM session_token_usage)
                  FROM sessions
-                 LEFT JOIN usage ON usage.source = sessions.source AND usage.session_id = sessions.session_id", cloud_usage::feed_sql()),
+                 LEFT JOIN usage ON usage.source = sessions.source AND usage.session_id = sessions.session_id", cloud_usage::QUERY_FEED),
                 [],
                 |row| {
                     let input: i64 = row.get(2)?;
@@ -4480,15 +4489,16 @@ impl TelemetryStore {
     /// without request-level provider counters are exposed as one explicit
     /// session-total fallback instead of zero-valued Hook rows.
     fn usage_records(&self, limit: u32) -> Result<Vec<TelemetryUsageRecord>, String> {
-        let conn = self
+        let mut conn = self
             .conn
             .lock()
             .map_err(|_| "telemetry store lock poisoned".to_string())?;
+        self.prepare_usage_query_feed(&mut conn)?;
         let mut statement = conn.prepare(&format!(
             "{} SELECT record_id, source, session_id, occurred_at, model, record_kind,
                     input_tokens, output_tokens, cached_tokens, origin
                FROM usage_feed WHERE day_only IS NULL
-              ORDER BY occurred_at DESC, record_id LIMIT ?1", cloud_usage::feed_sql(),
+              ORDER BY occurred_at DESC, record_id LIMIT ?1", cloud_usage::QUERY_FEED,
         )).map_err(|e| e.to_string())?;
         let rows = statement
             .query_map([limit.clamp(1, 1000)], |row| {
@@ -4518,13 +4528,13 @@ impl TelemetryStore {
         bucket: &str,
         record_limit: u32,
     ) -> Result<TelemetryUsageAnalytics, String> {
-        let conn = self
+        let mut conn = self
             .conn
             .lock()
             .map_err(|_| "telemetry store lock poisoned".to_string())?;
-        // One deduplicated feed for local and synced records. Legacy daily
-        // totals retain their count weight, but never invent an activity hour.
-        let feed = cloud_usage::feed_sql();
+        self.prepare_usage_query_feed(&mut conn)?;
+        // Reuse the same indexed snapshot for totals, details and every chart.
+        let feed = cloud_usage::QUERY_FEED;
         let filter = cloud_usage::FILTER;
         let totals_sql = format!("{feed} SELECT COALESCE(SUM(record_count), 0), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_tokens), 0), COALESCE(SUM(CASE WHEN origin LIKE 'estimated%' THEN input_tokens + output_tokens ELSE 0 END), 0), COALESCE(SUM(CASE WHEN day_only IS NOT NULL THEN input_tokens + output_tokens ELSE 0 END), 0), COALESCE(SUM(day_only IS NULL), 0) FROM usage_feed {filter}");
         let (record_count, input_tokens, output_tokens, cached_tokens, estimated_tokens, daily_only_tokens, detail_count):
@@ -4568,29 +4578,7 @@ impl TelemetryStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
 
-        // The group expression is chosen from a closed enum, never from UI
-        // text, so it is safe to interpolate into the SQL statement.
-        let group = if bucket == "hour" {
-            "strftime('%Y-%m-%d %H:00', occurred_at, 'localtime')"
-        } else {
-            "COALESCE(day_only, strftime('%Y-%m-%d', occurred_at, 'localtime'))"
-        };
-        let precision_filter = if bucket == "hour" { " AND day_only IS NULL" } else { "" };
-        let buckets_sql = format!("{feed} SELECT {group}, COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_tokens), 0), SUM(record_count) FROM usage_feed {filter}{precision_filter} GROUP BY 1 ORDER BY 1");
-        let mut bucket_statement = conn.prepare(&buckets_sql).map_err(|e| e.to_string())?;
-        let buckets = bucket_statement
-            .query_map(params![start_at, end_at, source], |row| {
-                Ok(TelemetryUsageBucket {
-                    label: row.get(0)?,
-                    input_tokens: row.get(1)?,
-                    output_tokens: row.get(2)?,
-                    cached_tokens: row.get(3)?,
-                    record_count: row.get(4)?,
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
+        let buckets = cloud_usage::read_usage_buckets(&conn, start_at, end_at, source, bucket)?;
 
         let heatmap_sql = format!(
             "{feed} SELECT CAST(strftime('%w', occurred_at, 'localtime') AS INTEGER), \
@@ -5133,7 +5121,9 @@ fn replace_transcript_mcp_calls(tx: &Transaction<'_>, parsed: &[ParsedMcpCall]) 
 pub async fn telemetry_summary(
     state: tauri::State<'_, TelemetryStore>,
 ) -> Result<TelemetrySummary, String> {
-    state.summary()
+    let store = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.summary())
+        .await.map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -5198,7 +5188,9 @@ pub async fn telemetry_usage_records(
     state: tauri::State<'_, TelemetryStore>,
     limit: Option<u32>,
 ) -> Result<Vec<TelemetryUsageRecord>, String> {
-    state.usage_records(limit.unwrap_or(200))
+    let store = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.usage_records(limit.unwrap_or(200)))
+        .await.map_err(|error| error.to_string())?
 }
 
 /// PRD 一期：追溯重算成本（models.dev 同步或改价后调用）。
@@ -5231,15 +5223,28 @@ pub async fn telemetry_usage_analytics(
     bucket: Option<String>,
     record_limit: Option<u32>,
 ) -> Result<TelemetryUsageAnalytics, String> {
-    state.usage_analytics(
+    let store = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.usage_analytics(
         start_at.as_deref(),
         end_at.as_deref(),
-        source
-            .as_deref()
-            .filter(|value| !value.trim().is_empty() && *value != "all"),
+        source.as_deref().filter(|value| !value.trim().is_empty() && *value != "all"),
         bucket.as_deref().unwrap_or("day"),
         record_limit.unwrap_or(500),
-    )
+    )).await.map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn telemetry_usage_calendar(
+    state: tauri::State<'_, TelemetryStore>,
+    start_at: Option<String>,
+    end_at: Option<String>,
+    source: Option<String>,
+) -> Result<Vec<TelemetryUsageBucket>, String> {
+    let store = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.usage_calendar(
+        start_at.as_deref(), end_at.as_deref(),
+        source.as_deref().filter(|value| !value.trim().is_empty() && *value != "all"),
+    )).await.map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

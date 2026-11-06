@@ -53,12 +53,14 @@ pub(super) fn feed_sql() -> String {
             PARTITION BY source, record_id
             ORDER BY (origin NOT LIKE 'estimated%') DESC, updated_at DESC, signature DESC
         ) AS position FROM candidates
+    ), winners AS MATERIALIZED (
+        SELECT * FROM ranked WHERE position = 1
+    ), detailed_sessions AS MATERIALIZED (
+        SELECT DISTINCT source, session_id FROM winners WHERE record_kind != 'session_total'
     ), exact_feed AS (
-        SELECT * FROM ranked r WHERE position = 1
-          AND (record_kind != 'session_total' OR NOT EXISTS (
-              SELECT 1 FROM ranked detail WHERE detail.position = 1
-                AND detail.source = r.source AND detail.session_id = r.session_id
-                AND detail.record_kind != 'session_total'))
+        SELECT r.* FROM winners r
+        LEFT JOIN detailed_sessions d ON d.source = r.source AND d.session_id = r.session_id
+        WHERE r.record_kind != 'session_total' OR d.source IS NULL
     ), usage_feed AS (
         SELECT record_id, source, session_id, occurred_at, model, record_kind,
                input_tokens, output_tokens, cached_tokens, origin,
@@ -167,7 +169,76 @@ fn validate_usage_records(records: &[CloudUsageRecord]) -> Result<(), String> {
     Ok(())
 }
 
+pub(super) const QUERY_FEED: &str = "WITH usage_feed AS (SELECT * FROM temp.usage_query_feed) ";
+
+pub(super) fn read_usage_buckets(
+    conn: &Connection, start_at: Option<&str>, end_at: Option<&str>, source: Option<&str>, bucket: &str,
+) -> Result<Vec<TelemetryUsageBucket>, String> {
+    let group = if bucket == "hour" {
+        "strftime('%Y-%m-%d %H:00', occurred_at, 'localtime')"
+    } else {
+        "COALESCE(day_only, strftime('%Y-%m-%d', occurred_at, 'localtime'))"
+    };
+    let precision = if bucket == "hour" { " AND day_only IS NULL" } else { "" };
+    let sql = format!("{QUERY_FEED} SELECT {group}, SUM(input_tokens), SUM(output_tokens),
+        SUM(cached_tokens), SUM(record_count) FROM usage_feed {FILTER}{precision} GROUP BY 1 ORDER BY 1");
+    let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+    let rows = statement.query_map(params![start_at, end_at, source], |row| Ok(TelemetryUsageBucket {
+        label: row.get(0)?, input_tokens: row.get(1)?, output_tokens: row.get(2)?,
+        cached_tokens: row.get(3)?, record_count: row.get(4)?,
+    })).map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())
+}
+
 impl TelemetryStore {
+    /// Materialize the expensive cross-device deduplication once per database
+    /// revision. All chart queries then scan this indexed connection-local table.
+    /// data_version catches other processes; total_changes catches this connection.
+    pub(super) fn prepare_usage_query_feed(&self, conn: &mut Connection) -> Result<(), String> {
+        let data_version: i64 = conn.query_row("PRAGMA main.data_version", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        let total_changes: i64 = conn.query_row("SELECT total_changes()", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        let mut cache = self.usage_query_cache.lock().map_err(|_| "usage query cache poisoned".to_string())?;
+        if cache.as_ref().is_some_and(|saved| saved.data_version == data_version && saved.total_changes == total_changes) {
+            return Ok(());
+        }
+        // Build one consistent read snapshot, even while an MCP process writes.
+        // Only TEMP tables are written; the durable usage ledger is untouched.
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS usage_query_feed (
+                 record_id TEXT, source TEXT, session_id TEXT, occurred_at TEXT, model TEXT,
+                 record_kind TEXT, input_tokens INTEGER, output_tokens INTEGER, cached_tokens INTEGER,
+                 origin TEXT, record_count INTEGER, day_only TEXT
+             );
+             CREATE INDEX IF NOT EXISTS temp.idx_usage_query_time
+                 ON usage_query_feed(occurred_at DESC, record_id) WHERE day_only IS NULL;
+             CREATE INDEX IF NOT EXISTS temp.idx_usage_query_source_time
+                 ON usage_query_feed(source, occurred_at);
+             CREATE INDEX IF NOT EXISTS temp.idx_usage_query_day
+                 ON usage_query_feed(day_only) WHERE day_only IS NOT NULL;
+             DELETE FROM temp.usage_query_feed;",
+        ).map_err(|error| error.to_string())?;
+        tx.execute(&format!("{} INSERT INTO temp.usage_query_feed SELECT * FROM usage_feed", feed_sql()), [])
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        // Remember the counter after our own TEMP writes to avoid rebuilding
+        // immediately for the next chart in the same screen.
+        let total_changes = conn.query_row("SELECT total_changes()", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        *cache = Some(UsageQueryCache { data_version, total_changes });
+        Ok(())
+    }
+
+    pub(super) fn usage_calendar(
+        &self, start_at: Option<&str>, end_at: Option<&str>, source: Option<&str>,
+    ) -> Result<Vec<TelemetryUsageBucket>, String> {
+        let mut conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned".to_string())?;
+        self.prepare_usage_query_feed(&mut conn)?;
+        read_usage_buckets(&conn, start_at, end_at, source, "day")
+    }
+
     /// Only locally captured records are exported; downloaded rows never echo.
     pub fn cloud_usage_ledger(&self) -> Result<CloudUsageLedger, String> {
         let mut conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned".to_string())?;

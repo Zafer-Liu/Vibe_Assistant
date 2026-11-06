@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-pub(super) fn discover_native_transcripts(
+pub(crate) fn discover_native_transcripts(
     sessions: &[(String, String, Option<PathBuf>)],
 ) -> HashMap<(String, String), PathBuf> {
     let wanted = |source: &str| {

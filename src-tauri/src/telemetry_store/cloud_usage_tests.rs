@@ -339,6 +339,77 @@ fn exporting_invalid_usage_does_not_commit_sync_versions() {
 }
 
 #[test]
+fn charts_and_summary_reuse_one_snapshot_without_rewriting_it() {
+    let store = TelemetryStore::in_memory();
+    write_record(&store, &record("snapshot", "2026-11-05T01:00:00Z", "native_transcript", "model-a"));
+    let seen = analytics(&store);
+    let changes = || -> i64 {
+        store.conn.lock().unwrap().query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap()
+    };
+    let after_build = changes();
+    let days = store.usage_calendar(None, None, None).unwrap();
+    assert_eq!(serde_json::to_value(days).unwrap(), serde_json::to_value(&seen.buckets).unwrap());
+    assert_eq!(store.summary().unwrap().total_tokens, 120);
+    assert_eq!(store.usage_records(200).unwrap().len(), 1);
+    assert_eq!(analytics(&store).record_count, 1);
+    assert_eq!(changes(), after_build, "图表、概览和明细应复用同一临时快照");
+}
+
+#[test]
+fn snapshot_rebuilds_after_local_edits_and_remote_removal() {
+    let source = TelemetryStore::in_memory();
+    let store = TelemetryStore::in_memory();
+    let mut row = record("local", "2026-11-05T01:00:00Z", "native_transcript", "model-a");
+    write_record(&store, &row);
+    write_record(&source, &record("remote", "2026-11-04T01:00:00Z", "native_transcript", "model-b"));
+    store.replace_remote_usage_ledger("source", 1, &source.cloud_usage_ledger().unwrap()).unwrap();
+    assert_eq!(analytics(&store).input_tokens, 200);
+    row.input_tokens = 10;
+    row.cached_tokens = 0;
+    write_record(&store, &row);
+    assert_eq!(analytics(&store).input_tokens, 110);
+    store.replace_remote_usage_ledger("source", 2, &CloudUsageLedger { format: 2, records: Vec::new() }).unwrap();
+    assert_eq!(analytics(&store).input_tokens, 10);
+    assert_eq!(store.usage_calendar(None, None, None).unwrap().len(), 1);
+}
+
+#[test]
+fn snapshot_observes_writes_from_an_independent_database_connection() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("usage.sqlite3");
+    let conn = crate::telemetry_store::schema::initialize_database(Connection::open(&path).unwrap()).unwrap();
+    let store = TelemetryStore::from_connection(conn);
+    let row = record("external-edit", "2026-11-05T01:00:00Z", "native_transcript", "model-a");
+    write_record(&store, &row);
+    assert_eq!(analytics(&store).input_tokens, 100);
+    let peer = Connection::open(&path).unwrap();
+    peer.execute("UPDATE usage_records SET input_tokens = 200 WHERE record_id = ?1", [&row.record_id]).unwrap();
+    assert_eq!(analytics(&store).input_tokens, 200);
+    assert_eq!(store.usage_records(200).unwrap()[0].input_tokens, 200);
+}
+
+#[test]
+fn calendar_only_query_preserves_filters_and_legacy_day_counts() {
+    let store = TelemetryStore::in_memory();
+    write_record(&store, &record("native-day", "2026-11-04T01:00:00Z", "native_transcript", "model-a"));
+    let mut old = legacy();
+    old.source = "qoder".into();
+    store.replace_remote_usage_totals("legacy", &[old]).unwrap();
+    let selected = store.usage_calendar(None, None, Some("qoder")).unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].label, "2026-11-05");
+    assert_eq!(selected[0].record_count, 120);
+    let (start, end): (String, String) = store.conn.lock().unwrap().query_row(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', '2026-11-05 00:00:00', 'utc'),
+                strftime('%Y-%m-%dT%H:%M:%fZ', '2026-11-06 00:00:00', 'utc')",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    let days = store.usage_calendar(Some(&start), Some(&end), None).unwrap();
+    let full = store.usage_analytics(Some(&start), Some(&end), None, "day", 500).unwrap();
+    assert_eq!(serde_json::to_value(days).unwrap(), serde_json::to_value(full.buckets).unwrap());
+}
+
+#[test]
 fn invalid_remote_ledger_rolls_back_and_does_not_hide_legacy_data() {
     let store = TelemetryStore::in_memory();
     store.replace_remote_usage_totals("source", &[legacy()]).unwrap();

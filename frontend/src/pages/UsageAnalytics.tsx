@@ -506,7 +506,7 @@ function PricingEstimator({
 
 export const UsageAnalytics = memo(function UsageAnalytics({ active = true }: { active?: boolean }) {
   const { t } = useTranslation()
-  const { loadUsageAnalytics, checkTelemetry } = useTelemetryFields('loadUsageAnalytics', 'checkTelemetry')
+  const { loadUsageAnalytics, loadUsageCalendar, checkTelemetry } = useTelemetryFields('loadUsageAnalytics', 'loadUsageCalendar', 'checkTelemetry')
   const [tab, setTab] = useState<TabKey>('trend')
   const [range, setRange] = useState<RangeKey>('today')
   const [source, setSource] = useState('all')
@@ -549,20 +549,19 @@ export const UsageAnalytics = memo(function UsageAnalytics({ active = true }: { 
     const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 364)
     const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
     try {
-      const result = await loadUsageAnalytics({ startAt: start.toISOString(), endAt: tomorrow.toISOString(), source, bucket: 'day' })
-      if (version === calendarVersion.current) setCalendarBuckets(result.buckets)
+      const result = await loadUsageCalendar({ startAt: start.toISOString(), endAt: tomorrow.toISOString(), source })
+      if (version === calendarVersion.current) setCalendarBuckets(result)
     } catch {
       if (version === calendarVersion.current) setCalendarBuckets([])
     }
-  }, [source, loadUsageAnalytics])
+  }, [source, loadUsageCalendar])
 
   useEffect(() => {
-    if (active) {
-      setLoading(true)
-      void checkTelemetry({ limit: 20 })
-    }
+    if (active) setLoading(true)
+    // The analytics response already contains the overview and details. Avoid
+    // queuing another summary/detail batch behind the same database lock.
     return () => { requestVersion.current += 1 }
-  }, [range, source, active, checkTelemetry])
+  }, [range, source, active])
 
   useEffect(() => {
     if (!active) return

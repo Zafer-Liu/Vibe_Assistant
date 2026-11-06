@@ -243,6 +243,7 @@ pub fn run() {
             telemetry_recent_events,
             telemetry_usage_records,
             telemetry_usage_analytics,
+            telemetry_usage_calendar,
             telemetry_recalculate_costs,
             provider_store::list_providers,
             provider_store::save_provider,

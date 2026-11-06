@@ -907,46 +907,85 @@ fn value_excerpt(value: Option<&Value>, max_chars: usize) -> String {
     truncate_text(&text, max_chars)
 }
 
-/// Read a transcript turn and turn parser failures into an observable log
-/// while preserving the hook payload's fallback response.
+/// Keep I/O error kinds so an expired path is distinct from a denied/corrupt read.
+type TranscriptTurnReader = fn(&Path, &str) -> std::io::Result<Vec<(String, String)>>;
+
 fn read_transcript_turn(
-    path: Option<&str>,
+    path: Option<&Path>,
     turn_id: Option<&str>,
-    reader: fn(&Path, &str) -> Result<Vec<(String, String)>, String>,
+    reader: TranscriptTurnReader,
     agent_name: &str,
 ) -> Option<Vec<(String, String)>> {
     let (Some(path), Some(turn_id)) = (path, turn_id) else {
         return None;
     };
-    match reader(Path::new(path), turn_id) {
+    match reader(path, turn_id) {
         Ok(messages) if !messages.is_empty() => Some(messages),
         Ok(_) => {
             eprintln!("[memory-ingest] no {agent_name} transcript messages for turn {turn_id}");
             None
         }
+        // Historical hooks can outlive their source files. Leave them available
+        // for later recovery and let Stop use its existing payload fallback.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
-            eprintln!("[memory-ingest] {agent_name} transcript read failed: {error}");
+            eprintln!("[memory-ingest] {agent_name} transcript read failed ({}): {error}", path.display());
             None
         }
     }
 }
 
-fn read_hook_transcript(source: &str, payload: &Value) -> Option<Vec<(String, String)>> {
+/// Request discovery only for absent hints. Permission errors must still reach
+/// the reader and remain visible instead of being mistaken for missing files.
+fn missing_hook_transcript(source: &str, payload: &Value) -> Option<(String, String, Option<PathBuf>)> {
+    let turn_key = match source {
+        "claude" => "prompt_id",
+        "codex" => "turn_id",
+        _ => return None,
+    };
+    payload.get(turn_key)?.as_str().filter(|id| !id.trim().is_empty())?;
+    let session_id = payload.get("session_id")?.as_str().filter(|id| !id.trim().is_empty())?;
+    let hint = payload.get("transcript_path").and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty()).map(PathBuf::from);
+    if let Some(path) = hint.as_ref() {
+        match fs::metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return None,
+        }
+    }
+    Some((source.to_string(), session_id.to_string(), hint))
+}
+
+fn read_hook_transcript_with_paths(
+    source: &str,
+    payload: &Value,
+    discovered: &HashMap<(String, String), PathBuf>,
+) -> Option<Vec<(String, String)>> {
+    let relocated = payload.get("session_id").and_then(Value::as_str)
+        .and_then(|id| discovered.get(&(source.to_string(), id.to_string())));
+    let hint = payload.get("transcript_path").and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty()).map(Path::new);
+    // Another receipt for this session may have triggered discovery. Prefer an
+    // existing explicit hint, and do not bypass permission errors on that hint.
+    let hint_missing = hint.map(|path| {
+        matches!(fs::metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    }).unwrap_or(true);
+    let path = if hint_missing { relocated.map(PathBuf::as_path).or(hint) } else { hint };
     match source {
         "claude" => read_transcript_turn(
-            payload.get("transcript_path").and_then(Value::as_str),
-            payload.get("prompt_id").and_then(Value::as_str),
-            read_claude_turn,
-            "Claude",
+            path, payload.get("prompt_id").and_then(Value::as_str), read_claude_turn, "Claude",
         ),
         "codex" => read_transcript_turn(
-            payload.get("transcript_path").and_then(Value::as_str),
-            payload.get("turn_id").and_then(Value::as_str),
-            read_codex_turn,
-            "Codex",
+            path, payload.get("turn_id").and_then(Value::as_str), read_codex_turn, "Codex",
         ),
         _ => None,
     }
+}
+
+fn read_hook_transcript(source: &str, payload: &Value) -> Option<Vec<(String, String)>> {
+    let missing = missing_hook_transcript(source, payload).into_iter().collect::<Vec<_>>();
+    let discovered = crate::telemetry_store::discover_native_transcripts(&missing);
+    read_hook_transcript_with_paths(source, payload, &discovered)
 }
 
 /// Populate newly introduced receipt previews from retained Stop records.
@@ -958,8 +997,14 @@ pub fn telemetry_backfill_conversations() -> Result<u32, String> {
         return Ok(0);
     };
     let mut updated = 0;
-    for (source, payload) in store.unannotated_stop_payloads(50)? {
-        if let Some(messages) = read_hook_transcript(&source, &payload) {
+    let payloads = store.unannotated_stop_payloads(50)?;
+    // Discover once for the whole batch, including multiple hooks referencing
+    // the same vanished file, rather than walking the roots once per receipt.
+    let missing = payloads.iter().filter_map(|(source, payload)| missing_hook_transcript(source, payload))
+        .collect::<Vec<_>>();
+    let discovered = crate::telemetry_store::discover_native_transcripts(&missing);
+    for (source, payload) in payloads {
+        if let Some(messages) = read_hook_transcript_with_paths(&source, &payload, &discovered) {
             store.record_conversation(&source, &payload, "full", &messages)?;
             updated += 1;
         }
@@ -1883,20 +1928,27 @@ fn read_workbuddy_session(path: &Path) -> Result<Vec<(String, String)>, String> 
     Ok(messages)
 }
 
+fn open_hook_transcript(path: &Path, agent_name: &str) -> std::io::Result<fs::File> {
+    // Inspect the opened handle: the pathname may disappear between discovery
+    // and reading, but an already-open transcript can still be read safely.
+    let file = fs::File::open(path)?;
+    if file.metadata()?.len() > 16 * 1024 * 1024 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("{agent_name} transcript exceeds 16 MB safety limit")));
+    }
+    Ok(file)
+}
+
 /// Read the single Claude turn that begins with this hook's `prompt_id`.
 /// Transcript lines for tool results are intentionally skipped: they are
 /// operational detail, whereas the user prompt and assistant text form the
 /// conversation we want the memory model to understand.
-fn read_claude_turn(path: &Path, prompt_id: &str) -> Result<Vec<(String, String)>, String> {
-    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
-    if metadata.len() > 16 * 1024 * 1024 {
-        return Err("Claude transcript exceeds 16 MB safety limit".into());
-    }
-    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+fn read_claude_turn(path: &Path, prompt_id: &str) -> std::io::Result<Vec<(String, String)>> {
+    let file = open_hook_transcript(path, "Claude")?;
     let mut collecting = false;
     let mut messages = Vec::new();
     for line in BufReader::new(file).lines() {
-        let line = line.map_err(|error| error.to_string())?;
+        let line = line?;
         let entry: Value = match serde_json::from_str(&line) {
             Ok(entry) => entry,
             Err(_) => continue,
@@ -1938,15 +1990,11 @@ fn read_claude_turn(path: &Path, prompt_id: &str) -> Result<Vec<(String, String)
 /// Codex stores its dialogue as `response_item/message` payloads, each with
 /// `internal_chat_message_metadata_passthrough.turn_id`; tool calls and
 /// reasoning are separate response-item types and are intentionally ignored.
-fn read_codex_turn(path: &Path, turn_id: &str) -> Result<Vec<(String, String)>, String> {
-    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
-    if metadata.len() > 16 * 1024 * 1024 {
-        return Err("Codex transcript exceeds 16 MB safety limit".into());
-    }
-    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+fn read_codex_turn(path: &Path, turn_id: &str) -> std::io::Result<Vec<(String, String)>> {
+    let file = open_hook_transcript(path, "Codex")?;
     let mut messages = Vec::new();
     for line in BufReader::new(file).lines() {
-        let line = line.map_err(|error| error.to_string())?;
+        let line = line?;
         let entry: Value = match serde_json::from_str(&line) {
             Ok(entry) => entry,
             Err(_) => continue,
@@ -4340,6 +4388,109 @@ mod tests {
             output_language_directive("Please retain this project decision").contains("English")
         );
         assert!(output_language_directive("用户偏好中文并使用 SQLite MCP Server").contains("中文"));
+    }
+
+    #[test]
+    fn missing_hook_transcript_can_be_recovered_when_the_file_reappears() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("restored-session.jsonl");
+        let payload = serde_json::json!({
+            "session_id": "restored-session", "prompt_id": "p-1",
+            "transcript_path": path, "last_assistant_message": "retained fallback",
+        });
+        assert_eq!(read_claude_turn(&path, "p-1").unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert!(super::missing_hook_transcript("claude", &payload).is_some());
+        let discovered = std::collections::HashMap::new();
+        assert!(super::read_hook_transcript_with_paths("claude", &payload, &discovered).is_none());
+        assert_eq!(payload["last_assistant_message"], "retained fallback");
+
+        std::fs::write(&path, [
+            serde_json::json!({"type":"user","promptId":"p-1","message":{"role":"user","content":"Recovered prompt"}}).to_string(),
+            serde_json::json!({"type":"assistant","message":{"role":"assistant","content":"Recovered response"}}).to_string(),
+        ].join("\n")).unwrap();
+        assert!(super::missing_hook_transcript("claude", &payload).is_none());
+        assert_eq!(super::read_hook_transcript_with_paths("claude", &payload, &discovered).unwrap(), vec![
+            ("user".into(), "Recovered prompt".into()),
+            ("assistant".into(), "Recovered response".into()),
+        ]);
+    }
+
+    #[test]
+    fn relocated_hook_transcript_matches_the_original_session_and_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let stale = directory.path().join("removed").join("session.jsonl");
+        let relocated = directory.path().join("session.jsonl");
+        std::fs::write(&relocated, [
+            serde_json::json!({"type":"user","promptId":"p-1","message":{"role":"user","content":"Original prompt"}}).to_string(),
+            serde_json::json!({"type":"assistant","message":{"role":"assistant","content":"Original response"}}).to_string(),
+            serde_json::json!({"type":"user","promptId":"p-2","message":{"role":"user","content":"Other turn"}}).to_string(),
+        ].join("\n")).unwrap();
+        let payload = serde_json::json!({
+            "session_id": "session", "prompt_id": "p-1", "transcript_path": stale,
+        });
+        let missing = super::missing_hook_transcript("claude", &payload).unwrap();
+        assert_eq!(missing.0, "claude");
+        assert_eq!(missing.1, "session");
+        let discovered = std::collections::HashMap::from([
+            (("claude".into(), "session".into()), relocated),
+        ]);
+        assert_eq!(super::read_hook_transcript_with_paths("claude", &payload, &discovered).unwrap(), vec![
+            ("user".into(), "Original prompt".into()),
+            ("assistant".into(), "Original response".into()),
+        ]);
+        let other_session = serde_json::json!({
+            "session_id": "another-session", "prompt_id": "p-1", "transcript_path": stale,
+        });
+        assert!(super::read_hook_transcript_with_paths("claude", &other_session, &discovered).is_none());
+    }
+
+    #[test]
+    fn readable_hook_path_takes_priority_over_another_receipts_discovered_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let current = directory.path().join("current.jsonl");
+        let other = directory.path().join("copy.jsonl");
+        for (path, text) in [(&current, "Current prompt"), (&other, "Other copy")] {
+            std::fs::write(path, serde_json::json!({
+                "type":"user", "promptId":"p-1", "message":{"role":"user", "content":text},
+            }).to_string()).unwrap();
+        }
+        let payload = serde_json::json!({
+            "session_id":"session", "prompt_id":"p-1", "transcript_path":current,
+        });
+        let discovered = std::collections::HashMap::from([
+            (("claude".into(), "session".into()), other),
+        ]);
+        assert_eq!(super::read_hook_transcript_with_paths("claude", &payload, &discovered).unwrap(), vec![
+            ("user".into(), "Current prompt".into()),
+        ]);
+    }
+
+    #[test]
+    fn hook_transcript_discovery_requires_a_session_and_turn_identifier() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.jsonl");
+        let no_turn = serde_json::json!({"session_id":"session", "transcript_path":missing});
+        let no_session = serde_json::json!({"prompt_id":"p-1", "transcript_path":missing});
+        let empty_turn = serde_json::json!({"session_id":"session", "prompt_id":" ", "transcript_path":missing});
+        assert!(super::missing_hook_transcript("claude", &no_turn).is_none());
+        assert!(super::missing_hook_transcript("claude", &no_session).is_none());
+        assert!(super::missing_hook_transcript("claude", &empty_turn).is_none());
+        assert!(super::missing_hook_transcript("qoder", &no_turn).is_none());
+    }
+
+    #[test]
+    fn hook_transcript_readers_preserve_non_missing_io_errors_and_size_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("invalid.jsonl");
+        std::fs::write(&path, [0xff, b'\n']).unwrap();
+        assert_eq!(read_claude_turn(&path, "p-1").unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(read_codex_turn(&path, "turn-1").unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        let large = directory.path().join("large.jsonl");
+        std::fs::File::create(&large).unwrap().set_len(16 * 1024 * 1024 + 1).unwrap();
+        let error = read_claude_turn(&large, "p-1").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("16 MB"));
+        assert_eq!(read_codex_turn(&large, "turn-1").unwrap_err().kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
