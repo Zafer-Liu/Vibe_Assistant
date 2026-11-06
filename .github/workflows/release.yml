@@ -9,15 +9,124 @@ on:
         default: 'v1.0.0'
 
 permissions:
-  contents: write   # needed to create/upload Release assets
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag_name }}
+  cancel-in-progress: false
 
 jobs:
+  prepare:
+    name: Prepare draft release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      # Check publication access before spending time building four installers.
+      # Old reruns keep their original SHA, which may no longer be taggable by
+      # GITHUB_TOKEN if .github/workflows differs from the default branch.
+      - name: Validate tag and prepare draft
+        id: draft
+        uses: actions/github-script@v8
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const { owner, repo } = context.repo;
+            const tag = process.env.RELEASE_TAG;
+            const sha = context.sha;
+            const version = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8')).version;
+            if (!/^v\d+\.\d+\.\d+$/.test(tag) || tag !== `v${version}`) {
+              throw new Error(`标签 ${tag} 必须与当前应用版本 v${version} 一致。`);
+            }
+
+            let tagExists = false;
+            try {
+              await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+              tagExists = true;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            if (tagExists) {
+              const commit = await github.rest.repos.getCommit({ owner, repo, ref: `refs/tags/${tag}` });
+              if (commit.data.sha !== sha) {
+                throw new Error(`标签 ${tag} 已指向其他提交，不能上传本次提交 ${sha} 的安装包。`);
+              }
+            }
+
+            const releases = await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 });
+            let release = releases.find(item => item.tag_name === tag);
+            if (release) {
+              if (!release.draft) {
+                throw new Error(`${tag} 已发布；请使用新版本号，避免覆盖公开安装包。`);
+              }
+              if (!tagExists) {
+                const target = await github.rest.repos.getCommit({ owner, repo, ref: release.target_commitish });
+                if (target.data.sha !== sha) {
+                  throw new Error(`${tag} 的已有草稿属于其他提交；请检查该草稿后再运行。`);
+                }
+              }
+            } else {
+              if (!tagExists) {
+                const defaultBranch = context.payload.repository.default_branch;
+                const workflowFiles = async ref => {
+                  const response = await github.rest.repos.getContent({ owner, repo, path: '.github/workflows', ref });
+                  if (!Array.isArray(response.data)) throw new Error('无法读取工作流目录。');
+                  return JSON.stringify(response.data.map(file => [file.name, file.sha]).sort());
+                };
+                const [selected, current] = await Promise.all([workflowFiles(sha), workflowFiles(defaultBranch)]);
+                if (selected !== current) {
+                  throw new Error(
+                    `本次提交 ${sha} 的工作流与 ${defaultBranch} 不同，GITHUB_TOKEN 无法为它创建新发布标签。` +
+                    `请从最新 ${defaultBranch} 重新 Run workflow，不要 Re-run 旧运行。`
+                  );
+                }
+              }
+              release = (await github.rest.repos.createRelease({
+                owner, repo,
+                tag_name: tag,
+                target_commitish: sha,
+                name: `Vibe Assistant ${tag}`,
+                draft: true,
+                prerelease: false,
+                body: [
+                  '## 安装说明 / Installation',
+                  '',
+                  '| 平台 | 文件 |',
+                  '|------|------|',
+                  '| Windows | `.exe` (NSIS installer) |',
+                  '| macOS Apple Silicon (M1/M2/M3) | `.dmg` (aarch64) |',
+                  '| macOS Intel | `.dmg` (x86_64) |',
+                  '| Linux | `.AppImage` / `.deb` |',
+                  '',
+                  '> **macOS 提示**：首次打开 `.dmg` 安装后，若系统提示"无法验证开发者"，请右键点击应用图标 → 选择"打开" → 确认打开即可（仅首次需要）。',
+                  '>',
+                  '> **macOS note**: If macOS says it cannot verify the developer, right-click the app → Open → confirm. This is only needed once.',
+                  '',
+                  '---',
+                  '完整更新日志见 [CHANGELOG](https://github.com/Zafer-Liu/Vibe_Assistant/blob/main/CHANGELOG.md)（如有）。',
+                ].join('\n'),
+              })).data;
+            }
+            core.setOutput('release_id', release.id);
+            core.info(`使用草稿 ${release.html_url}，安装包对应提交 ${sha}`);
+
   quality:
     name: Quality checks
+    needs: prepare
     uses: ./.github/workflows/ci.yml
 
   release:
-    needs: quality
+    needs: [prepare, quality]
+    permissions:
+      contents: write
     strategy:
       fail-fast: false   # one platform failing won't cancel the others
       matrix:
@@ -43,6 +152,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -90,29 +201,26 @@ jobs:
         env:
           TAURI_TARGET_TRIPLE: ${{ matrix.target }}
 
-      - name: Build & publish release
+      - name: Build and upload to draft release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ inputs.tag_name }}
-          releaseName: 'Vibe Assistant ${{ inputs.tag_name }}'
-          releaseBody: |
-            ## 安装说明 / Installation
-
-            | 平台 | 文件 |
-            |------|------|
-            | Windows | `.exe` (NSIS installer) |
-            | macOS Apple Silicon (M1/M2/M3) | `.dmg` (aarch64) |
-            | macOS Intel | `.dmg` (x86_64) |
-            | Linux | `.AppImage` / `.deb` |
-
-            > **macOS 提示**：首次打开 `.dmg` 安装后，若系统提示"无法验证开发者"，请右键点击应用图标 → 选择"打开" → 确认打开即可（仅首次需要）。
-            >
-            > **macOS note**: If macOS says it cannot verify the developer, right-click the app → Open → confirm. This is only needed once.
-
-            ---
-            完整更新日志见 [CHANGELOG](https://github.com/Zafer-Liu/Vibe_Assistant/blob/main/CHANGELOG.md)（如有）。
-          releaseDraft: true    # 手动触发：先创建草稿，确认无误后手动发布
+          releaseId: ${{ needs.prepare.outputs.release_id }}
+          releaseDraft: true
           prerelease: false
           args: --target ${{ matrix.target }}
+
+      # Preserve completed installers even if uploading to the draft fails.
+      - name: Save installer artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ inputs.tag_name }}-${{ matrix.target }}
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
+            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb
+            src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
+          if-no-files-found: warn
+          retention-days: 14
