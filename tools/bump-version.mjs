@@ -18,7 +18,12 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const read = (relative) => readFileSync(join(root, relative), "utf8");
+// Windows 检出可能带 CRLF；先归一化，再做 JSON/TOML 解析和版本替换。
+const read = (relative) => {
+  const text = readFileSync(join(root, relative), "utf8");
+  const withoutBom = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+  return withoutBom.replace(/\r\n?/g, "\n");
+};
 
 function fail(message) {
   console.error(`[错误] ${message}`);
@@ -143,9 +148,14 @@ for (const [lockFile, manifest] of [
   });
 }
 
-// 第二阶段：统一写回（UTF-8、LF）。
+// 写盘前校验全部输出，格式错误也不能留下部分文件已升级的状态。
 for (const { file, text } of outputs) {
-  if (text.includes("\r\n")) fail(`${file} 将被写入 CRLF，已中止`);
+  if (text.includes("\r")) fail(`${file} 将被写入非 LF 换行，已中止`);
+  if (text.charCodeAt(0) === 0xfeff) fail(`${file} 将被写入 BOM，已中止`);
+}
+
+// 第二阶段：统一写回（UTF-8 无 BOM、LF）。
+for (const { file, text } of outputs) {
   writeFileSync(join(root, file), text, "utf8");
   console.log(`  已更新 ${file}`);
 }
