@@ -76,6 +76,9 @@ jobs:
         run: npm ci
 
       - name: Install frontend dependencies
+        # WebView inference uses onnxruntime-web; avoid the Node runtime's extra downloads.
+        env:
+          ONNXRUNTIME_NODE_INSTALL: skip
         run: cd frontend && npm ci
 
       # Builds both external binaries (mcp-launcher + mcp-relay) that

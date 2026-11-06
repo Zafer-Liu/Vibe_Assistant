@@ -29,6 +29,9 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
+        # WebView inference uses onnxruntime-web; no extra Node native binaries are needed.
+        env:
+          ONNXRUNTIME_NODE_INSTALL: skip
         run: npm ci
 
       - name: Lint and build
