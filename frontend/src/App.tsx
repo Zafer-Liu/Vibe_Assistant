@@ -31,6 +31,7 @@ import { useResizable } from './hooks/useResizable'
 import { Sun, Moon, Settings2, Brain, BookOpenText, Plug, Wrench, ChevronRight, BarChart3, Search, PanelLeftClose, PanelLeftOpen, Home } from 'lucide-react'
 import logoUrl from '/logo.png'
 import { CloseBehaviorDialog } from './features/desktop/CloseBehaviorDialog'
+import { afterNextPaint, recordStartupPhase } from './lib/startupPerformance'
 
 type NavPage = 'ports' | 'network' | 'env-vars' | 'settings' | 'settings-general' | 'settings-llm' | 'settings-memory' | 'settings-cloud' | 'memory' | 'memory-graph' | 'skills' | 'published-skills' | 'skill-marketplace' | 'mcp-library' | 'mcp-tools' | 'mcp-calls' | 'mcp-errors' | 'mcp-help' | 'usage' | 'pending-memories' | 'organized-conversations' | 'memory-capture' | 'memory-injection' | 'memory-help'
 
@@ -41,10 +42,19 @@ const MCP_PAGES = ['mcp-library', 'mcp-tools', 'mcp-calls', 'mcp-errors', 'mcp-h
 const TOOL_PAGES = ['ports', 'network', 'env-vars'] as const
 const SETTINGS_PAGES = ['settings-general', 'settings-llm', 'settings-memory', 'settings-cloud'] as const
 const KEPT_PAGES: readonly string[] = [...MEMORY_PAGES, ...SKILL_PAGES, 'usage']
+let frontendReadyReported = false
 
 export default function App() {
   const { theme, toggle: toggleTheme } = useTheme()
   const { t } = useTranslation()
+
+  useEffect(() => afterNextPaint(() => {
+    if (frontendReadyReported) return
+    frontendReadyReported = true
+    const frontendElapsedMs = performance.now()
+    recordStartupPhase('app_shell_painted', frontendElapsedMs)
+    void invoke('startup_frontend_ready', { frontendElapsedMs }).catch(() => {})
+  }), [])
 
   const [page, setPage] = useState<NavPage>('memory')
   const [navigationOpen, setNavigationOpen] = useState(false)

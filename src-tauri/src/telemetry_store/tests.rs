@@ -1661,3 +1661,19 @@ fn dsh_plugin_usage_replaces_transcript_record_with_same_identity() {
         .unwrap();
     assert_eq!(count, 1);
 }
+
+#[test]
+fn probe_version_tracking_supports_the_legacy_connection_table_without_migration() {
+    let store = mcp_test_store();
+    store.proxy_connection_open("probe-a", "fixture", "assignment").unwrap();
+    store.proxy_connection_open("probe-b", "fixture", "assignment").unwrap();
+    let mut current = std::collections::HashSet::new();
+    current.insert(TelemetryStore::probe_connection_key("probe-a").unwrap());
+    assert_eq!(store.proxy_pending_probe_connections("assignment", &current).unwrap(), 1);
+    current.insert(TelemetryStore::probe_connection_key("probe-b").unwrap());
+    assert_eq!(store.proxy_pending_probe_connections("assignment", &current).unwrap(), 0);
+    let conn = store.conn.lock().unwrap();
+    let columns: Vec<String> = conn.prepare("PRAGMA table_info(mcp_proxy_connections)").unwrap()
+        .query_map([], |row| row.get(1)).unwrap().collect::<Result<_, _>>().unwrap();
+    assert!(!columns.iter().any(|name| name == "runtime_version"));
+}

@@ -2,6 +2,16 @@
 //! shared with the app so the fallback cannot bypass its manifest checks.
 #[path = "../../src/mcp_fallback_resolver.rs"]
 mod resolver;
+#[path = "../../src/mcp_command.rs"]
+mod mcp_command;
+// Publication APIs are used by the GUI; this binary embeds only selection.
+#[allow(dead_code)]
+#[path = "../../src/mcp_probe_protocol.rs"]
+mod mcp_probe_protocol;
+// The GUI also includes this module; this binary only uses read-only lookup.
+#[allow(dead_code)]
+#[path = "../../src/memory_mcp_runtime.rs"]
+mod memory_runtime;
 
 use resolver::FallbackLaunch;
 use std::io::{self, Read, Write};
@@ -52,6 +62,7 @@ fn run() -> Result<i32, String> {
 }
 
 fn start_relay(launch: &FallbackLaunch) -> Result<Child, StartupFailure> {
+    if launch.relay_command.is_empty() { return Err(StartupFailure::BeforeGo); }
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
         .map_err(|_| StartupFailure::BeforeGo)?;
     listener.set_nonblocking(true).map_err(|_| StartupFailure::BeforeGo)?;
@@ -123,8 +134,7 @@ fn read_line(stream: &mut TcpStream, deadline: Instant) -> io::Result<Vec<u8>> {
 }
 
 fn run_original(launch: &FallbackLaunch) -> Result<i32, String> {
-    let mut command = original_command(&launch.command, &launch.args)?;
-    command.envs(&launch.env);
+    let mut command = original_command(&launch.command, &launch.args, &launch.env)?;
     command.env_remove("VIBE_MCP_CONTROL_ADDR");
     command.env_remove("VIBE_MCP_CONTROL_NONCE");
     command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -258,27 +268,10 @@ fn relay_io(child: &mut Child, mut heartbeat: Option<&mut FallbackHeartbeat>, st
 // uses one child; exit with it so the MCP client can reconnect and initialize a
 // new session. Never replay input across sessions.
 
-/// runtime 目录里最新的记忆服务副本；按文件名里的构建时间戳比较。
+/// Read-only lookup in the same config directory used by GUI publication.
+/// New names sort by publication sequence and validate their content hash.
 fn newest_memory_runtime() -> Option<std::path::PathBuf> {
-    let root = dirs_next::config_dir()?.join("agent-manager").join("mcp-runtime");
-    let mut newest: Option<(u64, std::path::PathBuf)> = None;
-    let entries = std::fs::read_dir(&root).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(rest) = name
-            .strip_prefix("agent-manager-memory-")
-            .and_then(|rest| rest.strip_suffix(".exe"))
-        else {
-            continue;
-        };
-        let Some((stamp, _)) = rest.split_once('-') else { continue };
-        let Ok(stamp) = stamp.parse::<u64>() else { continue };
-        if newest.as_ref().map_or(true, |(best, _)| stamp > *best) {
-            newest = Some((stamp, entry.path()));
-        }
-    }
-    newest.map(|(_, path)| path)
+    memory_runtime::newest().ok().flatten()
 }
 
 fn run_memory() -> Result<i32, String> {
@@ -346,73 +339,8 @@ fn no_window(command: &mut Command) {
 #[cfg(not(windows))]
 fn no_window(_: &mut Command) {}
 
-#[cfg(windows)]
-fn original_command(program: &str, args: &[String]) -> Result<Command, String> {
-    use std::os::windows::process::CommandExt;
-    use std::path::{Path, PathBuf};
-
-    let mut executable = PathBuf::from(program);
-    if executable.extension().is_none() {
-        let names = [format!("{program}.exe"), format!("{program}.cmd"), format!("{program}.bat")];
-        if executable.components().count() > 1 {
-            if let Some(found) = names.iter().map(PathBuf::from).find(|path| path.is_file()) {
-                executable = found;
-            }
-        } else if let Some(paths) = std::env::var_os("PATH") {
-            'search: for directory in std::env::split_paths(&paths) {
-                for name in &names {
-                    let candidate = directory.join(name);
-                    if candidate.is_file() {
-                        executable = candidate;
-                        break 'search;
-                    }
-                }
-            }
-        }
-    } else if executable.components().count() == 1 && !executable.is_file() {
-        if let Some(paths) = std::env::var_os("PATH") {
-            if let Some(found) = std::env::split_paths(&paths)
-                .map(|directory| directory.join(program)).find(|candidate| candidate.is_file()) {
-                executable = found;
-            }
-        }
-    }
-    let batch = executable.extension().and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
-    if !batch {
-        let mut command = Command::new(executable);
-        command.args(args);
-        return Ok(command);
-    }
-    // cmd.exe interprets its /c argument. Reject shell expansion and syntax
-    // characters in every configured piece before quoting it.
-    fn quoted(value: &str) -> Result<String, String> {
-        if value.chars().any(|ch| matches!(ch, '"' | '&' | '|' | '<' | '>' | '^' | '%' | '!' | '\r' | '\n' | '\0')) {
-            return Err("unsafe MCP batch command or argument".into());
-        }
-        Ok(format!("\"{value}\""))
-    }
-    if program.is_empty() { return Err("empty MCP command".into()); }
-    let mut line = format!("\"{}", quoted(&executable.to_string_lossy())?);
-    for arg in args {
-        line.push(' ');
-        line.push_str(&quoted(arg)?);
-    }
-    line.push('"');
-    let system_root = std::env::var_os("SystemRoot").ok_or("Windows system root unavailable")?;
-    let cmd_path = Path::new(&system_root).join("System32").join("cmd.exe");
-    if !cmd_path.is_file() { return Err("Windows command processor unavailable".into()); }
-    let mut command = Command::new(cmd_path);
-    command.args(["/d", "/s", "/c"]);
-    command.raw_arg(line);
-    Ok(command)
-}
-
-#[cfg(not(windows))]
-fn original_command(program: &str, args: &[String]) -> Result<Command, String> {
-    let mut command = Command::new(program);
-    command.args(args);
-    Ok(command)
+fn original_command(program: &str, args: &[String], environment: &std::collections::BTreeMap<String, String>) -> Result<Command, String> {
+    mcp_command::command_with_env(program, args, environment)
 }
 
 #[cfg(test)]

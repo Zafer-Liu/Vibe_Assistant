@@ -376,6 +376,49 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
     }
   }
 
+  /** 一键“卸载重装”观测：先还原直连配置，再以最新入口与观测组件重建 assignment。 */
+  async function repairObservation(name: string, agent: string) {
+    setBusyObservation(`${name}:${agent === 'codex_desktop' ? 'codex_cli' : agent}`)
+    setObservationNotice(null)
+    try {
+      await setMcpObservation(name, agent, false)
+      const result = await setMcpObservation(name, agent, true)
+      const healthy = ['awaiting_connection', 'observing'].includes(result.state)
+      setObservationNotice({
+        tone: healthy ? 'success' : 'warning',
+        message: healthy
+          ? t('mcpLibrary.observationRepairedNotice', { agent: targetOf(agent)?.label ?? agent })
+          : t('mcpLibrary.observationIncomplete', { state: t(`mcpLibrary.observationState.${result.state}`) }),
+      })
+    } catch (error) {
+      setObservationNotice({ tone: 'error', message: t('mcpLibrary.observationFailed', { error: String(error) }) })
+    } finally {
+      setBusyObservation(null)
+      await loadMcpObservationStatuses().catch(() => {})
+    }
+  }
+
+  async function reconfigureAfterArgumentError(entry: McpCatalogEntry) {
+    setConfigBusy(true)
+    setObservationNotice(null)
+    try {
+      // Automatic recovery may have completed since the last poll. Disabling
+      // an already direct target is idempotent; retry remaining managed ones.
+      const observedAgents = [...new Set(mcpObservationStatuses
+        .filter(status => status.name === entry.name && !['off', 'unsupported', 'configuration_required'].includes(status.state))
+        .map(status => status.agent))]
+      for (const agent of observedAgents) await setMcpObservation(entry.name, agent, false)
+      setEditing(entry)
+      setAddOpen(true)
+    } catch (error) {
+      setObservationNotice({ tone: 'error', message: t('mcpLibrary.observationFailed', { error: String(error) }) })
+    } finally {
+      setConfigBusy(false)
+      await loadMcpObservationStatuses().catch(() => {})
+      await checkMcpStatuses().catch(() => {})
+    }
+  }
+
   async function toggleDshObservation(enabled: boolean) {
     setBusyDshObservation(true)
     setObservationNotice(null)
@@ -770,6 +813,8 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
           <div className="app-card-grid">
             {visible.map((entry) => {
               const isRemote = entry.transport === 'sse' || entry.transport === 'http'
+              const configurationNeedsAttention = !mcpObservationError && mcpObservationStatuses.some(status => status.name === entry.name && ['configuration_required', 'configuration_error'].includes(status.state))
+              const configurationStopPending = mcpObservationStatuses.some(status => status.name === entry.name && status.state === 'configuration_error')
               return (
                 <article key={entry.name} className="rounded-xl border border-gray-200 bg-white p-4 transition hover:border-violet-300 dark:border-gray-700 dark:bg-gray-900 dark:hover:border-violet-500/40">
                   <div className="flex items-start gap-3">
@@ -833,9 +878,16 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
                           const state = mcpObservationError ? undefined : observation?.state === 'observing' && observation.active_connections === 0 ? 'awaiting_connection' : observation?.state
                           const pluginObserved = target.id === 'dsh'
                           const pluginState = t(dshObservationEnabled ? 'mcpLibrary.dshPluginOn' : 'mcpLibrary.dshPluginOff')
-                          return <span key={target.id} className={pluginObserved ? (dshObservationEnabled ? 'text-emerald-700 dark:text-emerald-300' : 'text-gray-500 dark:text-gray-400') : state === 'drifted' || state === 'recovery' || state === 'fallback' ? 'text-amber-700 dark:text-amber-300' : state === 'observing' ? 'text-emerald-700 dark:text-emerald-300' : 'text-gray-500 dark:text-gray-400'}>
+                          return <span key={target.id} className={pluginObserved ? (dshObservationEnabled ? 'text-emerald-700 dark:text-emerald-300' : 'text-gray-500 dark:text-gray-400') : state === 'drifted' || state === 'recovery' || state === 'fallback' || state === 'configuration_required' || state === 'configuration_error' ? 'text-amber-700 dark:text-amber-300' : state === 'observing' ? 'text-emerald-700 dark:text-emerald-300' : 'text-gray-500 dark:text-gray-400'}>
                             {target.label} · {pluginObserved ? t('mcpLibrary.dshPluginInline', { state: pluginState }) : state ? t(`mcpLibrary.observationState.${state}`) : t('mcpLibrary.observationUnavailable')}
+                            {!pluginObserved && (state === 'observing' || state === 'awaiting_connection' || state === 'fallback') && (observation?.pending_probe_connections ?? 0) > 0 && (
+                              <span className="text-amber-700 dark:text-amber-300" title={t('mcpLibrary.probePendingTitle', { count: observation?.pending_probe_connections, version: observation?.probe_version ?? '' })}> · {t('mcpLibrary.probeUpdatedHint')}</span>
+                            )}
+                            {!pluginObserved && (state === 'observing' || state === 'awaiting_connection' || state === 'fallback') && observation?.probe_update_error && (
+                              <span className="text-gray-500 dark:text-gray-400" title={observation.probe_update_error}> · {t('mcpLibrary.probeUpdateDeferred')}</span>
+                            )}
                             {!pluginObserved && state === 'drifted' && <button type="button" disabled={busyObservation !== null || loading || configBusy || !!mcpObservationError} onClick={() => { void toggleObservation(entry.name, target.id, true) }} className="ml-1 rounded border border-amber-400 px-1.5 text-amber-800 disabled:opacity-50 dark:text-amber-300">{t('mcpLibrary.observationRetry')}</button>}
+                            {!pluginObserved && state === 'fallback' && <button type="button" disabled={busyObservation !== null || loading || configBusy || !!mcpObservationError} onClick={() => { void repairObservation(entry.name, target.id) }} title={t('mcpLibrary.observationRepairHint')} className="ml-1 rounded border border-amber-400 px-1.5 text-amber-800 disabled:opacity-50 dark:text-amber-300">{t('mcpLibrary.observationRepair')}</button>}
                           </span>
                         })}
                         <button type="button" onClick={() => setExpandedObservations(current => current.includes(entry.name) ? current.filter(name => name !== entry.name) : [...current, entry.name])} aria-expanded={expandedObservations.includes(entry.name)} className="ml-auto text-violet-700 dark:text-violet-300">{t(expandedObservations.includes(entry.name) ? 'mcpLibrary.observationCollapse' : 'mcpLibrary.observationManage')}</button>
@@ -845,7 +897,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
                           {TARGETS.filter(target => entry.assigned_agents.includes(target.id)).map(target => {
                             const observation = mcpObservationError ? undefined : observationOf(entry.name, target.id)
                             const state = observation?.state === 'observing' && observation.active_connections === 0 ? 'awaiting_connection' : observation?.state
-                            const enabled = state !== undefined && state !== 'off' && state !== 'unsupported'
+                            const enabled = state !== undefined && !['off', 'unsupported', 'configuration_required'].includes(state)
                             const busy = busyObservation === `${entry.name}:${target.id === 'codex_desktop' ? 'codex_cli' : target.id}`
                             if (target.id === 'dsh') {
                               return (
@@ -872,7 +924,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
                                   />
                                   {t('mcpLibrary.observationToggle')}
                                 </label>
-                                <span className={state === 'observing' ? 'text-emerald-700 dark:text-emerald-300' : state === 'drifted' || state === 'recovery' || state === 'fallback' ? 'text-amber-700 dark:text-amber-300' : 'text-gray-500 dark:text-gray-400'}>
+                                <span className={state === 'observing' ? 'text-emerald-700 dark:text-emerald-300' : state === 'drifted' || state === 'recovery' || state === 'fallback' || state === 'configuration_required' || state === 'configuration_error' ? 'text-amber-700 dark:text-amber-300' : 'text-gray-500 dark:text-gray-400'}>
                                   {state ? t(`mcpLibrary.observationState.${state}`) : t('mcpLibrary.observationUnavailable')}
                                 </span>
                                 {observation && observation.active_connections > 0 && <span className="text-gray-500 dark:text-gray-400">{t('mcpLibrary.observationConnections', { count: observation.active_connections })}</span>}
@@ -884,6 +936,13 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
                       </div>}
                     </div>
                   )}
+                  {configurationNeedsAttention && <div role="status" className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">
+                    <p className="min-w-0 flex-1 leading-5">{t(configurationStopPending ? 'mcpLibrary.argumentConfigurationPending' : 'mcpLibrary.argumentConfigurationRequired')}</p>
+                    <button type="button" onClick={() => { void reconfigureAfterArgumentError(entry) }} disabled={loading || configBusy || busyObservation !== null}
+                      className="shrink-0 rounded-md border border-amber-400 px-2.5 py-1.5 font-medium transition hover:bg-amber-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-amber-600 disabled:opacity-50 dark:border-amber-500/40 dark:hover:bg-amber-500/15">
+                      {t('mcpLibrary.reconfigureArguments')}
+                    </button>
+                  </div>}
                   {/* actions */}
                   <div className="mt-3 flex items-center gap-1.5">
                     <button type="button" onClick={() => setExpandedAssignments(current => current.includes(entry.name) ? current.filter(name => name !== entry.name) : [...current, entry.name])}
@@ -898,7 +957,7 @@ export const McpLibrary = memo(function McpLibrary({ active = true, section = 's
                     <button onClick={() => { setToolService(entry.name); onSectionChange?.('tools'); void discoverTools(entry) }} disabled={loading || configBusy} className="inline-flex items-center gap-1 rounded-md border border-gray-300 px-2 py-1 text-[11px] font-medium text-gray-600 transition hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800">
                       <Activity size={11} />{t('mcpLibrary.discoverTools')}
                     </button>
-                    <button onClick={() => { setEditing(entry); setAddOpen(true) }} disabled={loading || configBusy} className="inline-flex items-center gap-1 rounded-md border border-gray-300 px-2 py-1 text-[11px] font-medium text-gray-600 transition hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800">
+                    <button onClick={() => { if (configurationNeedsAttention) void reconfigureAfterArgumentError(entry); else { setEditing(entry); setAddOpen(true) } }} disabled={loading || configBusy} className="inline-flex items-center gap-1 rounded-md border border-gray-300 px-2 py-1 text-[11px] font-medium text-gray-600 transition hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800">
                       <Pencil size={11} />{t('mcpLibrary.edit')}
                     </button>
                     <button onClick={() => { void handleDelete(entry) }} disabled={loading || configBusy} className="ml-auto inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium text-gray-500 transition hover:text-red-600 dark:hover:text-red-400 disabled:opacity-50">

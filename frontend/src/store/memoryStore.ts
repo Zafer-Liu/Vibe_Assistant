@@ -9,8 +9,64 @@ import type { MemoryInjectionLog, MemoryInjectionStats } from '../types/memoryIn
 import { jsonEqual } from '../lib/stateEquality'
 import { requestMemory as request } from '../api/memory'
 import { useTelemetryStore } from './telemetryStore'
+import { timeStartupPhase } from '../lib/startupPerformance'
 
 export const GLOBAL_USER_ID = 'agent-manager'
+
+export type MemoryLoadStatus = 'idle' | 'loading' | 'ready' | 'error'
+interface MemoryLoadState {
+  inventory: MemoryLoadStatus
+  domains: MemoryLoadStatus
+  importance: MemoryLoadStatus
+  l2: MemoryLoadStatus
+  l3: MemoryLoadStatus
+}
+
+/** Share reads, but queue a new snapshot if a write invalidates an active read. */
+function createMemoryRequest<T>(load: (isCurrent: () => boolean) => Promise<T>) {
+  let revision = 0
+  let pending: Promise<T> | null = null
+  return {
+    invalidate() { revision += 1 },
+    run(refresh = false): Promise<T> {
+      if (pending) {
+        if (refresh) revision += 1
+        return pending
+      }
+      revision += 1
+      pending = Promise.resolve().then(async () => {
+        for (;;) {
+          const observed = revision
+          const isCurrent = () => observed === revision
+          try {
+            const result = await load(isCurrent)
+            if (isCurrent()) {
+              // Clear in the same turn as the revision check so a late force
+              // cannot join an already-finished snapshot before finally runs.
+              pending = null
+              return result
+            }
+          } catch (error) {
+            if (isCurrent()) {
+              pending = null
+              throw error
+            }
+          }
+        }
+      })
+      return pending
+    },
+  }
+}
+
+function withMemoryDomains(memories: MemoryItem[], domains: MemoryDomainItem[], links: Record<string, string[]>) {
+  const index = new Map(domains.map((domain) => [domain.id, domain]))
+  const enriched = memories.map((memory) => {
+    const attached = (links[memory.id] ?? []).map((id) => index.get(id)).filter((domain): domain is MemoryDomainItem => Boolean(domain))
+    return jsonEqual(memory.domains ?? [], attached) ? memory : { ...memory, domains: attached }
+  })
+  return enriched.every((memory, position) => memory === memories[position]) ? memories : enriched
+}
 
 interface MemoryStore {
   /** 内置记忆引擎在线状态 */
@@ -43,7 +99,9 @@ interface MemoryStore {
   l2Documents: MemoryLayerDocument[]
   l3Documents: MemoryLayerDocument[]
   localMemoryStats: LocalMemoryStats | null
+  /** Base SQLite inventory is usable, independently of optional enrichment. */
   memoryCacheReady: boolean
+  memoryLoadState: MemoryLoadState
   memories: MemoryItem[]
   memoryDomains: MemoryDomainItem[]
   selectedMemoryDomainId: string
@@ -73,7 +131,7 @@ interface MemoryStore {
   loadAgentSources: () => Promise<void>
   setAgentSourceOverride: (id: string, transcriptRoots?: string[] | null, configHome?: string | null) => Promise<AgentSourceInfo>
   setAgentSourceScanEnabled: (id: string, enabled: boolean) => Promise<AgentSourceInfo>
-  loadMemoryLayers: () => Promise<void>
+  loadMemoryLayers: (force?: boolean) => Promise<void>
   consolidateShortTermMemory: () => Promise<MemoryLayerRunResult>
   draftLongTermProfile: () => Promise<MemoryLayerRunResult>
   publishLongTermProfile: (documentId: string, content?: string) => Promise<MemoryLayerDocument>
@@ -85,7 +143,7 @@ interface MemoryStore {
   addUserMemory: (content: string, memoryType: string, scope: 'l2' | 'l3') => Promise<MemoryItem>
   search: (query: string, topK: number) => Promise<MemoryItem[]>
   listMemories: (force?: boolean) => Promise<void>
-  loadMemoryDomains: () => Promise<MemoryDomainItem[]>
+  loadMemoryDomains: (force?: boolean) => Promise<MemoryDomainItem[]>
   setSelectedMemoryDomain: (domainId: string) => Promise<void>
   resetL1ForReextraction: () => Promise<L1ResetResult>
   updateMemory: (id: string, content: string) => Promise<void>
@@ -96,7 +154,109 @@ interface MemoryStore {
   setMemoryPinned: (memoryId: string, pinned: boolean) => Promise<void>
 }
 
-export const useMemoryStore = create<MemoryStore>((set, get) => ({
+export const useMemoryStore = create<MemoryStore>((set, get) => {
+  let domainLinks: Record<string, string[]> = {}
+  const setLoadState = (patch: Partial<MemoryLoadState>) => set((state) => ({
+    memoryLoadState: { ...state.memoryLoadState, ...patch },
+  }))
+  const domainsRequest = createMemoryRequest(async (isCurrent) => {
+    setLoadState({ domains: 'loading' })
+    try {
+      const [domains, links] = await timeStartupPhase('memory_domains', () => Promise.all([
+        invoke<MemoryDomainItem[]>('memory_domain_list'),
+        invoke<Record<string, string[]>>('memory_domain_links_map'),
+      ]))
+      if (isCurrent()) {
+        domainLinks = links
+        set((state) => ({
+          memoryDomains: jsonEqual(state.memoryDomains, domains) ? state.memoryDomains : domains,
+          memories: withMemoryDomains(state.memories, domains, links),
+          memoryLoadState: { ...state.memoryLoadState, domains: 'ready' },
+        }))
+      }
+      return domains
+    } catch {
+      if (isCurrent()) setLoadState({ domains: 'error' })
+      return get().memoryDomains
+    }
+  })
+  const createLayerRequest = (layer: 'l2' | 'l3') => createMemoryRequest(async (isCurrent) => {
+    setLoadState({ [layer]: 'loading' })
+    try {
+      const documents = await timeStartupPhase(layer === 'l2' ? 'memory_l2' : 'memory_l3', () =>
+        invoke<MemoryLayerDocument[]>('memory_layer_documents', { layer }))
+      if (isCurrent()) set((state) => ({
+        ...(layer === 'l2' ? { l2Documents: documents } : { l3Documents: documents }),
+        memoryLoadState: { ...state.memoryLoadState, [layer]: 'ready' },
+      }))
+    } catch (error) {
+      if (isCurrent()) setLoadState({ [layer]: 'error' })
+      throw error
+    }
+  })
+  const l2Request = createLayerRequest('l2')
+  const l3Request = createLayerRequest('l3')
+  const runSearch = async (query: string, topK: number, isCurrent = () => true) => {
+    set({ loading: true, lastSearchQuery: query })
+    try {
+      const results = await searchMemoriesWithBge(query, get().memories, topK)
+      if (isCurrent() && get().lastSearchQuery === query) set({ lastSearchResults: results })
+      return results
+    } finally {
+      set({ loading: false })
+    }
+  }
+  const inventoryRequest = createMemoryRequest(async (isCurrent) => {
+    setLoadState({ inventory: 'loading', importance: 'loading' })
+    // SQLite is authoritative. Publish it before optional metadata/importance;
+    // the semantic sidecar is used for retrieval, never inventory reconciliation.
+    const inventory = timeStartupPhase('memory_l1', () => invoke<MemoryItem[]>('local_memory_list_all'))
+      .then((items) => {
+        if (!isCurrent()) return []
+        const memories = withMemoryDomains(items.map((item) => ({
+          ...item, retrieval_source: 'local' as const, retrieval_method: 'local' as const,
+        })), get().memoryDomains, domainLinks)
+        set((state) => ({
+          memories,
+          memoryCacheReady: true,
+          memoryLoadState: { ...state.memoryLoadState, inventory: 'ready' },
+        }))
+        return memories
+      }).catch((error) => {
+        if (isCurrent()) setLoadState({ inventory: 'error' })
+        throw error
+      })
+    const stats = timeStartupPhase('memory_stats', () => invoke<LocalMemoryStats>('local_memory_stats'))
+      .then((localMemoryStats) => { if (isCurrent()) set({ localMemoryStats }) })
+    const domains = domainsRequest.run(true)
+    const importance = inventory.then(async (memories) => {
+      if (!isCurrent()) return
+      const records = await timeStartupPhase('memory_importance', () =>
+        invoke<MemoryImportance[]>('memory_importance_list', { memoryIds: memories.map((memory) => memory.id) }))
+      if (isCurrent()) set((state) => ({
+        importance: Object.fromEntries(records.map((record) => [record.memory_id, record])),
+        memoryLoadState: { ...state.memoryLoadState, importance: 'ready' },
+      }))
+    }).catch((error) => {
+      if (isCurrent()) setLoadState({ importance: 'error' })
+      throw error
+    })
+    const completion = Promise.allSettled([inventory, importance, domains, stats]).then(async (results) => {
+      if (!isCurrent()) return
+      // Preserve the existing search reconciliation after inventory/tag refresh.
+      if (results[0].status === 'fulfilled' && get().lastSearchQuery.trim()) {
+        await runSearch(get().lastSearchQuery, 10, isCurrent).catch(() => [])
+      }
+      if (!isCurrent()) return
+      return results.slice(0, 2).find((result) => result.status === 'rejected')
+    })
+    // Coalesce the base read only: a post-mutation snapshot must not queue
+    // behind a previous snapshot's slower optional enrichment.
+    await inventory
+    return { completion }
+  })
+
+  return {
   engineOnline: null,
 
   engineStatus: null,
@@ -132,6 +292,8 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
   localMemoryStats: null,
 
   memoryCacheReady: false,
+
+  memoryLoadState: { inventory: 'idle', domains: 'idle', importance: 'idle', l2: 'idle', l3: 'idle' },
 
   memories: [],
   memoryDomains: [],
@@ -279,43 +441,41 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
     return info
   },
 
-  async loadMemoryLayers() {
-    const [l2, l3] = await Promise.all([
-      invoke<MemoryLayerDocument[]>('memory_layer_documents', { layer: 'l2' }),
-      invoke<MemoryLayerDocument[]>('memory_layer_documents', { layer: 'l3' }),
-    ])
-    set({ l2Documents: l2, l3Documents: l3 })
+  async loadMemoryLayers(force = false) {
+    const results = await Promise.allSettled([l2Request.run(force), l3Request.run(force)])
+    const failure = results.find((result) => result.status === 'rejected')
+    if (failure?.status === 'rejected') throw failure.reason
   },
 
   async consolidateShortTermMemory() {
     const result = await invoke<MemoryLayerRunResult>('memory_short_term_consolidate', { days: 30 })
     // Layer regeneration does not own user-defined L1 rows. Refresh both views
     // so older custom memories remain visible even after a large L1 rebuild.
-    await Promise.all([get().loadMemoryLayers(), get().listMemories(true)])
+    await Promise.all([get().loadMemoryLayers(true), get().listMemories(true)])
     return result
   },
 
   async draftLongTermProfile() {
     const result = await invoke<MemoryLayerRunResult>('memory_long_term_profile_draft')
-    await Promise.all([get().loadMemoryLayers(), get().listMemories(true)])
+    await Promise.all([get().loadMemoryLayers(true), get().listMemories(true)])
     return result
   },
 
   async publishLongTermProfile(documentId, content) {
     const document = await invoke<MemoryLayerDocument>('memory_long_term_profile_publish', { documentId, content: content ?? null })
-    await get().loadMemoryLayers()
+    await get().loadMemoryLayers(true)
     return document
   },
 
   async updatePublishedMemoryDocument(documentId, content) {
     const document = await invoke<MemoryLayerDocument>('memory_layer_document_update', { documentId, content })
-    await get().loadMemoryLayers()
+    await get().loadMemoryLayers(true)
     return document
   },
 
   async deleteLongTermProfileDraft(documentId) {
     await invoke('memory_long_term_profile_delete_draft', { documentId })
-    await get().loadMemoryLayers()
+    await get().loadMemoryLayers(true)
   },
 
   async checkEngine() {
@@ -379,68 +539,20 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
   },
 
   async search(query, topK) {
-    set({ loading: true, lastSearchQuery: query })
-    try {
-      const results = await searchMemoriesWithBge(query, get().memories, topK)
-      set({ lastSearchResults: results })
-      return results
-    } finally {
-      set({ loading: false })
-    }
+    return runSearch(query, topK)
   },
 
   async listMemories(force = false) {
-    // Switching pages in the same app session should be instant.  A manual
-    // refresh or a write operation supplies `true` to reconcile the cache.
-    if (!force && get().memoryCacheReady) return
-    set({ loading: true })
-    try {
-      const [extracted, stats, domains, domainLinks] = await Promise.allSettled([
-        invoke<MemoryItem[]>('local_memory_list_all'),
-        invoke<LocalMemoryStats>('local_memory_stats'),
-        invoke<MemoryDomainItem[]>('memory_domain_list'),
-        invoke<Record<string, string[]>>('memory_domain_links_map'),
-      ])
-      if (extracted.status === 'rejected') throw extracted.reason
-      const localMemories = extracted.status === 'fulfilled'
-        ? extracted.value.map((item) => ({ ...item, retrieval_source: 'local' as const, retrieval_method: 'local' as const }))
-        : []
-      const domainIndex = new Map<string, MemoryDomainItem>()
-      for (const domain of domains.status === 'fulfilled' ? domains.value : []) {
-        domainIndex.set(domain.id, domain)
-      }
-      const linksByMemory = domainLinks.status === 'fulfilled' ? domainLinks.value : {}
-      // SQLite L1 is authoritative. The optional sidecar may temporarily
-      // retain old embeddings after a deliberate rebuild, so it is used for
-      // retrieval only and never rendered as an independent memory inventory.
-      const memories = localMemories.map((memory) => {
-        const ids = linksByMemory[memory.id] ?? []
-        return { ...memory, domains: ids.map((id) => domainIndex.get(id)).filter(Boolean) as MemoryDomainItem[] }
-      })
-      const records = await invoke<MemoryImportance[]>('memory_importance_list', { memoryIds: memories.map((memory) => memory.id) })
-      set({
-        memories,
-        memoryDomains: domains.status === 'fulfilled' ? domains.value : get().memoryDomains,
-        importance: Object.fromEntries(records.map((record) => [record.memory_id, record])),
-        localMemoryStats: stats.status === 'fulfilled' ? stats.value : get().localMemoryStats,
-        memoryCacheReady: true,
-      })
-      if (get().lastSearchQuery.trim()) {
-        await get().search(get().lastSearchQuery, 10).catch(() => [])
-      }
-    } finally {
-      set({ loading: false })
-    }
+    // Normal reentry uses the base cache; active reads share one promise. A
+    // forced refresh must still invalidate an older snapshot after a mutation.
+    if (!force && get().memoryCacheReady && get().memoryLoadState.inventory !== 'loading') return
+    const snapshot = await inventoryRequest.run(force)
+    const failure = await snapshot.completion
+    if (failure?.status === 'rejected') throw failure.reason
   },
 
-  async loadMemoryDomains() {
-    try {
-      const domains = await invoke<MemoryDomainItem[]>('memory_domain_list')
-      set((state) => jsonEqual(state.memoryDomains, domains) ? state : { memoryDomains: domains })
-      return domains
-    } catch {
-      return get().memoryDomains
-    }
+  async loadMemoryDomains(force = false) {
+    return domainsRequest.run(force)
   },
 
   async setSelectedMemoryDomain(domainId) {
@@ -451,7 +563,17 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
 
   async resetL1ForReextraction() {
     const result = await invoke<L1ResetResult>('local_memory_reset_for_reextraction')
-    set({ memories: [], importance: {}, localMemoryStats: { total: 0, facts: 0, preferences: 0, session_only: 0, short_term: 0, long_term: 0 }, l2Documents: [], l3Documents: [], memoryCacheReady: true })
+    inventoryRequest.invalidate()
+    domainsRequest.invalidate()
+    l2Request.invalidate()
+    l3Request.invalidate()
+    domainLinks = {}
+    set((state) => ({
+      memories: [], importance: {},
+      localMemoryStats: { total: 0, facts: 0, preferences: 0, session_only: 0, short_term: 0, long_term: 0 },
+      l2Documents: [], l3Documents: [], memoryCacheReady: true,
+      memoryLoadState: { ...state.memoryLoadState, inventory: 'ready', importance: 'ready', l2: 'ready', l3: 'ready' },
+    }))
     await useTelemetryStore.getState().checkTelemetry()
     return result
   },
@@ -490,7 +612,8 @@ export const useMemoryStore = create<MemoryStore>((set, get) => ({
     await invoke('memory_importance_set_pinned', { memoryId, pinned })
     await get().listMemories(true)
   }
-}))
+  }
+})
 
 /** Subscribe only to fields owned by this feature. */
 export function useMemoryFields<const K extends keyof MemoryStore>(...keys: K[]): Pick<MemoryStore, K> {

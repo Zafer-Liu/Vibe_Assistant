@@ -16,7 +16,11 @@ mod llm_trace;
 mod model_registry;
 pub(crate) mod model_sync;
 mod mcp;
+mod mcp_command;
 mod mcp_fallback_resolver;
+mod mcp_probe_protocol;
+mod mcp_probe_connections;
+mod mcp_probe_updater;
 #[path = "../mcp-launcher/src/installation.rs"]
 mod mcp_launcher_installation;
 mod mcp_registry;
@@ -55,18 +59,23 @@ use updater::*;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    startup::begin();
     tauri::Builder::default()
         .manage(startup::parse_options(std::env::args()))
         .manage(desktop_lifecycle::DesktopLifecycle::default())
         .manage(memory_backend::MemoryBackend::new())
         .manage(memory_ingest::IngestStore::new())
-        .manage(telemetry_store::TelemetryStore::new().expect("initialize telemetry store"))
+        .manage({
+            let _phase = startup::phase("database.initialize");
+            telemetry_store::TelemetryStore::new().expect("initialize telemetry store")
+        })
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_dialog::init())
         .on_window_event(desktop_lifecycle::on_window_event)
         .setup(|_app| {
+            let _phase = startup::phase("native.setup");
             desktop_lifecycle::setup(_app.handle());
             // Local memory context, capture hooks and usage telemetry share port 9420.
             let store = agent_http::init_store();
@@ -89,40 +98,74 @@ pub fn run() {
                 .inner()
                 .clone();
             telemetry_store::init_shared(telemetry);
-            // Populate local indexes after the window can paint.  These jobs
-            // are idempotent and write their result to SQLite, so opening a
-            // memory page never needs to re-walk agent directories.
+            // Publish this build's memory runtime without changing any client
+            // binding or waiting for the MCP management page to be opened.
+            tauri::async_runtime::spawn_blocking(|| {
+                if memory_mcp::server_executable().is_err() {
+                    eprintln!("[memory-mcp] runtime publication failed; existing runtime retained");
+                }
+            });
+            mcp_probe_updater::start(_app.handle().clone());
+            // The frontend acknowledges a painted shell. Heavy maintenance
+            // waits for that acknowledgement (with a bounded tray-mode fallback).
             let startup_handle = _app.handle().clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                let _ = skill_registry::skill_list_impl();
-                let _ = memory_ingest::telemetry_backfill_conversations();
-                if let Some(store) = telemetry_store::shared_store() {
-                    let _ = store.refresh_transcript_usage();
-                    // PRD 一期：models.dev 目录每日同步 + 历史成本回填
-                    //（只补 pricing_source IS NULL 的行，分批不锁库）。
-                    if crate::provider_store::catalog_sync_needed(&store) {
-                        let synced =
-                            crate::provider_catalog::fetch_models_dev()
-                                .ok()
-                                .and_then(|rows| {
-                                    store.conn.lock().ok().and_then(|conn| {
-                                        crate::provider_catalog::apply_model_catalog_impl(
-                                            &conn, &rows,
-                                        )
-                                        .ok()
-                                    })
-                                });
-                        if synced.is_some() && store.invalidate_catalog_prices().is_ok() {
-                            crate::provider_store::mark_catalog_synced(&store);
+            tauri::async_runtime::spawn(async move {
+                startup::wait_for_frontend_ready().await;
+                tokio::time::sleep(startup::MAINTENANCE_GRACE).await;
+                let local_handle = startup_handle.clone();
+                let local = tauri::async_runtime::spawn_blocking(move || {
+                    {
+                        let _phase = startup::phase("maintenance.skills");
+                        if skill_registry::skill_list_impl().is_err() {
+                            eprintln!("[startup-perf] phase=maintenance.skills status=failed");
                         }
                     }
-                    let _ = store.recalculate_costs(false);
-                    // 启动时抓一次 HTTP 配额（magpie/直连端点），带 1 分钟
-                    // 节流，重复启动不会打爆供应商端点。
+                    {
+                        let _phase = startup::phase("maintenance.conversations");
+                        if memory_ingest::telemetry_backfill_conversations().is_err() {
+                            eprintln!("[startup-perf] phase=maintenance.conversations status=failed");
+                        }
+                    }
+                    let _ = local_handle.emit("telemetry-updated", ());
+                    if let Some(store) = telemetry_store::shared_store() {
+                        let _phase = startup::phase("maintenance.usage");
+                        if store.refresh_transcript_usage().is_err() {
+                            eprintln!("[startup-perf] phase=maintenance.usage status=failed");
+                        }
+                    }
+                    // Local results must not wait for an external catalog or
+                    // the complete pending-cost backlog before becoming visible.
+                    let _ = local_handle.emit("telemetry-updated", ());
+                }).await;
+                startup::mark_initial_usage_ready();
+                if local.is_err() {
+                    eprintln!("[startup-perf] phase=maintenance.local status=failed");
                 }
-                // The startup rebuild races the frontend's first read; ping
-                // the frontend so an open usage page re-queries the ledger.
-                let _ = startup_handle.emit("telemetry-updated", ());
+
+                tokio::time::sleep(startup::MAINTENANCE_GRACE).await;
+                let catalog = tauri::async_runtime::spawn_blocking(move || {
+                    if let Some(store) = telemetry_store::shared_store() {
+                        {
+                            let _phase = startup::phase("maintenance.catalog");
+                            if crate::provider_store::catalog_sync_needed(&store) {
+                                let synced = crate::provider_catalog::fetch_models_dev().ok().and_then(|rows| {
+                                    store.conn.lock().ok().and_then(|conn| {
+                                        crate::provider_catalog::apply_model_catalog_impl(&conn, &rows).ok()
+                                    })
+                                });
+                                if synced.is_some() && store.invalidate_catalog_prices().is_ok() {
+                                    crate::provider_store::mark_catalog_synced(&store);
+                                }
+                            }
+                        }
+                        let _phase = startup::phase("maintenance.repricing");
+                        let _ = store.recalculate_costs(false);
+                    }
+                    let _ = startup_handle.emit("telemetry-updated", ());
+                }).await;
+                if catalog.is_err() {
+                    eprintln!("[startup-perf] phase=maintenance.catalog_job status=failed");
+                }
             });
             let ingest2 = ingest.clone();
             // 静默会话节流巡检
@@ -330,6 +373,7 @@ pub fn run() {
             env_manager::env_var_set,
             env_manager::env_var_delete,
             startup::get_startup_options,
+            startup::startup_frontend_ready,
             desktop_lifecycle::desktop_preferences_get,
             desktop_lifecycle::desktop_preferences_set,
             desktop_lifecycle::desktop_close_resolve,
@@ -355,4 +399,17 @@ pub fn run_memory_mcp_stdio() -> Result<(), String> {
 /// Standalone transport relay used by an Agent's existing stdio MCP entry.
 pub fn run_mcp_stdio_relay(assignment_id: &str) -> Result<(), String> {
     mcp_stdio_relay::run_stdio(assignment_id)
+}
+
+/// Content-free compatibility information used before publishing a relay.
+pub fn mcp_probe_info_json(build_sequence: &str) -> Result<String, String> {
+    let info = mcp_probe_protocol::ProbeInfo {
+        schema: mcp_probe_protocol::PROBE_SCHEMA,
+        launcher_abi: mcp_probe_protocol::LAUNCHER_ABI,
+        generation_resolution: 1,
+        version: env!("CARGO_PKG_VERSION").into(),
+        build_sequence: build_sequence.parse().map_err(|_| "probe_build_sequence_invalid")?,
+    };
+    if !info.compatible() { return Err("probe_build_metadata_missing".into()); }
+    serde_json::to_string(&info).map_err(|_| "probe_info_serialization_failed".into())
 }

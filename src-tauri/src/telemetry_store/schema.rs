@@ -1,6 +1,10 @@
 //! SQLite initialization and idempotent schema migrations.
 use rusqlite::Connection;
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+static VERIFIED_WRITE_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 pub(super) fn open_database() -> Result<Connection, String> {
     let dir = dirs_next::config_dir()
@@ -10,14 +14,19 @@ pub(super) fn open_database() -> Result<Connection, String> {
     let path = dir.join("telemetry.sqlite3");
     let conn = Connection::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     ensure_writable_connection(&conn, &path)?;
-    // Probe write access up front with a real page allocation: acquiring the
-    // write lock alone also succeeds when the process is confined to writing
-    // inside a sandbox, so a lock check would let the failure surface later as
-    // the much vaguer "attempt to write a readonly database".
-    // Concurrent writers (e.g. an MCP relay) may hold the write lock, so wait
-    // for it and retry the probe.
     conn.pragma_update(None, "busy_timeout", 8000)
         .map_err(|e| format!("set busy_timeout on {}: {e}", path.display()))?;
+    probe_write_access(&conn, &path)?;
+    initialize_database(conn).map_err(|e| format!("initialize schema in {}: {e}", path.display()))
+}
+
+fn probe_write_access(conn: &Connection, path: &Path) -> Result<(), String> {
+    // Keep the real write probe for sandbox/security-software diagnosis, once
+    // per process/path. Ordinary context reads must not repeat probe DDL.
+    let mut verified = VERIFIED_WRITE_PATHS.get_or_init(|| Mutex::new(HashSet::new()))
+        .lock().map_err(|_| "database write-probe cache poisoned".to_string())?;
+    if verified.contains(path) { return Ok(()); }
+    let _phase = crate::startup::phase("database.write_probe");
     let mut last_err = None;
     for attempt in 0..3 {
         let probe = conn.execute_batch(
@@ -45,7 +54,8 @@ pub(super) fn open_database() -> Result<Connection, String> {
     if let Some(e) = last_err {
         return Err(format!("{} is not writable: {e} ({e:?})", path.display()));
     }
-    initialize_database(conn).map_err(|e| format!("initialize schema in {}: {e}", path.display()))
+    verified.insert(path.to_path_buf());
+    Ok(())
 }
 
 fn ensure_writable_connection(conn: &Connection, path: &std::path::Path) -> Result<(), String> {
@@ -141,7 +151,8 @@ mod tests {
     fn classification_upgrade_replays_clean_objects_only_once() {
         let conn = initialize_database(Connection::open_in_memory().unwrap()).unwrap();
         conn.execute_batch(
-            "DELETE FROM app_settings WHERE setting_key = 'cloud_classification_replay_v1';
+            "PRAGMA user_version=0;
+             DELETE FROM app_settings WHERE setting_key = 'cloud_classification_replay_v1';
              INSERT INTO app_settings (setting_key, value_json, updated_at)
              VALUES ('cloud_vault.pull_cursor', '42', datetime('now'));
              INSERT INTO cloud_sync_meta (object_key, revision, content_hash, sync_state, updated_at) VALUES
@@ -176,6 +187,54 @@ mod tests {
     }
 
     #[test]
+    fn current_schema_opens_without_repeating_historical_timestamp_repair() {
+        let conn = initialize_database(Connection::open_in_memory().unwrap()).unwrap();
+        conn.execute(
+            "INSERT INTO usage_records (record_id, source, session_id, occurred_at, record_kind, origin)
+             VALUES ('after-migration', 'test', 'session', '2026-11-06T01:00:00+00:00', 'response', 'test')",
+            [],
+        ).unwrap();
+        let conn = initialize_database(conn).unwrap();
+        let timestamp: String = conn.query_row("SELECT occurred_at FROM usage_records", [], |row| row.get(0)).unwrap();
+        assert_eq!(timestamp, "2026-11-06T01:00:00+00:00", "普通打开不能重扫并重写历史账本");
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_legacy_schema_runs_repairs_before_advancing_the_version() {
+        let conn = initialize_database(Connection::open_in_memory().unwrap()).unwrap();
+        conn.execute_batch("PRAGMA user_version=0;
+            INSERT INTO usage_records (record_id, source, session_id, occurred_at, record_kind, origin)
+            VALUES ('legacy', 'test', 'session', '2026-11-06T01:00:00+00:00', 'response', 'test');").unwrap();
+        let conn = initialize_database(conn).unwrap();
+        let timestamp: String = conn.query_row("SELECT occurred_at FROM usage_records", [], |row| row.get(0)).unwrap();
+        assert_eq!(timestamp, "2026-11-06T01:00:00.000Z");
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn failed_schema_migration_rolls_back_and_can_be_retried() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("migration.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE usage_records (record_id TEXT PRIMARY KEY);").unwrap();
+        assert!(initialize_database(conn).is_err(), "缺少必要字段的旧表应让迁移失败");
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, 0);
+        let partial_tables: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'agent_events'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(partial_tables, 0, "失败迁移不能留下已经执行的部分结构更改");
+        conn.execute_batch("DROP TABLE usage_records;").unwrap();
+        let conn = initialize_database(conn).unwrap();
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
     fn rejects_read_only_connections_without_changing_existing_data() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("telemetry.sqlite3");
@@ -198,13 +257,46 @@ mod tests {
     }
 }
 
-/// Shared by production and isolated tests; includes every schema migration.
+/// Increment whenever a durable table, column, trigger or data migration changes.
+const SCHEMA_VERSION: i64 = 1;
+
+/// Shared by production and isolated tests. Normal opens configure a connection
+/// and read one version number; historical repairs run only during migration.
 pub(super) fn initialize_database(mut conn: Connection) -> Result<Connection, String> {
+    let _phase = crate::startup::phase("database.schema_check");
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=8000; PRAGMA foreign_keys=ON;")
+        .map_err(|error| error.to_string())?;
+    let current: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if current > SCHEMA_VERSION {
+        return Err(format!("数据库结构版本 {current} 高于当前应用支持的 {SCHEMA_VERSION}，请更新应用"));
+    }
+    if current == SCHEMA_VERSION { return Ok(conn); }
+
+    let _migration = crate::startup::phase("database.schema_migration");
+    // Serialize upgrading processes, then recheck after acquiring the writer.
+    // The existing nested migrations use savepoints under this transaction.
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(|error| error.to_string())?;
+    let migrated = (|| -> Result<(), String> {
+        let current: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if current > SCHEMA_VERSION { return Err("数据库已由更新的应用迁移，请更新应用".into()); }
+        if current < SCHEMA_VERSION {
+            migrate_database_schema(&mut conn)?;
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION).map_err(|error| error.to_string())?;
+        }
+        conn.execute_batch("COMMIT").map_err(|error| error.to_string())
+    })();
+    if let Err(error) = migrated {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(error);
+    }
+    Ok(conn)
+}
+
+fn migrate_database_schema(conn: &mut Connection) -> Result<(), String> {
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA busy_timeout=8000;
-         PRAGMA foreign_keys=ON;
-         CREATE TABLE IF NOT EXISTS agent_events (
+        "CREATE TABLE IF NOT EXISTS agent_events (
            id INTEGER PRIMARY KEY AUTOINCREMENT,
            event_key TEXT NOT NULL UNIQUE,
            source TEXT NOT NULL,
@@ -696,7 +788,7 @@ pub(super) fn initialize_database(mut conn: Connection) -> Result<Connection, St
     // Replay classification-bearing objects once after upgrading. Their hashes
     // may be unchanged even though the old importer skipped the assignments.
     {
-        let transaction = conn.transaction().map_err(|e| e.to_string())?;
+        let transaction = conn.savepoint().map_err(|e| e.to_string())?;
         transaction.execute_batch(
             "DELETE FROM cloud_sync_meta
               WHERE (object_key LIKE 'l1-auto-agg:%' OR object_key LIKE 'tag-overrides:%')
@@ -736,7 +828,7 @@ pub(super) fn initialize_database(mut conn: Connection) -> Result<Connection, St
     // Historical rows mixed `Z`, `+00:00` and nanosecond-precision
     // suffixes; lexical SQL comparisons need one canonical UTC format.
     // The non-NULL guard skips (idempotently) rows SQLite cannot parse.
-    let _ = conn.execute_batch(
+    conn.execute_batch(
         "UPDATE usage_records
                 SET occurred_at = strftime('%Y-%m-%dT%H:%M:%fZ', occurred_at)
               WHERE strftime('%Y-%m-%dT%H:%M:%fZ', occurred_at) IS NOT NULL
@@ -745,7 +837,7 @@ pub(super) fn initialize_database(mut conn: Connection) -> Result<Connection, St
                 SET refreshed_at = strftime('%Y-%m-%dT%H:%M:%fZ', refreshed_at)
               WHERE strftime('%Y-%m-%dT%H:%M:%fZ', refreshed_at) IS NOT NULL
                 AND refreshed_at != strftime('%Y-%m-%dT%H:%M:%fZ', refreshed_at);",
-    );
+    ).map_err(|error| error.to_string())?;
     // PRD 一期：usage_records 增列（幂等）+ 模型目录表。
     for (column, declaration) in [
         ("provider_id", "TEXT"),
@@ -754,7 +846,7 @@ pub(super) fn initialize_database(mut conn: Connection) -> Result<Connection, St
         ("cost_usd", "REAL"),
         ("pricing_source", "TEXT"),
     ] {
-        let _ = add_column_if_missing_in(&conn, "usage_records", column, declaration);
+        add_column_if_missing_in(conn, "usage_records", column, declaration)?;
     }
     // 云端同步的显式用户决策（置顶/召回）各自带时间戳，跨设备按时间戳合并。
     for (column, declaration) in [
@@ -769,17 +861,17 @@ pub(super) fn initialize_database(mut conn: Connection) -> Result<Connection, St
           WHERE pinned != 0 AND pinned_updated_at IS NULL;",
     )
     .map_err(|e| e.to_string())?;
-    let _ = crate::provider_catalog::ensure_catalog_table(&conn);
-    migrate_mcp_unknown_projection(&mut conn)?;
-    crate::llm_trace::initialize(&conn)?;
-    crate::model_registry::initialize(&conn)?;
-    Ok(conn)
+    crate::provider_catalog::ensure_catalog_table(conn)?;
+    migrate_mcp_unknown_projection(conn)?;
+    crate::llm_trace::initialize(conn)?;
+    crate::model_registry::initialize(conn)?;
+    Ok(())
 }
 
 /// Keep the legacy evidence-table CHECK compatible with already-running relays.
 /// Its pending+observation_lost rows project to a distinct unknown ledger state.
 pub(super) fn migrate_mcp_unknown_projection(conn: &mut Connection) -> Result<(), String> {
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+    let tx = conn.savepoint().map_err(|e| e.to_string())?;
     let done: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM app_settings WHERE setting_key = 'mcp_unknown_projection_v1')", [], |row| row.get(0)).map_err(|e| e.to_string())?;
     if !done {
         tx.execute_batch(

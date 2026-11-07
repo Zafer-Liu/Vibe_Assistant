@@ -15,6 +15,11 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::process_util::no_window;
 
+// This module is also included directly by the standalone launcher.
+#[allow(dead_code)]
+#[path = "memory_mcp_runtime.rs"]
+mod memory_runtime;
+
 const SERVER_NAME: &str = "Vibe-Assistant-memory";
 /// 旧服务名：安装时清理旧节点，卸载与状态检查兼容历史配置。
 const LEGACY_SERVER_NAME: &str = "agent-manager-memory";
@@ -174,62 +179,19 @@ pub(crate) fn agent_label(agent_type: &str) -> &'static str {
 pub(crate) fn server_executable() -> Result<String, String> {
     let current = std::env::current_exe()
         .map_err(|error| format!("无法定位 Vibe Assistant 可执行文件：{error}"))?;
-    // Cargo / 安装器必须能随时替换应用主程序文件，而 MCP 客户端会把注册的
-    // exe 当长驻子进程拉起——被占用的 exe 在 Windows 上锁死无法替换。所以
-    // 无论 dev 还是 release，都给 MCP 一份按构建时间戳命名的私有副本，
-    // 由 [`registered_command`] 的启动器在每次拉起时解析最新一份。
-    let metadata = std::fs::metadata(&current)
-        .map_err(|error| format!("无法读取 MCP 可执行文件：{error}"))?;
-    let stamp = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default();
-    let root = dirs_next::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("agent-manager")
-        .join("mcp-runtime");
-    std::fs::create_dir_all(&root)
-        .map_err(|error| format!("无法创建 MCP 运行目录：{error}"))?;
-    let target = root.join(format!(
-        "agent-manager-memory-{stamp}-{}.exe",
-        metadata.len()
-    ));
-    if !target.is_file() {
-        let temporary = target.with_extension("tmp");
-        std::fs::copy(&current, &temporary)
-            .map_err(|error| format!("无法复制 MCP 运行副本：{error}"))?;
-        std::fs::rename(&temporary, &target)
-            .map_err(|error| format!("无法启用 MCP 运行副本：{error}"))?;
-    }
-    cleanup_runtime_copies(&root, &target);
-    Ok(target.to_string_lossy().to_string())
-}
-
-/// 清理 mcp-runtime 里的旧副本：仍在运行的副本被 Windows 锁住删不掉，
-/// 忽略即可——进程退出后的下一轮会清掉。绝不主动杀进程。
-fn cleanup_runtime_copies(root: &std::path::Path, keep: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.starts_with("agent-manager-memory-") || !name.ends_with(".exe") {
-            continue;
-        }
-        if entry.path() == keep {
-            continue;
-        }
-        let _ = std::fs::remove_file(entry.path());
-    }
+    // Keep the GUI executable replaceable while MCP sessions run. Publishing
+    // activates these bytes by publication order, including rollback/reinstall;
+    // even immutable old launchers select the new maximum filename number.
+    // This does not touch any client binding or launcher installation.
+    let target = memory_runtime::publish(&current)
+        .map_err(|error| format!("无法发布 MCP 运行副本：{error}"))?;
+    Ok(target.to_string_lossy().into_owned())
 }
 
 /// 注册进各 Agent MCP 配置的命令：稳定的启动器（内容哈希安装，见
 /// `mcp_launcher_installation::launcher_executable`），而不是会随构建变化的
-/// runtime 副本路径。启动器自己解析最新副本，并在应用更新杀掉旧副本后
-/// 无缝重启子进程，MCP 连接因此不再随更新断开。
+/// runtime 副本路径。旧启动器继续有效，新连接解析最新副本；已有连接
+/// 保持原来的子进程和 MCP 会话，不中途切换或重放输入。
 pub(crate) fn registered_command() -> Result<String, String> {
     crate::mcp_launcher_installation::launcher_executable()
 }
@@ -623,30 +585,73 @@ fn read_file_config(path: &std::path::Path) -> Result<Value, String> {
     Ok(config)
 }
 
-fn file_config_status(agent_type: &str, executable: &str) -> Result<MemoryMcpStatus, String> {
-    let path = desktop_config_path(agent_type)?.ok_or("无法定位 MCP 配置文件")?;
-    let config = read_file_config(&path)?;
-    let entry = servers_map(&config, agent_type)
-        .and_then(|servers| servers.get(SERVER_NAME).or_else(|| servers.get(LEGACY_SERVER_NAME)));
-    let installed = entry.is_some_and(|entry| {
-        entry.get("command").and_then(Value::as_str) == Some(executable)
-            && entry.get("args") == Some(&json!(["--mcp-memory"]))
-    });
+/// Validate the configured launcher's own identity, not the current build's
+/// digest. Every managed generation supports --mcp-memory and resolves runtimes
+/// at connection time, so a build change does not invalidate an existing entry.
+fn memory_launcher_at(command: &str, directory: &std::path::Path) -> bool {
+    let path = std::path::Path::new(command);
+    if !path.is_absolute() {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else { return false };
+    let stem = if cfg!(windows) {
+        let Some(stem) = name.strip_suffix(".exe") else { return false };
+        stem
+    } else {
+        name
+    };
+    let Some(digest) = stem.strip_prefix("mcp-launcher-") else { return false };
+    if !crate::mcp_probe_protocol::valid_digest(digest) {
+        return false;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(path) else { return false };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    let Some(parent) = path.parent().and_then(|parent| parent.canonicalize().ok()) else { return false };
+    if directory.canonicalize().ok().as_ref() != Some(&parent) {
+        return false;
+    }
+    std::fs::read(path)
+        .is_ok_and(|bytes| format!("{:x}", sha2::Sha256::digest(bytes)) == digest)
+}
+
+fn configured_memory_launcher_at<'a>(entry: &'a Value, directory: &std::path::Path) -> Option<&'a str> {
+    if entry.get("args") != Some(&json!(["--mcp-memory"])) {
+        return None;
+    }
+    let command = entry.get("command").and_then(Value::as_str)?;
+    memory_launcher_at(command, directory).then_some(command)
+}
+
+fn configuration_status(agent_type: &str) -> Result<MemoryMcpStatus, String> {
+    let (path, entry) = crate::mcp_registry::memory_configuration(agent_type)?;
+    let launchers = dirs_next::config_dir().ok_or("无法定位应用数据目录")?
+        .join("agent-manager").join("mcp-launchers");
+    let configured = entry.as_ref()
+        .and_then(|entry| configured_memory_launcher_at(entry, &launchers));
+    let installed = configured.is_some();
+    // Status never installs a launcher. Report the actual configured command,
+    // including when it needs repair; installation prepares a new one explicitly.
+    let executable = entry.as_ref()
+        .and_then(|entry| entry.get("command")).and_then(Value::as_str)
+        .unwrap_or_default().to_string();
     Ok(MemoryMcpStatus {
         agent_type: agent_type.into(),
         installed,
-        executable: executable.into(),
+        executable,
         detail: if entry.is_none() {
             format!("尚未写入 {}", path.display())
         } else if !installed {
-            format!("配置指向旧启动器或失效的观测代理，请重新连接（{}）", path.display())
+            format!("共享记忆启动文件缺失、校验失败或配置已变化，请重新配置（{}）", path.display())
         } else {
-            format!("已配置到 {}", path.display())
+            format!("已配置到 {}；新连接自动使用最新记忆服务", path.display())
         },
     })
 }
 
 fn write_file_config(agent_type: &str, executable: &str) -> Result<MemoryMcpStatus, String> {
+    let _guard = crate::mcp_registry::lock_observation_writes()?;
     let path = desktop_config_path(agent_type)?.ok_or("无法定位 MCP 配置文件")?;
     let mut config = read_file_config(&path)?;
     let servers = servers_map_mut(&mut config, agent_type)?;
@@ -663,10 +668,11 @@ fn write_file_config(agent_type: &str, executable: &str) -> Result<MemoryMcpStat
         serde_json::to_string_pretty(&config).map_err(|error| error.to_string())?,
     )
     .map_err(|error| format!("写入 {} 失败：{error}", path.display()))?;
-    file_config_status(agent_type, executable)
+    configuration_status(agent_type)
 }
 
 fn remove_file_config(agent_type: &str) -> Result<(), String> {
+    let _guard = crate::mcp_registry::lock_observation_writes()?;
     let path = desktop_config_path(agent_type)?.ok_or("无法定位 MCP 配置文件")?;
     let mut config = read_file_config(&path)?;
     let servers = servers_map_mut(&mut config, agent_type)?;
@@ -679,71 +685,14 @@ fn remove_file_config(agent_type: &str) -> Result<(), String> {
     .map_err(|error| format!("写入 {} 失败：{error}", path.display()))
 }
 
-fn status_args(agent_type: &str) -> Vec<String> {
-    match agent_type {
-        "codex_cli" | "codex_desktop" => vec!["mcp".into(), "get".into(), SERVER_NAME.into()],
-        "claude_cli" => vec!["mcp".into(), "get".into(), SERVER_NAME.into()],
-        _ => vec![],
-    }
-}
-
 #[tauri::command]
 pub async fn memory_mcp_status(agent_type: String) -> Result<MemoryMcpStatus, String> {
     if !supported_agent(&agent_type) {
         return Err(format!("暂不支持 {agent_type} 的 MCP 配置"));
     }
-    // 确保最新 runtime 副本存在（启动器靠它解析），配置里注册的则是稳定启动器。
-    server_executable()?;
-    let executable = registered_command()?;
-    if agent_type == "dsh" {
-        let (installed, detail) = crate::dsh_mcp::memory_status(&executable)?;
-        return Ok(MemoryMcpStatus {
-            agent_type,
-            installed,
-            executable,
-            detail,
-        });
-    }
-    if is_file_config_agent(&agent_type) {
-        crate::mcp_registry::repair_orphaned_memory_relay(&agent_type, &executable)?;
-        return file_config_status(&agent_type, &executable);
-    }
-    let cli = if agent_type.starts_with("codex") {
-        "codex"
-    } else {
-        "claude"
-    };
-    let output = run_agent_cli(cli, &status_args(&agent_type));
-    match output {
-        Ok(output) => {
-            // CLI get 输出里没有当前启动器路径 = 还钉着旧的 runtime 副本。
-            let detail = cli_detail(&output);
-            let outdated = output.status.success()
-                && !String::from_utf8_lossy(&output.stdout).contains(
-                    std::path::Path::new(&executable)
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or_default(),
-                );
-            Ok(MemoryMcpStatus {
-                agent_type,
-                installed: output.status.success(),
-                executable,
-                detail: if outdated {
-                    "配置指向旧路径，请在 Vibe Assistant 里重新安装后生效"
-                } else {
-                    &detail
-                }
-                .to_string(),
-            })
-        }
-        Err(error) => Ok(MemoryMcpStatus {
-            agent_type,
-            installed: false,
-            executable,
-            detail: error,
-        }),
-    }
+    // Configuration health is independent of runtime publication and CLI
+    // availability. Read the actual registry without starting an MCP session.
+    configuration_status(&agent_type)
 }
 
 #[tauri::command]
@@ -816,19 +765,20 @@ pub async fn memory_mcp_install(agent_type: String) -> Result<MemoryMcpStatus, S
     let executable = registered_command()?;
     if agent_type == "dsh" {
         crate::dsh_mcp::write_server(&crate::dsh_mcp::DshMcpServer::memory_server(&executable))?;
-        let (installed, detail) = crate::dsh_mcp::memory_status(&executable)?;
-        return Ok(MemoryMcpStatus {
-            agent_type,
-            installed,
-            executable,
-            detail,
-        });
+        return configuration_status(&agent_type);
     }
     if is_file_config_agent(&agent_type) {
+        crate::mcp_registry::prepare_memory_observation_install(&agent_type)?;
+        crate::mcp_registry::repair_orphaned_memory_relay(&agent_type, &executable)?;
         return write_file_config(&agent_type, &executable);
     }
-    let existing = memory_mcp_status(agent_type.clone()).await?;
-    if existing.installed {
+    // An invalid binding still occupies the CLI registry name and must be
+    // removed during explicit repair. Configuration health is not existence.
+    let existing = run_agent_cli(
+        if agent_type.starts_with("codex") { "codex" } else { "claude" },
+        &["mcp".into(), "get".into(), SERVER_NAME.into()],
+    )?;
+    if existing.status.success() {
         let remove_args = vec!["mcp".into(), "remove".into(), SERVER_NAME.into()];
         let remove = run_agent_cli(
             if agent_type.starts_with("codex") {
@@ -1691,6 +1641,57 @@ mod tests {
         let config = super::claude_desktop_config_selection(paths, Some(chosen.clone())).unwrap();
         assert_eq!(config.selected_path, Some(chosen));
         assert_eq!(config.candidates.len(), 1);
+    }
+
+    fn memory_launcher_fixture(directory: &std::path::Path, bytes: &[u8]) -> std::path::PathBuf {
+        use sha2::Digest;
+        std::fs::create_dir_all(directory).unwrap();
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
+        let path = directory.join(format!("mcp-launcher-{:x}{suffix}", sha2::Sha256::digest(bytes)));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn shared_memory_accepts_both_launcher_generations_without_reconfiguration() {
+        let root = tempfile::tempdir().unwrap();
+        let old = memory_launcher_fixture(root.path(), b"old launcher");
+        let new = memory_launcher_fixture(root.path(), b"new launcher");
+        assert_ne!(old, new);
+        for launcher in [&old, &new] {
+            let command = launcher.to_str().unwrap();
+            let entry = super::file_server_entry("claude_desktop", command);
+            assert_eq!(super::configured_memory_launcher_at(&entry, root.path()), Some(command));
+        }
+    }
+
+    #[test]
+    fn shared_memory_rejects_missing_tampered_or_external_launchers() {
+        let root = tempfile::tempdir().unwrap();
+        let launchers = root.path().join("mcp-launchers");
+        let old = memory_launcher_fixture(&launchers, b"old launcher");
+        let command = old.to_str().unwrap();
+        assert!(super::memory_launcher_at(command, &launchers));
+        let outside = memory_launcher_fixture(&root.path().join("outside"), b"old launcher");
+        assert!(!super::memory_launcher_at(outside.to_str().unwrap(), &launchers));
+        std::fs::write(&old, b"modified launcher").unwrap();
+        assert!(!super::memory_launcher_at(command, &launchers));
+        std::fs::remove_file(&old).unwrap();
+        assert!(!super::memory_launcher_at(command, &launchers));
+    }
+
+    #[test]
+    fn shared_memory_requires_the_memory_mode_and_a_stable_launcher() {
+        let root = tempfile::tempdir().unwrap();
+        let launcher = memory_launcher_fixture(root.path(), b"launcher");
+        for args in [json!([]), json!(["--mcp-relay", "assignment"]), json!(["--mcp-memory", "extra"])] {
+            let entry = json!({"command": launcher, "args": args});
+            assert!(super::configured_memory_launcher_at(&entry, root.path()).is_none());
+        }
+        let runtime = root.path().join("agent-manager-memory-123-7.exe");
+        std::fs::write(&runtime, b"runtime").unwrap();
+        let entry = super::file_server_entry("claude_desktop", runtime.to_str().unwrap());
+        assert!(super::configured_memory_launcher_at(&entry, root.path()).is_none());
     }
 
     #[test]

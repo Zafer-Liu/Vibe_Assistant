@@ -8,6 +8,10 @@ import { jsonEqual } from '../lib/stateEquality'
 
 let callStatsRequestId = 0
 let callStatsScope = ''
+let observationRequestId = 0
+let observationMutationEpoch = 0
+let observationMutationsPending = 0
+const observationMutationIds = new Map<string, number>()
 
 interface McpStore {
   /** Codex / Claude connection state for the shared-memory MCP server. */
@@ -273,29 +277,49 @@ export const useMcpStore = create<McpStore>((set, get) => ({
   },
 
   async loadMcpObservationStatuses() {
+    const requestId = ++observationRequestId
+    const epoch = observationMutationEpoch
+    const canPublish = () => requestId === observationRequestId
+      && epoch === observationMutationEpoch && observationMutationsPending === 0
     try {
       const statuses = await mcpApi.mcpObservationStatusAll()
+      if (!canPublish()) return get().mcpObservationStatuses
       set((state) => ({
         ...(jsonEqual(state.mcpObservationStatuses, statuses) ? {} : { mcpObservationStatuses: statuses }),
         mcpObservationError: '',
       }))
       return statuses
     } catch (error) {
+      if (!canPublish()) return get().mcpObservationStatuses
       set({ mcpObservationError: String(error) })
       throw error
     }
   },
 
   async setMcpObservation(name, agent, enabled) {
-    const status = await mcpApi.mcpObservationSet({ name, agent, enabled })
-    set((state) => ({
-      mcpObservationStatuses: [
-        ...state.mcpObservationStatuses.filter(item => item.name !== status.name || item.agent !== status.agent),
-        status,
-      ],
-      mcpObservationError: '',
-    }))
-    return status
+    const key = JSON.stringify([name, agent === 'codex_desktop' ? 'codex_cli' : agent])
+    const mutationId = ++observationMutationEpoch
+    observationMutationsPending += 1
+    observationMutationIds.set(key, mutationId)
+    try {
+      const status = await mcpApi.mcpObservationSet({ name, agent, enabled })
+      if (observationMutationIds.get(key) === mutationId) {
+        set((state) => ({
+          mcpObservationStatuses: [
+            ...state.mcpObservationStatuses.filter(item => item.name !== status.name || item.agent !== status.agent),
+            status,
+          ],
+          mcpObservationError: '',
+        }))
+      }
+      return status
+    } finally {
+      // Also invalidate polls started while a write was in flight.
+      observationMutationEpoch += 1
+      observationMutationsPending -= 1
+      if (observationMutationIds.get(key) === mutationId) observationMutationIds.delete(key)
+      if (observationMutationsPending === 0) void get().loadMcpObservationStatuses().catch(() => {})
+    }
   },
 
   async loadDshBridge() {

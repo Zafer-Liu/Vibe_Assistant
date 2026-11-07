@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use sha2::{Digest, Sha256};
+use crate::mcp_probe_protocol::{merge_runtime, ProbeGeneration, ProbeRuntime};
 
 use crate::memory_mcp::{
     agent_label, cli_detail, desktop_config_path, run_agent_cli, servers_map, servers_map_mut,
@@ -474,6 +475,20 @@ fn read_agent_mcp_servers(agent: &str) -> Result<Map<String, Value>, String> {
         }
         Ok(servers_map(&config, agent).cloned().unwrap_or_default())
     }
+}
+
+/// Shared-memory status uses the same read-only paths and parsers as the MCP
+/// library, including CLI registries and the DSH patch layer.
+pub(crate) fn memory_configuration(agent: &str) -> Result<(PathBuf, Option<Value>), String> {
+    let path = if agent == "dsh" {
+        crate::dsh_mcp::patch_path_or_error()?
+    } else {
+        observation_config_path(agent)?
+    };
+    let servers = read_agent_mcp_servers(agent)?;
+    let entry = servers.get(MEMORY_SERVER_NAME)
+        .or_else(|| servers.get(LEGACY_MEMORY_SERVER_NAME)).cloned();
+    Ok((path, entry))
 }
 
 /// 库条目 → 某 Agent JSON 配置里的 mcpServers 条目形状。
@@ -946,6 +961,8 @@ struct ObservationManifest {
     #[serde(default)]
     relay_command: Option<String>,
     #[serde(default)]
+    relay_runtime: Option<ProbeRuntime>,
+    #[serde(default)]
     previous_proxy_command: Option<String>,
     #[serde(default)]
     previous_relay_command: Option<String>,
@@ -961,6 +978,9 @@ pub struct McpObservationStatus {
     pub agent: String,
     pub state: String,
     pub active_connections: i64,
+    pub probe_version: Option<String>,
+    pub pending_probe_connections: i64,
+    pub probe_update_error: Option<String>,
 }
 
 pub struct RelayLaunch {
@@ -968,11 +988,39 @@ pub struct RelayLaunch {
     pub command: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    pub runtime_digest: Option<String>,
 }
 
 fn observation_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+pub(crate) struct ObservationWriteGuard<'a> {
+    _local: std::sync::MutexGuard<'a, ()>,
+    _file: std::fs::File,
+}
+
+fn control_file_lock(root: &Path, timeout: std::time::Duration) -> Result<std::fs::File, String> {
+    std::fs::create_dir_all(root).map_err(|_| "MCP 控制目录不可用")?;
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(root.join(".writer.lock")).map_err(|_| "MCP 控制锁不可用")?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline =>
+                std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(std::fs::TryLockError::WouldBlock) => return Err("MCP 控制层忙，请稍后重试".into()),
+            Err(std::fs::TryLockError::Error(_)) => return Err("MCP 控制锁不可用".into()),
+        }
+    }
+}
+
+pub(crate) fn lock_observation_writes() -> Result<ObservationWriteGuard<'static>, String> {
+    let local = observation_lock().lock().map_err(|_| "MCP observation 锁不可用")?;
+    let file = control_file_lock(&observation_root()?, std::time::Duration::from_secs(2))?;
+    Ok(ObservationWriteGuard { _local: local, _file: file })
 }
 
 fn physical_target(agent: &str) -> &str {
@@ -996,7 +1044,7 @@ pub(crate) fn repair_orphaned_memory_relay(agent: &str, launcher: &str) -> Resul
     if !matches!(agent, "claude_desktop" | "kimi" | "qoder" | "workbuddy" | "minimax" | "zcode" | "gemini" | "antigravity") {
         return Ok(());
     }
-    let _guard = observation_lock().lock().map_err(|_| "MCP observation 锁不可用")?;
+    let _guard = lock_observation_writes()?;
     let path = observation_config_path(agent)?;
     if !path.is_file() { return Ok(()); }
     let Some(current) = read_observation_node(agent, &path, MEMORY_SERVER_NAME)? else { return Ok(()) };
@@ -1013,6 +1061,7 @@ pub(crate) fn repair_orphaned_memory_relay(agent: &str, launcher: &str) -> Resul
         return Ok(());
     }
     let manifest = ObservationManifest {
+        relay_runtime: None,
         id: id.to_string(), name: MEMORY_SERVER_NAME.into(), agent: agent.into(),
         config_path: path, fingerprint: String::new(), proxy_command: command.into(),
         relay_command: None, previous_proxy_command: None, previous_relay_command: None, omitted_args: false,
@@ -1022,9 +1071,16 @@ pub(crate) fn repair_orphaned_memory_relay(agent: &str, launcher: &str) -> Resul
     patch_observation_node(&manifest, &current, &replacement)
 }
 
-fn retire_memory_observation() {
+pub(crate) fn prepare_memory_observation_install(agent: &str) -> Result<(), String> {
+    let _guard = lock_observation_writes()?;
+    retire_memory_observation(agent);
+    Ok(())
+}
+
+fn retire_memory_observation(agent: &str) {
     let Ok(manifests) = observation_manifests() else { return };
     for manifest in manifests {
+        if manifest.agent != physical_target(agent) { continue; }
         if manifest.name != MEMORY_SERVER_NAME && manifest.name != LEGACY_MEMORY_SERVER_NAME { continue; }
         let Ok(launcher) = crate::memory_mcp::registered_command() else { continue };
         let mut node = crate::memory_mcp::file_server_entry(&manifest.agent, &launcher);
@@ -1048,7 +1104,10 @@ fn retire_memory_observation() {
 }
 
 fn observation_manifests() -> Result<Vec<ObservationManifest>, String> {
-    let root = observation_root()?;
+    observation_manifests_at(&observation_root()?)
+}
+
+fn observation_manifests_at(root: &Path) -> Result<Vec<ObservationManifest>, String> {
     let files = match std::fs::read_dir(root) {
         Ok(files) => files,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1079,14 +1138,32 @@ fn observation_manifests() -> Result<Vec<ObservationManifest>, String> {
 fn save_observation(manifest: &ObservationManifest) -> Result<(), String> {
     let root = observation_root()?;
     std::fs::create_dir_all(&root).map_err(|_| "无法创建 MCP observation 状态目录")?;
-    let mut temporary = tempfile::NamedTempFile::new_in(&root)
-        .map_err(|_| "无法准备 MCP observation 状态")?;
-    serde_json::to_writer(&mut temporary, manifest)
-        .map_err(|_| "无法编码 MCP observation 状态")?;
+    save_observation_at(&root.join(format!("{}.json", manifest.id)), manifest)
+}
+
+fn save_observation_at(path: &Path, manifest: &ObservationManifest) -> Result<(), String> {
+    let mut next = manifest.clone();
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let current: ObservationManifest = serde_json::from_slice(&bytes).map_err(|_| "MCP observation 状态已损坏")?;
+            if current.id != next.id || current.name != next.name || current.agent != next.agent {
+                return Err("MCP observation 绑定已变化".into());
+            }
+            next.relay_runtime = merge_runtime(next.relay_runtime.as_ref(), current.relay_runtime.as_ref())
+                .map_err(str::to_string)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(_) => return Err("MCP observation 状态不可读".into()),
+    }
+    if let Some(runtime) = &next.relay_runtime {
+        next.relay_command = Some(runtime.preferred_generation().map_err(str::to_string)?.command.clone());
+    }
+    let parent = path.parent().ok_or("MCP observation 目录无效")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|_| "无法准备 MCP observation 状态")?;
+    serde_json::to_writer(&mut temporary, &next).map_err(|_| "无法编码 MCP observation 状态")?;
     use std::io::Write;
     temporary.flush().map_err(|_| "无法保存 MCP observation 状态")?;
     temporary.as_file().sync_all().map_err(|_| "无法保存 MCP observation 状态")?;
-    let path = root.join(format!("{}.json", manifest.id));
     temporary.persist(path).map_err(|_| "无法保存 MCP observation 状态")?;
     Ok(())
 }
@@ -1317,8 +1394,21 @@ fn activate_observation_node(manifest: &ObservationManifest, canonical: &Value, 
     Err("MCP 配置被反复恢复为原命令，观测未启用".into())
 }
 
+fn activate_ready_observation(
+    manifest: &ObservationManifest, canonical: &Value,
+    mut save: impl FnMut(&ObservationManifest) -> Result<(), String>, pause: impl FnMut(),
+) -> Result<(), String> {
+    // Client watchers can spawn the launcher immediately after the config write.
+    // Its manifest must already be resolvable before that entry becomes visible.
+    let mut ready = manifest.clone();
+    ready.phase = "active".into();
+    save(&ready)?;
+    activate_observation_node(&ready, canonical, pause)
+}
+
 fn activate_observation(manifest: &ObservationManifest, canonical: &Value) -> Result<(), String> {
-    activate_observation_node(manifest, canonical, || std::thread::sleep(std::time::Duration::from_millis(120)))
+    activate_ready_observation(manifest, canonical, save_observation,
+        || std::thread::sleep(std::time::Duration::from_millis(120)))
 }
 
 fn observation_catalog() -> Result<Vec<McpCatalogEntry>, String> {
@@ -1335,18 +1425,22 @@ fn observation_catalog() -> Result<Vec<McpCatalogEntry>, String> {
 
 pub fn relay_launch(assignment_id: &str) -> Result<RelayLaunch, String> {
     let id = uuid::Uuid::parse_str(assignment_id).map_err(|_| "MCP relay id 无效")?;
-    let manifest = observation_manifests()?.into_iter()
-        .find(|manifest| manifest.id == id.to_string()).ok_or("MCP relay assignment 不存在")?;
+    let path = observation_root()?.join(format!("{id}.json"));
+    let metadata = std::fs::symlink_metadata(&path).map_err(|_| "MCP relay assignment 不可读")?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() { return Err("MCP relay assignment 路径无效".into()); }
+    let manifest: ObservationManifest = serde_json::from_slice(&std::fs::read(&path).map_err(|_| "MCP relay assignment 不可读")?)
+        .map_err(|_| "MCP relay assignment 无效")?;
+    if manifest.id != id.to_string() { return Err("MCP relay assignment id 不一致".into()); }
     if manifest.phase != "active" { return Err("MCP relay assignment 尚未就绪".into()); }
     if manifest.relay_command.is_some() {
         let fallback = crate::mcp_fallback_resolver::resolve_fallback_for_relay(assignment_id)
             .map_err(|_| "MCP relay assignment 已变化".to_string())?;
-        let expected = std::fs::canonicalize(manifest.relay_command.as_deref().unwrap_or_default())
+        let expected = std::fs::canonicalize(&fallback.relay_command)
             .map_err(|_| "MCP relay 程序不可用")?;
         if std::env::current_exe().and_then(std::fs::canonicalize).map_err(|_| "MCP relay 程序不可用")? != expected {
             return Err("MCP relay 程序已变化".into());
         }
-        return Ok(RelayLaunch { server_name: manifest.name, command: fallback.command, args: fallback.args, env: fallback.env });
+        return Ok(RelayLaunch { server_name: manifest.name, command: fallback.command, args: fallback.args, env: fallback.env, runtime_digest: fallback.runtime_digest });
     }
     let entry = find_entry(&observation_catalog()?, &manifest.name)
         .map_err(|_| "MCP relay 原始配置已缺失")?;
@@ -1360,11 +1454,11 @@ pub fn relay_launch(assignment_id: &str) -> Result<RelayLaunch, String> {
         || !read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name)?
             .as_ref().is_some_and(|node| proxy_matches(node, &manifest))
     { return Err("MCP relay 配置已漂移".into()); }
-    Ok(RelayLaunch { server_name: entry.name, command: entry.command, args: entry.args, env: entry.env })
+    Ok(RelayLaunch { server_name: entry.name, command: entry.command, args: entry.args, env: entry.env, runtime_digest: None })
 }
 
-fn guarded_observation(name: &str, agent: Option<&str>) -> Result<std::sync::MutexGuard<'static, ()>, String> {
-    let guard = observation_lock().lock().map_err(|_| "MCP observation 锁不可用")?;
+fn guarded_observation(name: &str, agent: Option<&str>) -> Result<ObservationWriteGuard<'static>, String> {
+    let guard = lock_observation_writes()?;
     retire_detached_observations(&read_catalog()?)?;
     if observation_manifests()?.iter().any(|manifest| manifest.name == name &&
         agent.is_none_or(|agent| physical_target(agent) == manifest.agent)) {
@@ -1373,82 +1467,108 @@ fn guarded_observation(name: &str, agent: Option<&str>) -> Result<std::sync::Mut
     Ok(guard)
 }
 
-fn upgrade_observation(manifest: &ObservationManifest, catalog: &[McpCatalogEntry]) -> Result<ObservationManifest, String> {
-    // Keep one full generation until explicit disable/enable. Polling must not
-    // discard rollback evidence or immediately retry an upgrade just rolled back.
-    if manifest.phase != "active" || manifest.previous_proxy_command.is_some() { return Ok(manifest.clone()); }
-    // Refresh only between connections. A live relay still validates its pinned
-    // executable against this manifest; leave it intact until the next idle retry.
-    // Unknown telemetry is not evidence that switching is safe.
-    let Some(active) = crate::telemetry_store::shared_store()
-        .and_then(|store| store.proxy_active_connections(&manifest.id).ok()) else {
-        return Ok(manifest.clone());
-    };
-    if require_idle_observation(Some(active), checked_fallback_connections(&manifest.id)).is_err() {
-        return Ok(manifest.clone());
-    }
-    let entry = catalog.iter().find(|entry| entry.name == manifest.name)
-        .ok_or("MCP 原始配置缺失")?;
-    if !manifest.config_path.is_absolute() { return Err("MCP 配置路径必须是绝对路径".into()); }
-    if observation_fingerprint(&manifest.agent, entry) != manifest.fingerprint
-        || normalize_transport(&entry.transport) != "stdio"
-        || !entry.assigned_agents.iter().any(|agent| physical_target(agent) == manifest.agent)
-        || observation_config_path(&manifest.agent)? != manifest.config_path {
-        return Err("MCP 原始配置已变化，无法升级代理".into());
-    }
-    let old = proxy_entry(manifest);
-    if read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name)?.as_ref() != Some(&old) {
-        return Err("MCP 配置已漂移，无法升级代理".into());
-    }
-    let launcher = crate::mcp_launcher_installation::launcher_executable()?;
-    let relay = crate::mcp_launcher_installation::relay_executable()?;
-    upgrade_observation_node(manifest, launcher, relay, |state| {
-        ensure_observation_idle(&manifest.id)?;
-        save_observation(state)
-    })
+fn probe_now_ms() -> Result<u64, String> {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .ok().and_then(|time| u64::try_from(time.as_millis()).ok()).ok_or_else(|| "probe_clock_unavailable".into())
 }
 
-fn upgrade_observation_node(
-    manifest: &ObservationManifest, launcher: String, relay: String,
-    mut save: impl FnMut(&ObservationManifest) -> Result<(), String>,
-) -> Result<ObservationManifest, String> {
-    if manifest.proxy_command == launcher && manifest.relay_command.as_ref() == Some(&relay) {
-        return Ok(manifest.clone());
-    }
-    if manifest.previous_proxy_command.is_some() { return Ok(manifest.clone()); }
-    let old = proxy_entry(manifest);
-    let mut next = manifest.clone();
-    next.proxy_command = launcher;
-    next.relay_command = Some(relay);
-    next.previous_proxy_command = Some(manifest.proxy_command.clone());
-    next.previous_relay_command = manifest.relay_command.clone();
-    let replacement = proxy_entry(&next);
-    // Keep both exact endpoints in the preparing record until the config
-    // switch commits. On restart we can distinguish either side from drift.
-    next.phase = "preparing".into();
-    save(&next)?;
-    if let Err(error) = patch_observation_node(&next, &old, &replacement) {
-        if read_observation_node(&next.agent, &next.config_path, &next.name).ok().flatten().as_ref() == Some(&old) {
-            let _ = save(manifest);
+pub(crate) fn has_probe_observations() -> Result<bool, String> {
+    Ok(observation_manifests()?.iter().any(|m| m.phase == "active" && m.relay_command.is_some()
+        && m.name != MEMORY_SERVER_NAME && m.name != LEGACY_MEMORY_SERVER_NAME))
+}
+
+fn prepare_probe_publication(
+    manifest: &ObservationManifest, candidate: &ProbeGeneration, now_ms: u64,
+) -> Result<Option<ObservationManifest>, String> {
+    let legacy = manifest.relay_command.as_deref().filter(|path|
+        crate::mcp_probe_protocol::digest_from_path(Path::new(path)).is_ok());
+    let runtime = ProbeRuntime::publish(manifest.relay_runtime.as_ref(), legacy, candidate, now_ms)
+        .map_err(str::to_string)?;
+    let Some(runtime) = runtime else {
+        // Heal only the legacy pointer alias, never the client or upstream.
+        if let Some(runtime) = &manifest.relay_runtime {
+            let preferred = &runtime.preferred_generation().map_err(str::to_string)?.command;
+            if manifest.relay_command.as_ref() != Some(preferred) {
+                let mut next = manifest.clone(); next.relay_command = Some(preferred.clone());
+                return Ok(Some(next));
+            }
         }
-        return Err(error);
-    }
-    next.phase = "active".into();
-    save(&next)?;
-    // A client may write its cached old node after our initial verified patch.
-    // Retain the pair even after commit so later status refreshes can reconcile it.
-    let installed = read_observation_node(&next.agent, &next.config_path, &next.name)?;
-    let reconciled = recover_upgrade_node(&next, installed.as_ref())?;
-    if reconciled != next { save(&reconciled)?; }
-    Ok(reconciled)
+        return Ok(None);
+    };
+    let mut next = manifest.clone();
+    next.relay_command = Some(runtime.preferred_generation().map_err(str::to_string)?.command.clone());
+    next.relay_runtime = Some(runtime);
+    Ok(Some(next))
 }
 
-fn recover_upgrade(manifest: &ObservationManifest, catalog: &[McpCatalogEntry]) -> Result<ObservationManifest, String> {
+fn publish_probe_manifest(
+    manifest: &ObservationManifest, entry: &McpCatalogEntry, candidate: &ProbeGeneration, now_ms: u64,
+    mut save: impl FnMut(&ObservationManifest) -> Result<(), String>,
+) -> Result<bool, String> {
+    if manifest.phase != "active" || manifest.fingerprint != observation_fingerprint(&manifest.agent, entry)
+        || normalize_transport(&entry.transport) != "stdio"
+        || !entry.assigned_agents.iter().any(|agent| physical_target(agent) == manifest.agent) {
+        return Err("probe_binding_changed".into());
+    }
+    let next = prepare_probe_publication(manifest, candidate, now_ms)?;
+    let Some(next) = next else { return Ok(false) };
+    let node = read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name)?;
+    if !node.as_ref().is_some_and(|node| proxy_matches(node, manifest)) {
+        return Err("probe_client_drifted".into());
+    }
+    save(&next)?;
+    Ok(true)
+}
+
+fn probe_catalog_snapshot() -> Result<Vec<McpCatalogEntry>, String> {
+    let root = observation_root()?;
+    let path = root.parent().ok_or("probe_catalog_unavailable")?.join("telemetry.sqlite3");
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| "probe_catalog_unavailable")?;
+    conn.busy_timeout(std::time::Duration::from_millis(500)).map_err(|_| "probe_catalog_unavailable")?;
+    let migration = read_setting::<CatalogMigration>(&conn, MCP_MIGRATION_SETTING_KEY)
+        .map_err(|_| "probe_catalog_invalid")?;
+    if !migration.is_some_and(|migration| migration.completed) { return Err("probe_catalog_not_ready".into()); }
+    read_setting(&conn, MCP_CATALOG_SETTING_KEY).map_err(|_| "probe_catalog_invalid".to_string())?
+        .ok_or_else(|| "probe_catalog_unavailable".into())
+}
+
+pub(crate) fn publish_probe_candidate(candidate: &ProbeGeneration) -> Result<crate::mcp_probe_updater::UpdateReport, String> {
+    let root = observation_root()?;
+    let relays = root.parent().ok_or("probe_directory_invalid")?.join("mcp-relays");
+    crate::mcp_probe_protocol::verify_file(&candidate.command, &candidate.digest, &relays).map_err(str::to_string)?;
+    let _guard = lock_observation_writes()?;
+    let catalog = probe_catalog_snapshot()?;
+    let manifests = observation_manifests()?;
+    let now = probe_now_ms()?;
+    let mut report = crate::mcp_probe_updater::UpdateReport::default();
+    for manifest in manifests {
+        if manifest.phase != "active" || manifest.relay_command.is_none()
+            || manifest.name == MEMORY_SERVER_NAME || manifest.name == LEGACY_MEMORY_SERVER_NAME { continue; }
+        let result = (|| -> Result<(), String> {
+            if catalog.iter().filter(|entry| entry.name == manifest.name).count() != 1 {
+                return Err("probe_catalog_ambiguous".into());
+            }
+            let entry = find_entry(&catalog, &manifest.name)?;
+            crate::mcp_fallback_resolver::verify_client_path(&manifest.agent, &manifest.config_path)?;
+            let node = read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name)?.ok_or("probe_client_missing")?;
+            let launchers = root.parent().ok_or("probe_directory_invalid")?.join("mcp-launchers");
+            let owned = owned_observation_proxy(&manifest.agent, &entry, &manifest.config_path, &node, &launchers)?;
+            if owned.id != manifest.id || owned.proxy_command != manifest.proxy_command { return Err("probe_client_drifted".into()); }
+            if publish_probe_manifest(&manifest, &entry, candidate, now, save_observation)? { report.published += 1; }
+            Ok(())
+        })();
+        if let Err(reason) = result { report.errors.insert(manifest.id, reason); }
+    }
+    Ok(report)
+}
+
+fn recover_upgrade(manifest: &ObservationManifest, catalog: &[McpCatalogEntry], allow_config_write: bool) -> Result<ObservationManifest, String> {
     if !matches!(manifest.phase.as_str(), "preparing" | "active") {
         return Ok(manifest.clone());
     }
     if manifest.previous_proxy_command.is_none() {
-        return recover_drifted_proxy(manifest, catalog);
+        return if allow_config_write { recover_drifted_proxy(manifest, catalog) } else { Ok(manifest.clone()) };
     }
     let entry = find_entry(catalog, &manifest.name)?;
     if manifest.fingerprint != observation_fingerprint(&manifest.agent, &entry)
@@ -1463,9 +1583,10 @@ fn recover_upgrade(manifest: &ObservationManifest, catalog: &[McpCatalogEntry]) 
     if current.as_ref() == Some(&canonical_for_manifest(manifest, &entry)) { return Ok(manifest.clone()); }
     let recovered = match recover_upgrade_node(manifest, current.as_ref()) {
         Ok(recovered) => recovered,
-        // Neither endpoint matches: the client may have written back an even
-        // older generation of the same assignment. Try converging forward.
-        Err(_) => return recover_drifted_proxy(manifest, catalog),
+        // Unrecorded client-node replacement requires an explicit retry. A
+        // status refresh must not switch the launch command behind a client.
+        Err(_) if allow_config_write => return recover_drifted_proxy(manifest, catalog),
+        Err(error) => return Err(error),
     };
     if &recovered != manifest {
         ensure_observation_idle(&manifest.id)?;
@@ -1528,6 +1649,7 @@ fn recover_upgrade_node(manifest: &ObservationManifest, current: Option<&Value>)
             previous.phase = "active".into();
             previous.previous_proxy_command = Some(manifest.proxy_command.clone());
             previous.previous_relay_command = manifest.relay_command.clone();
+            if manifest.relay_runtime.is_some() { previous.relay_command = manifest.relay_command.clone(); }
             return Ok(previous);
         }
     }
@@ -1605,6 +1727,7 @@ fn owned_observation_proxy(
         return Err("MCP 孤儿代理与资源库装备关系不一致".into());
     }
     let manifest = ObservationManifest {
+        relay_runtime: None,
         id: id.into(), name: entry.name.clone(), agent: agent.into(), config_path: path.into(),
         fingerprint: observation_fingerprint(agent, entry), proxy_command: command.into(),
         relay_command: None, previous_proxy_command: None, previous_relay_command: None,
@@ -1665,6 +1788,21 @@ fn displaced_observation(
     Ok(recovery)
 }
 
+/// Explicit stop can release bookkeeping after the client has already moved to
+/// a valid direct configuration. Preserve those bytes; never restore old values.
+fn release_detached_observation_node(
+    manifest: &ObservationManifest, current: Option<&Value>,
+    mut remove: impl FnMut(&ObservationManifest) -> Result<(), String>,
+) -> Result<bool, String> {
+    if let Some(node) = current {
+        if is_observation_proxy_node(node) { return Ok(false); }
+        entry_from_config(&manifest.name, &manifest.agent, node)
+            .map_err(|_| "当前直连配置无效，请先修复该客户端配置")?;
+    }
+    remove(manifest)?;
+    Ok(true)
+}
+
 fn restore_observation_node(
     manifest: &ObservationManifest, entry: &McpCatalogEntry,
     mut save: impl FnMut(&ObservationManifest) -> Result<(), String>,
@@ -1683,6 +1821,212 @@ fn restore_observation_node(
     recovery.phase = "recovery".into();
     save(&recovery)?;
     patch_observation_node(&recovery, current.as_ref().unwrap(), &canonical)
+}
+
+/// Finish only metadata for interrupted transitions; this worker never changes
+/// a client node. A custom edit stays available for explicit stop/arbitration.
+fn recover_observation_metadata(
+    manifest: &ObservationManifest, entry: &McpCatalogEntry, current: Option<&Value>,
+    mut save: impl FnMut(&ObservationManifest) -> Result<(), String>,
+    mut remove: impl FnMut(&ObservationManifest) -> Result<(), String>,
+) -> Result<bool, String> {
+    if !matches!(manifest.phase.as_str(), "preparing" | "recovery") { return Ok(false); }
+    if manifest.fingerprint != observation_fingerprint(&manifest.agent, entry)
+        || normalize_transport(&entry.transport) != "stdio"
+        || !entry.assigned_agents.iter().any(|agent| physical_target(agent) == manifest.agent) {
+        return Err("observation_transition_binding_changed".into());
+    }
+    if current == Some(&canonical_for_manifest(manifest, entry)) {
+        remove(manifest)?;
+        return Ok(true);
+    }
+    if manifest.phase == "preparing" && current.is_some_and(|node| proxy_matches(node, manifest)
+        || previous_observation_endpoint(manifest).is_some_and(|previous| proxy_matches(node, &previous))) {
+        let ready = recover_upgrade_node(manifest, current)?;
+        save(&ready)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+pub(crate) fn resume_observation_transitions() -> Result<crate::mcp_probe_updater::UpdateReport, String> {
+    if !observation_manifests()?.iter().any(|manifest| matches!(manifest.phase.as_str(), "preparing" | "recovery")) {
+        return Ok(Default::default());
+    }
+    let _guard = lock_observation_writes()?;
+    let catalog = observation_catalog()?;
+    let mut report = crate::mcp_probe_updater::UpdateReport::default();
+    for manifest in observation_manifests()? {
+        if !matches!(manifest.phase.as_str(), "preparing" | "recovery") { continue; }
+        let result = (|| -> Result<bool, String> {
+            if observation_config_path(&manifest.agent)? != manifest.config_path
+                || catalog.iter().filter(|entry| entry.name == manifest.name).count() != 1 {
+                return Err("observation_transition_binding_changed".into());
+            }
+            let entry = find_entry(&catalog, &manifest.name)?;
+            let current = read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name)?;
+            recover_observation_metadata(&manifest, &entry, current.as_ref(), save_observation, remove_observation)
+        })();
+        match result {
+            Ok(true) => report.transitions_recovered += 1,
+            Ok(false) => {},
+            Err(_) => { report.errors.insert(manifest.id, "observation_transition_recovery_pending".into()); },
+        }
+    }
+    Ok(report)
+}
+
+/// Durable, credential-free reminders live outside the active manifest directory.
+/// Keep the old binding through editing and cancellation; re-enabling clears it.
+fn parameter_issues_root() -> Result<PathBuf, String> {
+    Ok(observation_root()?.join("configuration-required"))
+}
+
+fn warn_parameter_issue_unavailable() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[mcp observation] ignoring unreadable configuration reminder");
+    }
+}
+
+/// Reminders are optional evidence, unlike authoritative routing manifests.
+/// A damaged historical record must not disable every status/update operation.
+/// Reading never deletes or rewrites the damaged file.
+fn parameter_issues_at(root: &Path) -> Vec<ObservationManifest> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(_) => { warn_parameter_issue_unavailable(); return Vec::new(); },
+    };
+    let mut issues = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else { warn_parameter_issue_unavailable(); continue; };
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") { continue; }
+        let issue = entry.file_type().ok().filter(|kind| kind.is_file() && !kind.is_symlink())
+            .and_then(|_| std::fs::read(&path).ok())
+            .and_then(|bytes| serde_json::from_slice::<ObservationManifest>(&bytes).ok())
+            .filter(|issue| uuid::Uuid::parse_str(&issue.id).ok().is_some_and(|id| id.to_string() == issue.id)
+                && path.file_stem().and_then(|stem| stem.to_str()) == Some(issue.id.as_str())
+                && matches!(issue.phase.as_str(), "preparing" | "active" | "recovery"));
+        match issue {
+            Some(issue) => issues.push(issue),
+            None => warn_parameter_issue_unavailable(),
+        }
+    }
+    issues
+}
+
+fn parameter_issues() -> Result<Vec<ObservationManifest>, String> {
+    Ok(parameter_issues_at(&parameter_issues_root()?))
+}
+
+fn parameter_issue_matches(issue: &ObservationManifest, manifest: &ObservationManifest) -> bool {
+    issue.id == manifest.id && issue.name == manifest.name && issue.agent == manifest.agent
+        && issue.config_path == manifest.config_path && issue.fingerprint == manifest.fingerprint
+        && issue.proxy_command == manifest.proxy_command && issue.omitted_args == manifest.omitted_args
+}
+
+fn clear_parameter_issues(name: &str, agent: &str) -> Result<(), String> {
+    let root = parameter_issues_root()?;
+    for issue in parameter_issues()?.into_iter().filter(|issue| issue.name == name && issue.agent == agent) {
+        match std::fs::remove_file(root.join(format!("{}.json", issue.id))) {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(_) => return Err("无法清除 MCP 重新配置提醒".into()),
+        }
+    }
+    Ok(())
+}
+
+fn disable_parameter_issue(
+    issue: &ObservationManifest, manifest: &ObservationManifest, entry: &McpCatalogEntry,
+    save: impl FnMut(&ObservationManifest) -> Result<(), String>,
+    mut remove: impl FnMut(&ObservationManifest) -> Result<(), String>,
+) -> Result<(), String> {
+    if !parameter_issue_matches(issue, manifest) || !matches!(manifest.phase.as_str(), "active" | "recovery")
+        || !entry.assigned_agents.iter().any(|agent| physical_target(agent) == manifest.agent) {
+        return Err("parameter_issue_binding_changed".into());
+    }
+    restore_observation_node(manifest, entry, save)?;
+    remove(manifest)
+}
+
+/// Caller holds the control lock. Only exact, unchanged application-owned nodes
+/// may be restored. Running processes are left alone; removal releases editing.
+fn disable_parameter_issues_locked(
+    issues: &[ObservationManifest], manifests: &[ObservationManifest], catalog: &[McpCatalogEntry],
+) -> crate::mcp_probe_updater::UpdateReport {
+    let mut report = crate::mcp_probe_updater::UpdateReport::default();
+    for issue in issues {
+        let Some(manifest) = manifests.iter().find(|manifest| manifest.id == issue.id) else { continue };
+        let result = (|| -> Result<(), String> {
+            if observation_config_path(&manifest.agent)? != manifest.config_path {
+                return Err("parameter_issue_binding_changed".into());
+            }
+            if catalog.iter().filter(|entry| entry.name == manifest.name).count() != 1 {
+                return Err("parameter_issue_catalog_ambiguous".into());
+            }
+            let entry = find_entry(catalog, &manifest.name)?;
+            disable_parameter_issue(issue, manifest, &entry, save_observation, remove_observation)?;
+            report.configuration_stopped += 1;
+            Ok(())
+        })();
+        if result.is_err() {
+            // Error strings from configuration parsers may contain private paths.
+            report.errors.insert(manifest.id.clone(), "parameter_observation_disable_pending".into());
+        }
+    }
+    report
+}
+
+pub(crate) fn retry_parameter_configuration() -> Result<crate::mcp_probe_updater::UpdateReport, String> {
+    if parameter_issues()?.is_empty() { return Ok(Default::default()); }
+    let _guard = lock_observation_writes()?;
+    Ok(disable_parameter_issues_locked(&parameter_issues()?, &observation_manifests()?, &observation_catalog()?))
+}
+
+/// Queue evidence independently of the writer lock. A busy CLI operation must
+/// not discard the request when the failed relay exits. These snapshots grant
+/// no write authority: the locked recovery revalidates every binding and node.
+fn queue_parameter_configuration_at(
+    root: &Path, assignment: &str, launch: &RelayLaunch,
+    manifests: &[ObservationManifest], catalog: &[McpCatalogEntry],
+) -> Result<(), String> {
+    let source = manifests.iter().find(|manifest| manifest.id == assignment && manifest.phase == "active")
+        .ok_or("parameter_issue_assignment_unavailable")?;
+    let entry = find_entry(catalog, &source.name)?;
+    if source.name != launch.server_name || entry.command != launch.command
+        || entry.args != launch.args || entry.env != launch.env
+        || observation_fingerprint(&source.agent, &entry) != source.fingerprint {
+        return Err("parameter_issue_upstream_changed".into());
+    }
+    std::fs::create_dir_all(root).map_err(|_| "parameter_issue_directory_unavailable")?;
+    // All targets use this catalog command. Disable their matching probes so
+    // editing the one shared entry does not get blocked by another client.
+    for manifest in manifests.iter().filter(|manifest| manifest.name == source.name && manifest.phase == "active") {
+        if observation_fingerprint(&manifest.agent, &entry) != manifest.fingerprint { continue; }
+        save_observation_at(&root.join(format!("{}.json", manifest.id)), manifest)?;
+    }
+    Ok(())
+}
+
+/// Invoked only after a relay proves a startup argument error. A stale failing
+/// process cannot undo a newer user configuration or replacement assignment.
+pub(crate) fn disable_observation_after_argument_error(assignment: &str, launch: &RelayLaunch) -> Result<(), String> {
+    queue_parameter_configuration_at(&parameter_issues_root()?, assignment, launch,
+        &observation_manifests()?, &observation_catalog()?)?;
+    let _guard = lock_observation_writes()?;
+    // Re-read after acquiring the lock: queuing may have overlapped a user edit.
+    let report = disable_parameter_issues_locked(&parameter_issues()?, &observation_manifests()?, &observation_catalog()?);
+    if report.errors.is_empty() { Ok(()) } else { Err("parameter_observation_disable_pending".into()) }
+}
+
+fn parameter_configuration_required(issue: &ObservationManifest, entry: &McpCatalogEntry, current: Option<&Value>) -> bool {
+    // Saving a new catalog entry alone is not enough: wait until the corrected
+    // configuration is applied to the client, or observation is explicitly enabled.
+    issue.fingerprint == observation_fingerprint(&issue.agent, entry)
+        || !current.is_some_and(|node| canonical_matches(&issue.agent, entry, node))
 }
 
 /// A detached manifest can be retired without touching the Agent file. Keep
@@ -1743,27 +2087,42 @@ fn observation_status(manifest: &ObservationManifest, catalog: &[McpCatalogEntry
             .and_then(|store| store.proxy_active_connections(&manifest.id).ok())
             .unwrap_or(0)
     } else { 0 };
+    let preferred = manifest.relay_runtime.as_ref().and_then(|runtime| runtime.preferred_generation().ok());
+    let mut tracking_error = None;
+    let pending = preferred.map(|generation| {
+        let current = crate::mcp_probe_connections::current_connections(&manifest.id, &generation.digest)
+            .unwrap_or_else(|_| { tracking_error = Some("probe_tracking_unconfirmed".to_string()); HashSet::new() });
+        crate::telemetry_store::shared_store().and_then(|store|
+            store.proxy_pending_probe_connections(&manifest.id, &current).ok()).unwrap_or_else(|| {
+                tracking_error = Some("probe_tracking_unconfirmed".to_string()); active_connections
+            })
+    }).unwrap_or(0);
     McpObservationStatus {
         name: manifest.name.clone(), agent: manifest.agent.clone(),
         state: if state == "awaiting_connection" && fallback_connections(&manifest.id) > 0 { "fallback" }
             else if active_connections > 0 { "observing" }
             else { state }.into(),
         active_connections,
+        probe_version: preferred.map(|generation| format!("{} / {}", generation.info.version, &generation.digest[..8])),
+        pending_probe_connections: if preferred.is_some() { pending + fallback_connections(&manifest.id) } else { 0 },
+        probe_update_error: crate::mcp_probe_updater::last_error(&manifest.id).or(tracking_error),
     }
 }
 
 #[tauri::command]
 pub async fn mcp_observation_status_all() -> Result<Vec<McpObservationStatus>, String> {
-    let _guard = observation_lock().lock().map_err(|_| "MCP observation 锁不可用")?;
-    retire_memory_observation();
     let catalog = read_catalog()?;
-    retire_detached_observations(&catalog)?;
     let manifests = observation_manifests()?;
+    let issues = parameter_issues()?;
     let mut statuses = Vec::with_capacity(manifests.len());
     for manifest in &manifests {
-        let recovered = recover_upgrade(manifest, &catalog).unwrap_or_else(|_| manifest.clone());
-        let current = upgrade_observation(&recovered, &catalog).unwrap_or(recovered);
-        statuses.push(observation_status(&current, &catalog));
+        let mut status = observation_status(manifest, &catalog);
+        if issues.iter().any(|issue| parameter_issue_matches(issue, manifest)) {
+            // A durable notice exists but its proxy has not yet been restored.
+            // Do not claim observation was disabled when a write failed.
+            status.state = "configuration_error".into();
+        }
+        statuses.push(status);
     }
     for entry in &catalog {
         for agent in &entry.assigned_agents {
@@ -1772,12 +2131,15 @@ pub async fn mcp_observation_status_all() -> Result<Vec<McpObservationStatus>, S
             statuses.push(McpObservationStatus {
                 name: entry.name.clone(), agent: physical.to_string(),
                 state: if normalize_transport(&entry.transport) == "stdio" && is_mcp_target(agent) && agent != "dsh" {
-                    let proxy = observation_config_path(physical).ok()
-                        .and_then(|path| read_observation_node(physical, &path, &entry.name).ok().flatten())
-                        .is_some_and(|node| is_observation_proxy_node(&node));
-                    if proxy { "drifted" } else { "off" }
+                    let path = observation_config_path(physical).ok();
+                    let node = path.as_ref().and_then(|path| read_observation_node(physical, path, &entry.name).ok().flatten());
+                    let proxy = node.as_ref().is_some_and(is_observation_proxy_node);
+                    let issue = issues.iter().any(|issue| issue.name == entry.name && issue.agent == physical
+                        && path.as_ref() == Some(&issue.config_path)
+                        && parameter_configuration_required(issue, entry, node.as_ref()));
+                    if proxy { "drifted" } else if issue { "configuration_required" } else { "off" }
                 } else { "unsupported" }.into(),
-                active_connections: 0,
+                active_connections: 0, probe_version: None, pending_probe_connections: 0, probe_update_error: None,
             });
         }
     }
@@ -1787,7 +2149,7 @@ pub async fn mcp_observation_status_all() -> Result<Vec<McpObservationStatus>, S
 
 #[tauri::command]
 pub async fn mcp_observation_set(name: String, agent: String, enabled: bool) -> Result<McpObservationStatus, String> {
-    let _guard = observation_lock().lock().map_err(|_| "MCP observation 锁不可用")?;
+    let _guard = lock_observation_writes()?;
     if !is_mcp_target(&agent) { return Err("此 Agent 不支持 MCP observation".into()); }
     if agent == "dsh" {
         // dsh 的 MCP 调用观测来自本地转录扫描（tool/call × tool/result 配对），
@@ -1843,8 +2205,7 @@ pub async fn mcp_observation_set(name: String, agent: String, enabled: bool) -> 
     }
     if enabled {
         if let Some(manifest) = existing {
-            let recovered = recover_upgrade(&manifest, &catalog)?;
-            let current = upgrade_observation(&recovered, &catalog)?;
+            let current = recover_upgrade(&manifest, &catalog, true)?;
             if current.phase != "active" || current.config_path != observation_config_path(&physical)?
                 || current.fingerprint != observation_fingerprint(&physical, &entry)
                 || !Path::new(&current.proxy_command).is_file()
@@ -1854,6 +2215,7 @@ pub async fn mcp_observation_set(name: String, agent: String, enabled: bool) -> 
             }
             let node = read_observation_node(&physical, &current.config_path, &name)?;
             if node.as_ref().is_some_and(|node| proxy_matches(node, &current)) {
+                clear_parameter_issues(&name, &physical)?;
                 return Ok(observation_status(&current, &catalog));
             }
             let canonical = canonical_for_manifest(&current, &entry);
@@ -1868,14 +2230,18 @@ pub async fn mcp_observation_set(name: String, agent: String, enabled: bool) -> 
                 }
                 return Err(error);
             }
+            clear_parameter_issues(&name, &physical)?;
             return Ok(observation_status(&current, &catalog));
         }
         let path = observation_config_path(&physical)?;
+        let candidate = crate::mcp_probe_updater::candidate()?;
+        let runtime = ProbeRuntime::publish(None, None, &candidate, probe_now_ms()?).map_err(str::to_string)?;
         let mut manifest = ObservationManifest {
+            relay_runtime: runtime,
             id: uuid::Uuid::new_v4().to_string(), name: name.clone(), agent: physical.clone(),
             config_path: path.clone(), fingerprint: observation_fingerprint(&physical, &entry),
             proxy_command: crate::mcp_launcher_installation::launcher_executable()?,
-            relay_command: Some(crate::mcp_launcher_installation::relay_executable()?),
+            relay_command: Some(candidate.command),
             previous_proxy_command: None, previous_relay_command: None, omitted_args: false, phase: "preparing".into(),
         };
         let current = read_observation_node(&manifest.agent, &path, &name)?
@@ -1895,13 +2261,19 @@ pub async fn mcp_observation_set(name: String, agent: String, enabled: bool) -> 
         }
         let mut ready = manifest;
         ready.phase = "active".into();
-        save_observation(&ready)?;
+        // activate_observation persisted readiness before publishing the client
+        // entry; a second write here would only add another failure window.
+        clear_parameter_issues(&name, &physical)?;
         Ok(observation_status(&ready, &catalog))
     } else if let Some(manifest) = existing {
         if manifest.config_path != observation_config_path(&manifest.agent)? {
             return Err("MCP 配置路径已变化，未覆盖用户修改".into());
         }
         let current = read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name)?;
+        if release_detached_observation_node(&manifest, current.as_ref(), remove_observation)? {
+            return Ok(McpObservationStatus { name, agent: physical, state: "off".into(), active_connections: 0,
+                probe_version: None, pending_probe_connections: 0, probe_update_error: None });
+        }
         let displaced = current.as_ref().is_some_and(|node| is_observation_proxy_node(node)
             && !proxy_matches(node, &manifest)
             && !previous_observation_endpoint(&manifest).is_some_and(|previous| proxy_matches(node, &previous)));
@@ -1913,9 +2285,11 @@ pub async fn mcp_observation_set(name: String, agent: String, enabled: bool) -> 
         } else { manifest };
         restore_observation_node(&manifest, &entry, save_observation)?;
         remove_observation(&manifest)?;
-        Ok(McpObservationStatus { name, agent: physical, state: "off".into(), active_connections: 0 })
+        // Disabling releases editing but does not repair incompatible arguments.
+        // Keep the durable reminder if the editor is cancelled or saving fails.
+        Ok(McpObservationStatus { name, agent: physical, state: "off".into(), active_connections: 0, probe_version: None, pending_probe_connections: 0, probe_update_error: None })
     } else {
-        Ok(McpObservationStatus { name, agent: physical, state: "off".into(), active_connections: 0 })
+        Ok(McpObservationStatus { name, agent: physical, state: "off".into(), active_connections: 0, probe_version: None, pending_probe_connections: 0, probe_update_error: None })
     }
 }
 
@@ -2065,12 +2439,14 @@ pub async fn mcp_equip(name: String, agent: String) -> Result<McpCatalogEntry, S
     if !is_mcp_target(&agent) {
         return Err(format!("暂不支持 {agent} 的 MCP 配置"));
     }
+    let _observation_guard = guarded_observation(&name, Some(&agent))?;
+    // Read under the same lock as the write. A queued equip must not apply an
+    // entry read before a concurrent catalog edit or arbitration completed.
     let catalog = read_catalog()?;
     let entry = find_entry(&catalog, &name)?;
     if !supports_transport(&agent, normalize_transport(&entry.transport)) {
         return Err(format!("{} 不支持该 transport", agent_label(&agent)));
     }
-    let _observation_guard = guarded_observation(&name, Some(&agent))?;
     apply_equip(&agent, &entry)?;
     save_assignment(&name, &agent, true)
 }
@@ -2081,9 +2457,9 @@ pub async fn mcp_unequip(name: String, agent: String) -> Result<McpCatalogEntry,
     if !is_mcp_target(&agent) {
         return Err(format!("暂不支持 {agent} 的 MCP 配置"));
     }
-    // 先确认中央目录可读且条目存在，再产生外部文件/CLI 副作用。
-    find_entry(&read_catalog()?, &name)?;
     let _observation_guard = guarded_observation(&name, Some(&agent))?;
+    // Validate existence inside the write lock, before any external side effect.
+    find_entry(&read_catalog()?, &name)?;
     apply_unequip(&agent, &name)?;
     save_assignment(&name, &agent, false)
 }
@@ -2121,7 +2497,13 @@ fn comparison_revision(
         }).collect();
     let mut manifests: Vec<_> = observation.iter().filter(|manifest| manifest.name == name).collect();
     manifests.sort_by(|a, b| a.agent.cmp(&b.agent).then(a.id.cmp(&b.id)));
-    let bytes = serde_json::to_vec(&json!({"catalog": catalog, "sources": sources, "observation": manifests}))
+    let bindings: Vec<_> = manifests.iter().map(|manifest| json!({
+        "id": manifest.id, "name": manifest.name, "agent": manifest.agent,
+        "config_path": manifest.config_path, "fingerprint": manifest.fingerprint,
+        "proxy_command": manifest.proxy_command, "omitted_args": manifest.omitted_args,
+        "phase": manifest.phase,
+    })).collect();
+    let bytes = serde_json::to_vec(&json!({"catalog": catalog, "sources": sources, "observation": bindings}))
         .map_err(|_| "无法生成 MCP 对比版本".to_string())?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
@@ -2182,10 +2564,7 @@ pub async fn mcp_configuration_compare(name: String) -> Result<McpConfigurationC
     if name.trim().is_empty() || name == MEMORY_SERVER_NAME || name == LEGACY_MEMORY_SERVER_NAME {
         return Err("不支持仲裁该 MCP 服务".into());
     }
-    let _guard = observation_lock().lock().map_err(|_| "MCP observation 锁不可用")?;
-    let catalog = read_catalog()?;
-    retire_detached_observations(&catalog)?;
-    let catalog = catalog.into_iter().find(|entry| entry.name == name);
+    let catalog = read_catalog()?.into_iter().find(|entry| entry.name == name);
     configuration_comparison(&name, catalog, &read_mcp_snapshots(), &observation_manifests()?)
 }
 
@@ -2275,7 +2654,7 @@ pub async fn mcp_sync_agent(agent: String) -> Result<(), String> {
     if !is_mcp_target(&agent) {
         return Err(format!("暂不支持 {agent} 的 MCP 配置"));
     }
-    let _observation_guard = observation_lock().lock().map_err(|_| "MCP observation 锁不可用")?;
+    let _observation_guard = lock_observation_writes()?;
     let catalog = read_catalog()?;
     if observation_manifests()?.iter().any(|manifest| manifest.agent == physical_target(&agent)) {
         return Err("此 Agent 存在正在观察的 MCP，请先关闭观察".into());
@@ -3083,6 +3462,7 @@ mod tests {
             "mcpServers": {"demo": canonical}, "theme": "light"
         })).unwrap()).unwrap();
         let manifest = ObservationManifest {
+            relay_runtime: None,
             id: uuid::Uuid::new_v4().to_string(), name: "demo".into(), agent: "claude_desktop".into(),
             config_path, fingerprint: observation_fingerprint("claude_desktop", &entry),
             proxy_command: directory.path().join("launcher").to_string_lossy().into_owned(),
@@ -3091,134 +3471,352 @@ mod tests {
         (directory, manifest, canonical)
     }
 
+
+    fn test_probe_candidate(directory: &Path, sequence: u64) -> ProbeGeneration {
+        let payload = format!("isolated probe fixture {sequence}");
+        let digest = format!("{:x}", Sha256::digest(payload.as_bytes()));
+        let relays = directory.join("mcp-relays");
+        std::fs::create_dir_all(&relays).unwrap();
+        let filename = format!("mcp-relay-{digest}{}", if cfg!(windows) { ".exe" } else { "" });
+        let command = relays.join(filename);
+        std::fs::write(&command, payload).unwrap();
+        ProbeGeneration {
+            command: command.to_string_lossy().into_owned(), digest,
+            info: crate::mcp_probe_protocol::ProbeInfo {
+                schema: 1, launcher_abi: 1, generation_resolution: 1,
+                version: "1.2.3".into(), build_sequence: sequence,
+            },
+            published_at_ms: 0, retire_after_ms: None,
+        }
+    }
+
+    fn legacy_binding_upgrade(manifest: &ObservationManifest) -> ObservationManifest {
+        let mut next = manifest.clone();
+        next.previous_proxy_command = Some(manifest.proxy_command.clone());
+        next.previous_relay_command = manifest.relay_command.clone();
+        next.proxy_command = "new-launcher".into();
+        next.relay_command = Some("new-relay".into());
+        next.phase = "preparing".into();
+        next
+    }
+
+    fn test_probe_entry() -> McpCatalogEntry {
+        McpCatalogEntry { name: "demo".into(), command: "node".into(),
+            assigned_agents: vec!["claude_desktop".into()], ..Default::default() }
+    }
+
     #[test]
-    fn observation_upgrade_refreshes_legacy_and_sidecar_endpoints() {
-        for previous_relay in [None, Some("old-relay".to_string())] {
-            let (_directory, mut manifest, canonical) = synthetic_observation();
-            manifest.relay_command = previous_relay.clone();
-            patch_observation_node(&manifest, &canonical, &proxy_entry(&manifest)).unwrap();
-            let mut saved = Vec::new();
-            let next = upgrade_observation_node(&manifest, "new-launcher".into(), "new-relay".into(), |state| {
-                saved.push(state.clone());
-                Ok(())
-            }).unwrap();
-            assert_eq!(saved.len(), 2);
-            assert_eq!(saved[0].phase, "preparing");
-            assert_eq!(saved[0].previous_proxy_command.as_ref(), Some(&manifest.proxy_command));
-            assert_eq!(saved[0].previous_relay_command, previous_relay);
-            assert_eq!(next.phase, "active");
-            assert_eq!(next.proxy_command, "new-launcher");
-            assert_eq!(next.relay_command.as_deref(), Some("new-relay"));
-            assert_eq!(next.previous_proxy_command.as_ref(), Some(&manifest.proxy_command));
-            assert_eq!(next.previous_relay_command, previous_relay);
-            assert_eq!(next.id, manifest.id);
-            assert_eq!(next.fingerprint, manifest.fingerprint);
-            assert_eq!(read_json_config(&manifest.config_path).unwrap()["theme"], "light");
-            let node = read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name).unwrap();
-            assert_eq!(node, Some(proxy_entry(&next)));
-            let rollback = recover_upgrade_node(&saved[0], Some(&proxy_entry(&manifest))).unwrap();
-            assert_eq!(rollback.proxy_command, manifest.proxy_command);
-            assert_eq!(rollback.relay_command, manifest.relay_command);
-            let committed = recover_upgrade_node(&saved[0], node.as_ref()).unwrap();
-            assert_eq!(committed.relay_command, next.relay_command);
+    fn legacy_binding_history_recovers_either_installed_endpoint() {
+        for relay in [None, Some("old-relay".to_string())] {
+            let (_directory, mut old, canonical) = synthetic_observation();
+            old.relay_command = relay.clone();
+            patch_observation_node(&old, &canonical, &proxy_entry(&old)).unwrap();
+            let staged = legacy_binding_upgrade(&old);
+            let rollback = recover_upgrade_node(&staged, Some(&proxy_entry(&old))).unwrap();
+            assert_eq!(rollback.proxy_command, old.proxy_command);
+            assert_eq!(rollback.relay_command, old.relay_command);
+            let committed = recover_upgrade_node(&staged, Some(&proxy_entry(&staged))).unwrap();
             assert_eq!(committed.phase, "active");
-            let unchanged = upgrade_observation_node(&next, "new-launcher".into(), "new-relay".into(), |_| {
-                panic!("unchanged endpoints must not rewrite the manifest")
-            }).unwrap();
-            assert_eq!(unchanged.proxy_command, next.proxy_command);
+            assert_eq!(committed.proxy_command, "new-launcher");
+            assert_eq!(committed.relay_command.as_deref(), Some("new-relay"));
+            assert_eq!(read_observation_node(&old.agent, &old.config_path, &old.name).unwrap(), Some(proxy_entry(&old)));
+        }
+    }
+
+
+    #[test]
+    fn automatic_probe_updates_a_b_c_preserve_cached_binding_and_client_bytes() {
+        let (directory, mut manifest, canonical) = synthetic_observation();
+        manifest.relay_command = Some("old-relay".into());
+        manifest.previous_proxy_command = Some("historical-launcher".into());
+        manifest.previous_relay_command = Some("historical-relay".into());
+        patch_observation_node(&manifest, &canonical, &proxy_entry(&manifest)).unwrap();
+        let raw = format!(" {{ \"mcpServers\" : {{ \"demo\" : {} }}, \"theme\" : \"light\" }}\n", serde_json::to_string(&proxy_entry(&manifest)).unwrap());
+        std::fs::write(&manifest.config_path, &raw).unwrap();
+        let original = manifest.clone();
+        let routing = directory.path().join("routing.json");
+        for sequence in 1..=3 {
+            let candidate = test_probe_candidate(directory.path(), sequence);
+            assert!(publish_probe_manifest(&manifest, &test_probe_entry(), &candidate, sequence * 1000,
+                |next| save_observation_at(&routing, next)).unwrap());
+            manifest = serde_json::from_slice(&std::fs::read(&routing).unwrap()).unwrap();
+            assert_eq!(manifest.relay_runtime.as_ref().unwrap().revision, sequence);
+            assert_eq!(manifest.relay_runtime.as_ref().unwrap().preferred, candidate.digest);
+            assert_eq!(manifest.relay_command.as_ref(), Some(&candidate.command));
+            assert_eq!(manifest.proxy_command, original.proxy_command);
+            assert_eq!(manifest.id, original.id);
+            assert_eq!(manifest.fingerprint, original.fingerprint);
+            assert_eq!(manifest.previous_proxy_command, original.previous_proxy_command);
+            assert_eq!(manifest.previous_relay_command, original.previous_relay_command);
+            assert_eq!(std::fs::read_to_string(&manifest.config_path).unwrap(), raw);
+        }
+        let runtime = manifest.relay_runtime.as_ref().unwrap();
+        let a = test_probe_candidate(directory.path(), 1);
+        assert!(runtime.selected_generation(&a.digest, 4000).is_ok());
+        assert!(!publish_probe_manifest(&manifest, &test_probe_entry(), &a, 5000,
+            |_| panic!("an old runtime must never overwrite the new preference")).unwrap());
+    }
+
+
+    #[test]
+    fn probe_publication_save_failure_preserves_last_published_preference() {
+        let (directory, mut manifest, canonical) = synthetic_observation();
+        manifest.relay_command = Some("old-relay".into());
+        patch_observation_node(&manifest, &canonical, &proxy_entry(&manifest)).unwrap();
+        let before_client = std::fs::read(&manifest.config_path).unwrap();
+        let routing = directory.path().join("routing.json");
+        let a = test_probe_candidate(directory.path(), 1);
+        publish_probe_manifest(&manifest, &test_probe_entry(), &a, 1000,
+            |next| save_observation_at(&routing, next)).unwrap();
+        manifest = serde_json::from_slice(&std::fs::read(&routing).unwrap()).unwrap();
+        let before_runtime = std::fs::read(&routing).unwrap();
+        let b = test_probe_candidate(directory.path(), 2);
+        let result = publish_probe_manifest(&manifest, &test_probe_entry(), &b, 2000,
+            |_| Err("simulated atomic save failure".into()));
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&routing).unwrap(), before_runtime);
+        assert_eq!(std::fs::read(&manifest.config_path).unwrap(), before_client);
+    }
+
+
+    #[test]
+    fn legacy_binding_recovery_rejects_custom_nodes_and_missing_old_relay_is_compatible() {
+        let (_directory, manifest, canonical) = synthetic_observation();
+        let staged = legacy_binding_upgrade(&manifest);
+        assert!(recover_upgrade_node(&staged, Some(&json!({"command": "custom"}))).is_err());
+        let mut legacy = serde_json::to_value(&staged).unwrap();
+        legacy.as_object_mut().unwrap().remove("previous_relay_command");
+        legacy.as_object_mut().unwrap().remove("relay_runtime");
+        let legacy: ObservationManifest = serde_json::from_value(legacy).unwrap();
+        let restored = recover_upgrade_node(&legacy, Some(&proxy_entry(&manifest))).unwrap();
+        assert!(restored.relay_command.is_none());
+        assert_eq!(restored.phase, "active");
+        assert_eq!(read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name).unwrap(), Some(canonical));
+    }
+
+
+    #[test]
+    fn stale_binding_snapshot_cannot_downgrade_published_probe() {
+        let (directory, mut manifest, canonical) = synthetic_observation();
+        manifest.relay_command = Some("old-relay".into());
+        patch_observation_node(&manifest, &canonical, &proxy_entry(&manifest)).unwrap();
+        let before_client = std::fs::read(&manifest.config_path).unwrap();
+        let routing = directory.path().join("routing.json");
+        let a = test_probe_candidate(directory.path(), 1);
+        publish_probe_manifest(&manifest, &test_probe_entry(), &a, 1000,
+            |next| save_observation_at(&routing, next)).unwrap();
+        let stale: ObservationManifest = serde_json::from_slice(&std::fs::read(&routing).unwrap()).unwrap();
+        let c = test_probe_candidate(directory.path(), 3);
+        publish_probe_manifest(&stale, &test_probe_entry(), &c, 3000,
+            |next| save_observation_at(&routing, next)).unwrap();
+        save_observation_at(&routing, &stale).unwrap();
+        let persisted: ObservationManifest = serde_json::from_slice(&std::fs::read(&routing).unwrap()).unwrap();
+        assert_eq!(persisted.relay_runtime.as_ref().unwrap().preferred, c.digest);
+        assert_eq!(persisted.relay_command.as_ref(), Some(&c.command));
+        assert_eq!(std::fs::read(&manifest.config_path).unwrap(), before_client);
+        let mut historical = legacy_binding_upgrade(&stale);
+        historical.relay_runtime = persisted.relay_runtime.clone();
+        historical.relay_command = persisted.relay_command.clone();
+        historical.phase = "active".into();
+        let recovered = recover_upgrade_node(&historical, Some(&proxy_entry(&stale))).unwrap();
+        assert_eq!(recovered.proxy_command, stale.proxy_command);
+        assert_eq!(recovered.relay_runtime, persisted.relay_runtime);
+        assert_eq!(recovered.relay_command, persisted.relay_command);
+    }
+
+
+    #[test]
+    fn automatic_probe_publication_never_overwrites_a_server_config_update() {
+        let (directory, manifest, canonical) = synthetic_observation();
+        patch_observation_node(&manifest, &canonical, &proxy_entry(&manifest)).unwrap();
+        let updated = json!({"command": "new-server", "args": ["--new-syntax"]});
+        patch_observation_node(&manifest, &proxy_entry(&manifest), &updated).unwrap();
+        let before = std::fs::read(&manifest.config_path).unwrap();
+        let candidate = test_probe_candidate(directory.path(), 2);
+        assert!(publish_probe_manifest(&manifest, &test_probe_entry(), &candidate, 1000,
+            |_| panic!("client drift must not be rewritten or published")).is_err());
+        assert_eq!(std::fs::read(&manifest.config_path).unwrap(), before);
+        let mut changed = test_probe_entry(); changed.command = "new-server".into();
+        assert!(publish_probe_manifest(&manifest, &changed, &candidate, 1000,
+            |_| panic!("upstream authorization cannot be guessed")).is_err());
+    }
+
+    #[test]
+    fn probe_control_lock_serializes_independent_writer_handles() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = control_file_lock(directory.path(), std::time::Duration::ZERO).unwrap();
+        assert!(control_file_lock(directory.path(), std::time::Duration::ZERO).is_err());
+        drop(first);
+        assert!(control_file_lock(directory.path(), std::time::Duration::ZERO).is_ok());
+    }
+
+
+    #[test]
+    fn probe_version_updates_do_not_invalidate_server_configuration_comparison() {
+        let (directory, mut manifest, _canonical) = synthetic_observation();
+        let entry = test_probe_entry();
+        let sources = snapshots(&[("claude_desktop", json!({"demo": proxy_entry(&manifest)}))]);
+        let first = comparison_revision("demo", Some(&entry), &sources, &[manifest.clone()]).unwrap();
+        let candidate = test_probe_candidate(directory.path(), 2);
+        manifest = prepare_probe_publication(&manifest, &candidate, 1000).unwrap().unwrap();
+        let next = comparison_revision("demo", Some(&entry), &sources, &[manifest]).unwrap();
+        assert_eq!(first, next, "the probe is not part of the upstream configuration version");
+    }
+
+    #[test]
+    fn observation_is_ready_before_the_client_can_launch_its_new_entry() {
+        let (directory, mut manifest, canonical) = synthetic_observation();
+        manifest.phase = "preparing".into();
+        let routing = directory.path().join("routing.json");
+        save_observation_at(&routing, &manifest).unwrap();
+        activate_ready_observation(&manifest, &canonical, |ready| {
+            assert_eq!(ready.phase, "active");
+            assert_eq!(read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name).unwrap(), Some(canonical.clone()));
+            save_observation_at(&routing, ready)
+        }, || {
+            let ready: ObservationManifest = serde_json::from_slice(&std::fs::read(&routing).unwrap()).unwrap();
+            assert_eq!(ready.phase, "active");
+            assert_eq!(read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name).unwrap(), Some(proxy_entry(&manifest)));
+        }).unwrap();
+    }
+
+    #[test]
+    fn interrupted_activation_finishes_metadata_without_rewriting_the_client() {
+        let (_directory, mut manifest, canonical) = synthetic_observation();
+        manifest.phase = "preparing".into();
+        patch_observation_node(&manifest, &canonical, &proxy_entry(&manifest)).unwrap();
+        let before = std::fs::read(&manifest.config_path).unwrap();
+        let current = read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name).unwrap();
+        let mut saved = false;
+        assert!(recover_observation_metadata(&manifest, &test_probe_entry(), current.as_ref(), |ready| {
+            assert_eq!(ready.phase, "active"); saved = true; Ok(())
+        }, |_| panic!("an installed proxy cannot be discarded")).unwrap());
+        assert!(saved);
+        assert_eq!(std::fs::read(&manifest.config_path).unwrap(), before);
+        let mut removed = false;
+        assert!(recover_observation_metadata(&manifest, &test_probe_entry(), Some(&canonical),
+            |_| panic!("an unpublished entry needs no active route"), |_| { removed = true; Ok(()) }).unwrap());
+        assert!(removed);
+    }
+
+    #[test]
+    fn explicit_stop_releases_old_observation_without_overwriting_user_direct_configuration() {
+        let (_directory, manifest, canonical) = synthetic_observation();
+        let custom = json!({"command": "new-server", "args": ["--new-syntax"], "env": {"CUSTOM": "value"}});
+        patch_observation_node(&manifest, &canonical, &custom).unwrap();
+        let before = std::fs::read(&manifest.config_path).unwrap();
+        let mut removed = false;
+        assert!(release_detached_observation_node(&manifest, Some(&custom), |_| { removed = true; Ok(()) }).unwrap());
+        assert!(removed);
+        assert_eq!(std::fs::read(&manifest.config_path).unwrap(), before);
+        assert!(!release_detached_observation_node(&manifest, Some(&proxy_entry(&manifest)),
+            |_| panic!("a proxy must use the verified restore path")).unwrap());
+        assert!(release_detached_observation_node(&manifest, Some(&json!({"args": []})),
+            |_| panic!("invalid direct configuration must remain recoverable")).is_err());
+    }
+
+    #[test]
+    fn damaged_optional_reminders_do_not_hide_healthy_records_or_mutate_files() {
+        let (directory, manifest, _canonical) = synthetic_observation();
+        let notices = directory.path().join("reminders");
+        std::fs::create_dir(&notices).unwrap();
+        save_observation_at(&notices.join(format!("{}.json", manifest.id)), &manifest).unwrap();
+        let damaged = notices.join(format!("{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&damaged, b"{").unwrap();
+        std::fs::write(notices.join("not-an-assignment.json"), b"{}").unwrap();
+        assert_eq!(parameter_issues_at(&notices), vec![manifest]);
+        assert_eq!(std::fs::read(&damaged).unwrap(), b"{");
+        assert!(parameter_issues_at(&directory.path().join("absent")).is_empty());
+        assert!(parameter_issues_at(&damaged).is_empty());
+    }
+
+    #[test]
+    fn parameter_recovery_request_survives_a_busy_writer_without_touching_the_client() {
+        let (directory, manifest, canonical) = synthetic_observation();
+        let entry = test_probe_entry();
+        patch_observation_node(&manifest, &canonical, &proxy_entry(&manifest)).unwrap();
+        let before = std::fs::read(&manifest.config_path).unwrap();
+        let root = directory.path().join("observations");
+        let held = control_file_lock(&root, std::time::Duration::ZERO).unwrap();
+        let notices = root.join("configuration-required");
+        let launch = RelayLaunch { server_name: entry.name.clone(), command: entry.command.clone(),
+            args: entry.args.clone(), env: entry.env.clone(), runtime_digest: None };
+        queue_parameter_configuration_at(&notices, &manifest.id, &launch, &[manifest.clone()], &[entry.clone()]).unwrap();
+        assert!(control_file_lock(&root, std::time::Duration::ZERO).is_err());
+        assert_eq!(observation_manifests_at(&notices).unwrap(), vec![manifest.clone()]);
+        assert_eq!(std::fs::read(&manifest.config_path).unwrap(), before);
+        drop(held);
+        assert!(control_file_lock(&root, std::time::Duration::ZERO).is_ok());
+        let mut corrected = entry;
+        corrected.args.push("--new-syntax".into());
+        assert!(queue_parameter_configuration_at(&notices, &manifest.id, &launch, &[manifest.clone()], &[corrected]).is_err());
+    }
+
+    #[test]
+    fn parameter_error_disables_the_exact_proxy_and_keeps_a_durable_reminder() {
+        let (directory, manifest, canonical) = synthetic_observation();
+        let entry = test_probe_entry();
+        patch_observation_node(&manifest, &canonical, &proxy_entry(&manifest)).unwrap();
+        let notices = directory.path().join("configuration-required");
+        std::fs::create_dir(&notices).unwrap();
+        let notice = notices.join(format!("{}.json", manifest.id));
+        save_observation_at(&notice, &manifest).unwrap();
+        let mut removed = false;
+        disable_parameter_issue(&manifest, &manifest, &entry, |next| {
+            assert_eq!(next.phase, "recovery");
+            Ok(())
+        }, |_| { removed = true; Ok(()) }).unwrap();
+        assert!(removed);
+        assert_eq!(read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name).unwrap(), Some(canonical));
+        assert_eq!(read_json_config(&manifest.config_path).unwrap()["theme"], "light");
+        assert_eq!(observation_manifests_at(&notices).unwrap(), vec![manifest]);
+    }
+
+    #[test]
+    fn parameter_error_does_not_replace_new_bindings_upstream_or_custom_client_edits() {
+        for change in ["binding", "upstream", "client"] {
+            let (_directory, mut manifest, canonical) = synthetic_observation();
+            let issue = manifest.clone();
+            let mut entry = test_probe_entry();
+            patch_observation_node(&manifest, &canonical, &proxy_entry(&manifest)).unwrap();
+            match change {
+                "binding" => { manifest.id = uuid::Uuid::new_v4().to_string(); },
+                "upstream" => { entry.args.push("--new-syntax".into()); },
+                _ => { patch_observation_node(&manifest, &proxy_entry(&manifest), &json!({"command": "user-edited"})).unwrap(); },
+            }
+            let before = std::fs::read(&manifest.config_path).unwrap();
+            assert!(disable_parameter_issue(&issue, &manifest, &entry,
+                |_| panic!("stale or custom configurations must not be saved"),
+                |_| panic!("stale or custom bindings must not be removed")).is_err());
+            assert_eq!(std::fs::read(&manifest.config_path).unwrap(), before);
         }
     }
 
     #[test]
-    fn observation_relay_only_upgrade_recovers_after_final_save_failure() {
-        let (_directory, mut manifest, canonical) = synthetic_observation();
-        manifest.relay_command = Some("old-relay".into());
+    fn parameter_disable_failures_remain_recoverable_and_retry_idempotently() {
+        let (_directory, manifest, canonical) = synthetic_observation();
+        let entry = test_probe_entry();
         patch_observation_node(&manifest, &canonical, &proxy_entry(&manifest)).unwrap();
-        let mut preparing = None;
-        let result = upgrade_observation_node(&manifest, manifest.proxy_command.clone(), "new-relay".into(), |state| {
-            if state.phase == "preparing" {
-                preparing = Some(state.clone());
-                Ok(())
-            } else {
-                Err("simulated final save failure".into())
-            }
-        });
-        assert!(result.is_err());
-        let current = read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name).unwrap();
-        assert_eq!(current, Some(proxy_entry(&manifest)));
-        let recovered = recover_upgrade_node(&preparing.unwrap(), current.as_ref()).unwrap();
-        assert_eq!(recovered.phase, "active");
-        assert_eq!(recovered.relay_command.as_deref(), Some("new-relay"));
-        assert_eq!(recovered.previous_relay_command.as_deref(), Some("old-relay"));
+        assert!(disable_parameter_issue(&manifest, &manifest, &entry,
+            |_| Err("cannot save recovery".into()), |_| panic!("must retain the manifest")).is_err());
+        assert_eq!(read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name).unwrap(), Some(proxy_entry(&manifest)));
+        assert!(disable_parameter_issue(&manifest, &manifest, &entry,
+            |_| Ok(()), |_| Err("cannot remove manifest".into())).is_err());
+        assert_eq!(read_observation_node(&manifest.agent, &manifest.config_path, &manifest.name).unwrap(), Some(canonical));
+        disable_parameter_issue(&manifest, &manifest, &entry,
+            |_| panic!("a restored direct node needs no second write"), |_| Ok(())).unwrap();
     }
 
     #[test]
-    fn observation_upgrade_rejects_config_drift_and_restores_old_manifest_shape() {
-        let (_directory, mut manifest, _canonical) = synthetic_observation();
-        manifest.relay_command = Some("old-relay".into());
-        let mut saved = Vec::new();
-        assert!(upgrade_observation_node(&manifest, "new-launcher".into(), "new-relay".into(), |state| {
-            saved.push(state.clone());
-            Ok(())
-        }).is_err());
-        assert_eq!(saved.len(), 1);
-        assert!(recover_upgrade_node(&saved[0], Some(&json!({"command": "custom"}))).is_err());
-        let mut legacy = serde_json::to_value(&saved[0]).unwrap();
-        legacy.as_object_mut().unwrap().remove("previous_relay_command");
-        let legacy: ObservationManifest = serde_json::from_value(legacy).unwrap();
-        let old = recover_upgrade_node(&legacy, Some(&proxy_entry(&manifest))).unwrap();
-        assert!(old.relay_command.is_none());
-        assert_eq!(old.phase, "active");
-        assert_eq!(read_json_config(&manifest.config_path).unwrap()["mcpServers"]["demo"]["command"], "node");
-    }
-
-    #[test]
-    fn committed_upgrade_reconciles_delayed_writeback_without_losing_either_pair() {
-        let (_directory, mut original, canonical) = synthetic_observation();
-        original.relay_command = Some("old-relay".into());
-        patch_observation_node(&original, &canonical, &proxy_entry(&original)).unwrap();
-        let upgraded = upgrade_observation_node(&original, "new-launcher".into(), "new-relay".into(), |_| Ok(())).unwrap();
-        let upgraded: ObservationManifest = serde_json::from_slice(&serde_json::to_vec(&upgraded).unwrap()).unwrap();
-        let retained = upgrade_observation_node(&upgraded, "third-launcher".into(), "third-relay".into(), |_| {
-            panic!("a third generation must not overwrite rollback history")
-        }).unwrap();
-        assert_eq!(retained, upgraded);
-        patch_observation_node(&original, &proxy_entry(&upgraded), &proxy_entry(&original)).unwrap();
-        let installed = read_observation_node(&original.agent, &original.config_path, &original.name).unwrap();
-        let rolled_back = recover_upgrade_node(&upgraded, installed.as_ref()).unwrap();
-        assert_eq!(rolled_back.proxy_command, original.proxy_command);
-        assert_eq!(rolled_back.relay_command, original.relay_command);
-        assert_eq!(rolled_back.previous_proxy_command.as_deref(), Some("new-launcher"));
-        assert_eq!(rolled_back.previous_relay_command.as_deref(), Some("new-relay"));
-        assert_eq!(recover_upgrade_node(&rolled_back, installed.as_ref()).unwrap(), rolled_back);
-        let unchanged = upgrade_observation_node(&rolled_back, "third-launcher".into(), "third-relay".into(), |_| {
-            panic!("polling must not replace retained endpoint history")
-        }).unwrap();
-        assert_eq!(unchanged, rolled_back);
-        let forward = recover_upgrade_node(&rolled_back, Some(&proxy_entry(&upgraded))).unwrap();
-        assert_eq!(forward.proxy_command, upgraded.proxy_command);
-        assert_eq!(forward.relay_command, upgraded.relay_command);
-        assert_eq!(read_json_config(&original.config_path).unwrap()["theme"], "light");
-    }
-
-    #[test]
-    fn upgrade_rechecks_the_node_after_saving_active() {
-        let (_directory, mut original, canonical) = synthetic_observation();
-        original.relay_command = Some("old-relay".into());
-        patch_observation_node(&original, &canonical, &proxy_entry(&original)).unwrap();
-        let mut saved = Vec::new();
-        let result = upgrade_observation_node(&original, "new-launcher".into(), "new-relay".into(), |state| {
-            saved.push(state.clone());
-            if saved.len() == 2 {
-                patch_observation_node(state, &proxy_entry(state), &proxy_entry(&original))?;
-            }
-            Ok(())
-        }).unwrap();
-        assert_eq!(saved.len(), 3);
-        assert_eq!(result.proxy_command, original.proxy_command);
-        assert_eq!(result.relay_command, original.relay_command);
-        assert_eq!(result.previous_relay_command.as_deref(), Some("new-relay"));
-        assert_eq!(saved.last(), Some(&result));
+    fn parameter_reminder_waits_for_changed_configuration_to_reach_the_client() {
+        let (_directory, manifest, canonical) = synthetic_observation();
+        let entry = test_probe_entry();
+        assert!(parameter_configuration_required(&manifest, &entry, Some(&canonical)));
+        let mut corrected = entry.clone();
+        corrected.args.push("--new-syntax".into());
+        assert!(parameter_configuration_required(&manifest, &corrected, Some(&canonical)));
+        assert!(!parameter_configuration_required(&manifest, &corrected,
+            Some(&observation_canonical(&manifest.agent, &corrected))));
     }
 
     #[test]
@@ -3432,6 +4030,7 @@ mod tests {
             ..Default::default()
         };
         let manifest = ObservationManifest {
+            relay_runtime: None,
             id: uuid::Uuid::new_v4().to_string(), name: entry.name.clone(),
             agent: "codex_cli".into(), config_path: PathBuf::from("config.toml"),
             fingerprint: observation_fingerprint("codex_cli", &entry),

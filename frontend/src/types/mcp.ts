@@ -62,7 +62,7 @@ export interface McpAgentStatus {
   error: string | null
 }
 
-export type McpObservationState = 'off' | 'awaiting_connection' | 'observing' | 'fallback' | 'drifted' | 'recovery' | 'unsupported'
+export type McpObservationState = 'off' | 'awaiting_connection' | 'observing' | 'fallback' | 'drifted' | 'recovery' | 'unsupported' | 'configuration_required' | 'configuration_error'
 
 /** Live stdio observation for a catalog assignment. */
 export interface McpObservationStatus {
@@ -70,6 +70,9 @@ export interface McpObservationStatus {
   agent: string
   state: McpObservationState
   active_connections: number
+  probe_version?: string | null
+  pending_probe_connections?: number
+  probe_update_error?: string | null
 }
 
 /** dsh 桥接插件的特性开关（Rust 侧覆盖行未写时默认全开）。 */

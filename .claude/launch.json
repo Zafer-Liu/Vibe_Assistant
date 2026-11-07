@@ -1,0 +1,24 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "vibe-frontend",
+      "runtimeExecutable": "E:\\Tool\\node\\node.exe",
+      "runtimeArgs": [
+        "E:\\Tool\\node\\node_modules\\npm\\bin\\npm-cli.js",
+        "--prefix",
+        "frontend",
+        "run",
+        "dev",
+        "--",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "1420",
+        "--strictPort"
+      ],
+      "port": 1420,
+      "url": "http://localhost:1420"
+    }
+  ]
+}

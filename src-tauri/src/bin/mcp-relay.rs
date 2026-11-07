@@ -5,6 +5,13 @@
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.as_slice() == ["--probe-info"] {
+        match agent_manager_lib::mcp_probe_info_json(option_env!("VIBE_MCP_RELAY_BUILD_SEQUENCE").unwrap_or("0")) {
+            Ok(info) => println!("{info}"),
+            Err(reason) => { eprintln!("[mcp-relay] {reason}"); std::process::exit(2); }
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "--mcp-relay") && args.len() == 2 {
         if let Err(reason) = agent_manager_lib::run_mcp_stdio_relay(&args[1]) {
             eprintln!("[mcp-relay] {reason}");

@@ -4,7 +4,7 @@
 //! caller only.
 
 use crate::mcp_registry::mcp_catalog_list;
-use crate::mcp_stdio_relay::child_command;
+use crate::mcp_command::command_with_env;
 use crate::process_util::no_window;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read};
@@ -110,10 +110,9 @@ fn starts_shared_daemon(entry: &CatalogEntry) -> bool {
 }
 
 fn run_stdio_discovery(entry: &CatalogEntry) -> Result<(Vec<McpDiscoveredTool>, bool), String> {
-    let mut command = child_command(&entry.command, &entry.args)
+    let mut command = command_with_env(&entry.command, &entry.args, &entry.env)
         .map_err(|_| "无法安全启动该 MCP 服务命令".to_string())?;
-    command.envs(&entry.env)
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
     no_window(&mut command);
     let deadline = Instant::now() + DISCOVERY_TIMEOUT;
     let mut child = command.spawn().map_err(|_| "MCP 服务启动失败".to_string())?;

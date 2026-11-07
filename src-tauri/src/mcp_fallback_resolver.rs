@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+use crate::mcp_probe_protocol::{digest_from_path, verify_file, ProbeRuntime};
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -20,6 +21,8 @@ struct Manifest {
     proxy_command: String,
     #[serde(default)]
     relay_command: Option<String>,
+    #[serde(default)]
+    relay_runtime: Option<ProbeRuntime>,
     phase: String,
 }
 
@@ -47,6 +50,7 @@ pub struct FallbackLaunch {
     pub env: BTreeMap<String, String>,
     pub relay_command: String,
     pub assignment_id: String,
+    pub runtime_digest: Option<String>,
 }
 
 fn physical_target(agent: &str) -> &str {
@@ -151,7 +155,11 @@ fn default_config_path(agent: &str) -> Option<PathBuf> {
 }
 
 fn verified_path(manifest: &Manifest) -> Result<(), String> {
-    let expected = match manifest.agent.as_str() {
+    verify_client_path(&manifest.agent, &manifest.config_path)
+}
+
+pub(crate) fn verify_client_path(agent: &str, config_path: &Path) -> Result<(), String> {
+    let expected = match agent {
         "codex_cli" => std::env::var("CODEX_HOME").ok().filter(|home| !home.trim().is_empty())
             .map(|home| PathBuf::from(home).join("config.toml"))
             .or_else(|| dirs_next::home_dir().map(|home| home.join(".codex").join("config.toml"))),
@@ -195,20 +203,20 @@ fn verified_path(manifest: &Manifest) -> Result<(), String> {
             let overrides = config_root()?.join("agent_source_paths.json");
             let settings: Value = std::fs::read(&overrides).ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_else(|| json!({}));
-            if let Some(home) = settings.get(&manifest.agent).and_then(|entry| entry.get("config_home")).and_then(Value::as_str).filter(|home| !home.trim().is_empty()) {
+            if let Some(home) = settings.get(agent).and_then(|entry| entry.get("config_home")).and_then(Value::as_str).filter(|home| !home.trim().is_empty()) {
                 let mut path = PathBuf::from(home);
-                match manifest.agent.as_str() {
+                match agent {
                     "zcode" => path.push("cli/config.json"),
                     "gemini" => path.push("settings.json"),
                     "antigravity" => path.push("mcp_config.json"),
                     _ => path.push("mcp.json"),
                 }
                 Some(path)
-            } else { default_config_path(&manifest.agent) }
+            } else { default_config_path(agent) }
         }
         _ => return Err("Unsupported MCP agent".into()),
     };
-    if expected.is_none_or(|path| path != manifest.config_path) {
+    if expected.as_deref().is_none_or(|path| path != config_path) {
         return Err("Agent config path changed".into());
     }
     Ok(())
@@ -292,11 +300,110 @@ fn resolve(assignment_id: &str, launcher_process: bool) -> Result<FallbackLaunch
         expected["enabled"] = json!(true);
     }
     if installed_node(&manifest)? != expected { return Err("Agent assignment changed".into()); }
+    let executable = std::env::current_exe().map_err(|_| "Probe executable unavailable")?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .ok().and_then(|value| u64::try_from(value.as_millis()).ok()).ok_or("Probe clock unavailable")?;
+    let (relay_command, runtime_digest) = probe_route(&manifest, &root, launcher_process, &executable, now)?;
     Ok(FallbackLaunch {
         command: entry.command,
         args: entry.args,
         env: entry.env,
-        relay_command: manifest.relay_command.unwrap_or_default(),
-        assignment_id: id,
+        relay_command,
+        assignment_id: id, runtime_digest,
     })
+}
+
+fn probe_route(
+    manifest: &Manifest, root: &Path, launcher: bool, executable: &Path, now_ms: u64,
+) -> Result<(String, Option<String>), String> {
+    let directory = root.join("mcp-relays");
+    let select = || -> Result<(String, Option<String>), String> {
+        let command = if let Some(runtime) = &manifest.relay_runtime {
+            if launcher {
+                runtime.preferred_generation().map_err(str::to_string)?.command.clone()
+            } else {
+                let digest = digest_from_path(executable).map_err(str::to_string)?;
+                runtime.selected_generation(&digest, now_ms).map_err(str::to_string)?.command.clone()
+            }
+        } else { manifest.relay_command.clone().ok_or("Probe missing")? };
+        let digest = digest_from_path(Path::new(&command)).map_err(str::to_string)?;
+        let expected = verify_file(&command, &digest, &directory).map_err(str::to_string)?;
+        if !launcher && executable.canonicalize().map_err(|_| "Probe executable unavailable")? != expected {
+            return Err("Probe executable changed".into());
+        }
+        Ok((command, Some(digest)))
+    };
+    match select() {
+        Ok(route) => Ok(route),
+        // Once the stable binding and upstream are authorized, a missing or bad
+        // probe must not prevent transparent forwarding through pre-GO fallback.
+        Err(_) if launcher => Ok((String::new(), None)),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp_probe_protocol::{ProbeGeneration, ProbeInfo};
+
+    fn generation(directory: &Path, sequence: u64) -> ProbeGeneration {
+        let contents = format!("isolated executable fixture {sequence}");
+        let digest = format!("{:x}", Sha256::digest(contents.as_bytes()));
+        let path = directory.join(format!("mcp-relay-{digest}{}", if cfg!(windows) { ".exe" } else { "" }));
+        std::fs::write(&path, contents).unwrap();
+        ProbeGeneration {
+            command: path.to_string_lossy().into_owned(), digest,
+            info: ProbeInfo { schema: 1, launcher_abi: 1, generation_resolution: 1,
+                version: "1.2.3".into(), build_sequence: sequence },
+            published_at_ms: 0, retire_after_ms: None,
+        }
+    }
+
+    #[test]
+    fn selected_a_survives_publication_b_c_and_does_not_reset_preference() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("mcp-relays");
+        std::fs::create_dir(&directory).unwrap();
+        let a = generation(&directory, 1); let b = generation(&directory, 2); let c = generation(&directory, 3);
+        let first = ProbeRuntime::publish(None, None, &a, 1000).unwrap().unwrap();
+        let second = ProbeRuntime::publish(Some(&first), None, &b, 2000).unwrap().unwrap();
+        let current = ProbeRuntime::publish(Some(&second), None, &c, 3000).unwrap().unwrap();
+        let stored = root.path().join("runtime.json");
+        let bytes = serde_json::to_vec(&current).unwrap();
+        std::fs::write(&stored, &bytes).unwrap();
+        let manifest = Manifest {
+            id: Uuid::new_v4().to_string(), name: "fixture".into(), agent: "claude_desktop".into(),
+            config_path: root.path().join("client.json"), fingerprint: "authorized-before-routing".into(),
+            proxy_command: "stable-launcher".into(), relay_command: Some(c.command.clone()),
+            relay_runtime: Some(current), phase: "active".into(),
+        };
+        let selected = probe_route(&manifest, root.path(), false, Path::new(&a.command), 4000).unwrap();
+        assert_eq!(selected, (a.command.clone(), Some(a.digest.clone())));
+        let next = probe_route(&manifest, root.path(), true, Path::new("stable-launcher"), 4000).unwrap();
+        assert_eq!(next, (c.command.clone(), Some(c.digest.clone())));
+        let unapproved = generation(&directory, 4);
+        assert!(probe_route(&manifest, root.path(), false, Path::new(&unapproved.command), 4000).is_err());
+        assert!(probe_route(&manifest, root.path(), false, Path::new(&a.command), 2000 + crate::mcp_probe_protocol::STARTUP_GRACE_MS).is_err());
+        assert_eq!(std::fs::read(&stored).unwrap(), bytes, "data-plane selection cannot roll back publication");
+    }
+
+    #[test]
+    fn damaged_probe_preserves_authorized_parent_fallback_but_not_relay_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("mcp-relays");
+        std::fs::create_dir(&directory).unwrap();
+        let a = generation(&directory, 1);
+        let runtime = ProbeRuntime::publish(None, None, &a, 1000).unwrap().unwrap();
+        let manifest = Manifest {
+            id: Uuid::new_v4().to_string(), name: "fixture".into(), agent: "claude_desktop".into(),
+            config_path: root.path().join("client.json"), fingerprint: "authorized-before-routing".into(),
+            proxy_command: "stable-launcher".into(), relay_command: Some(a.command.clone()),
+            relay_runtime: Some(runtime.clone()), phase: "active".into(),
+        };
+        std::fs::write(&a.command, b"corrupt payload").unwrap();
+        assert_eq!(probe_route(&manifest, root.path(), true, Path::new("stable-launcher"), 2000).unwrap(), (String::new(), None));
+        assert!(probe_route(&manifest, root.path(), false, Path::new(&a.command), 2000).is_err());
+        assert_eq!(manifest.relay_runtime.as_ref().unwrap(), &runtime);
+    }
 }

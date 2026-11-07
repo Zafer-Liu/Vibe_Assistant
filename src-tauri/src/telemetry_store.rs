@@ -3326,6 +3326,10 @@ impl TelemetryStore {
         Ok(())
     }
 
+    pub(crate) fn probe_connection_key(id: &str) -> Result<String, String> {
+        opaque_proxy_id(id)
+    }
+
     pub fn proxy_connection_open(&self, id: &str, server: &str, assignment_id: &str) -> Result<(), String> {
         let connection_id = opaque_proxy_id(id)?;
         let assignment_id = opaque_proxy_id(assignment_id)?;
@@ -3361,6 +3365,18 @@ impl TelemetryStore {
                 AND error_category IS NOT 'observation_lost'", [&connection_id]).map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM mcp_proxy_connections WHERE connection_id = ?1", [connection_id]).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn proxy_pending_probe_connections(&self, assignment_id: &str, current: &std::collections::HashSet<String>) -> Result<i64, String> {
+        let assignment_id = opaque_proxy_id(assignment_id)?;
+        let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(15))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned".to_string())?;
+        let mut statement = conn.prepare("SELECT connection_id FROM mcp_proxy_connections WHERE assignment_id = ?1 AND last_seen_at >= ?2")
+            .map_err(|error| error.to_string())?;
+        let ids = statement.query_map(params![assignment_id, cutoff], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+        Ok(ids.iter().filter(|id| !current.contains(*id)).count() as i64)
     }
 
     pub fn proxy_active_connections(&self, assignment_id: &str) -> Result<i64, String> {
@@ -5144,6 +5160,9 @@ pub fn telemetry_refresh_usage(
 /// 自动补上新数据，而不需要用户手动点「重新扫描」。
 pub fn start_usage_refresh_scheduler(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
+        // Start the interval after the startup scan finishes, including its
+        // failure path, so a slow first scan cannot overlap this scheduler.
+        crate::startup::wait_for_initial_usage_ready().await;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(90)).await;
             let Some(store) = shared_store() else {

@@ -192,27 +192,6 @@ pub(crate) fn remove_server(name: &str) -> Result<(), String> {
     write_atomically(&path, &updated)
 }
 
-/// 共享记忆服务器的安装状态（与 file_config_status 同口径）。
-pub(crate) fn memory_status(executable: &str) -> Result<(bool, String), String> {
-    let path = patch_path_or_error()?;
-    let servers = read_servers()?;
-    let name = crate::memory_mcp::server_name();
-    let legacy = crate::memory_mcp::legacy_server_name();
-    let entry = servers.get(name).or_else(|| servers.get(legacy));
-    let installed = entry.is_some_and(|entry| {
-        entry.get("command").and_then(Value::as_str) == Some(executable)
-            && entry.get("args") == Some(&json!(["--mcp-memory"]))
-    });
-    let detail = match entry {
-        None => format!("尚未写入 {}", path.display()),
-        Some(_) if !installed => {
-            format!("配置指向旧启动器或已失效，请重新连接（{}）", path.display())
-        }
-        Some(_) => format!("已配置到 {}", path.display()),
-    };
-    Ok((installed, detail))
-}
-
 // ── 顶层条目的文本切分与重写 ──────────────────────────────────────────────────
 
 /// 一个顶层 `- ` 条目的行区间（含嵌进行）；条目之后的尾部空行/注释归入与

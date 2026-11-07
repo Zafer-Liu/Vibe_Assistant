@@ -80,9 +80,8 @@ pub fn run_stdio(assignment_id: &str) -> Result<(), String> {
     })?;
     let server_name = launch.server_name.clone();
 
-    let mut command = child_command(&launch.command, &launch.args)
+    let mut command = crate::mcp_command::command_with_env(&launch.command, &launch.args, &launch.env)
         .map_err(|e| { relay_failure(&store, &connection_id, Some(&server_name), "startup", "relay_startup", "command_invalid", "command preparation failed"); e })?;
-    command.envs(&launch.env);
     // The control channel belongs only to this relay, never the original MCP server.
     command.env_remove(CONTROL_ADDR).env_remove(CONTROL_NONCE);
     command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -101,13 +100,20 @@ pub fn run_stdio(assignment_id: &str) -> Result<(), String> {
     // only the tail and record a fixed classification on an abnormal exit.
     let stderr_tail = Arc::new(std::sync::Mutex::new(Vec::new()));
     let child_stderr = child.stderr.take();
-    child_stderr.map(|stderr| {
+    let stderr_pump = child_stderr.map(|stderr| {
         let tail = Arc::clone(&stderr_tail);
         std::thread::spawn(move || drain_tail(stderr, tail))
     });
+    let started = Instant::now();
+    let server_output_seen = Arc::new(AtomicBool::new(false));
+    let observed_stdout = StartupOutput { reader: child_stdout, seen: Arc::clone(&server_output_seen) };
 
     let _ = telemetry_result(store.proxy_connection_open(&connection_id, &server_name, assignment_id), TelemetryOperation::ConnectionOpen);
-    let mut tracker = CallTracker::new(connection_id.clone(), launch.server_name, store.clone());
+    let mut runtime_lease = launch.runtime_digest.as_deref().and_then(|version|
+        TelemetryStore::probe_connection_key(&connection_id).ok().and_then(|key|
+            crate::mcp_probe_connections::ConnectionLease::new(assignment_id, &key, version).ok()));
+    if launch.runtime_digest.is_some() && runtime_lease.is_none() { eprintln!("[mcp relay] runtime tracking unavailable"); }
+    let mut tracker = CallTracker::new(connection_id.clone(), server_name.clone(), store.clone());
     let (events, receiver) = mpsc::sync_channel(64);
     let (completed, completions) = mpsc::channel();
     let dropped_metadata = Arc::new(AtomicU8::new(0));
@@ -123,7 +129,7 @@ pub fn run_stdio(assignment_id: &str) -> Result<(), String> {
         let _ = input_completed.send(PumpEvent::Input(result));
     });
     let output_pump = std::thread::spawn(move || {
-        let result = pump(child_stdout, io::stdout(), events, Direction::Server, output_dropped);
+        let result = pump(observed_stdout, io::stdout(), events, Direction::Server, output_dropped);
         let _ = completed.send(PumpEvent::Output(result));
     });
 
@@ -150,6 +156,7 @@ pub fn run_stdio(assignment_id: &str) -> Result<(), String> {
         }
         if last_touch.elapsed() >= Duration::from_secs(5) {
             let _ = telemetry_result(store.proxy_connection_touch(&connection_id), TelemetryOperation::ConnectionTouch);
+            if let Some(lease) = runtime_lease.as_mut() { let _ = lease.touch(); }
             last_touch = Instant::now();
         }
         if let Some(status) = child.try_wait().map_err(|_| {
@@ -205,15 +212,75 @@ pub fn run_stdio(assignment_id: &str) -> Result<(), String> {
     }
     tracker.disconnect();
     if !exit.success() {
+        // Drain the final CLI diagnostic before classifying it. Descendants may
+        // keep stderr open, so this wait is bounded and never joins a live reader.
+        let stderr_deadline = Instant::now() + Duration::from_millis(250);
+        while stderr_pump.as_ref().is_some_and(|pump| !pump.is_finished()) && Instant::now() < stderr_deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let argument_error = stderr_tail.lock().ok().is_some_and(|tail| startup_argument_error(
+            exit.code(), termination.is_some(), server_output_seen.load(Ordering::Acquire), started.elapsed(), &tail,
+        ));
+        if argument_error {
+            let stopped = crate::mcp_registry::disable_observation_after_argument_error(assignment_id, &launch).is_ok();
+            relay_failure(&store, &connection_id, Some(&server_name), "startup", "relay_startup", "command_invalid",
+                if stopped { "startup arguments incompatible; observation disabled; reconfigure MCP" }
+                else { "startup arguments incompatible; observation disable pending; reconfigure MCP" });
+        }
         let reason = child_exit_reason(&exit, termination, stderr_classification(&stderr_tail));
         relay_failure(&store, &connection_id, Some(&server_name), "child", "relay_child_exit", "child_exit", &reason);
-        return Err("MCP server connection ended unexpectedly".into());
+        return Err(if argument_error { "MCP startup arguments incompatible; reconfigure this service".into() }
+            else { "MCP server connection ended unexpectedly".into() });
     }
     if transfer_failed {
         Err("MCP server connection ended unexpectedly".into())
     } else {
         Ok(())
     }
+}
+
+/// Observe only whether stdout ever carried bytes; forwarding remains unchanged.
+struct StartupOutput<R> {
+    reader: R,
+    seen: Arc<AtomicBool>,
+}
+
+impl<R: Read> Read for StartupOutput<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.reader.read(buffer)?;
+        if count > 0 { self.seen.store(true, Ordering::Release); }
+        Ok(count)
+    }
+}
+
+/// Only known CLI usage errors before any server output can stop observation.
+/// Never persist the diagnostic itself: it may contain credentials or arguments.
+fn startup_argument_error(code: Option<i32>, terminated: bool, output_seen: bool, elapsed: Duration, stderr: &[u8]) -> bool {
+    if !matches!(code, Some(1 | 2 | 64)) || terminated || output_seen || elapsed > Duration::from_secs(60) {
+        return false;
+    }
+    let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    text.lines().any(|line| {
+        let line = line.trim();
+        let diagnostic = if let Some(message) = line.strip_prefix("error:") {
+            message.trim_start()
+        } else if let Some((program, message)) = line.split_once(": error:") {
+            // argparse prefixes diagnostics with its program name. Do not
+            // interpret JSON/log payloads containing a quoted error as a CLI.
+            if program.is_empty() || program.len() > 512
+                || program.bytes().any(|byte| matches!(byte, b'{' | b'}' | b'[' | b']' | b'"')) {
+                return false;
+            }
+            message.trim_start()
+        } else { line };
+        ["unknown option", "unknown argument", "unexpected argument", "unrecognized arguments:",
+            "no such option:", "unknown flag:", "flag provided but not defined:",
+            "missing required argument", "the following required arguments were not provided",
+            "the following arguments are required:", "unknown command", "unrecognized subcommand", "no such command"]
+            .iter().any(|prefix| diagnostic.starts_with(prefix))
+            || (diagnostic.starts_with("argument ") && diagnostic.contains(": invalid choice:"))
+            || (diagnostic.starts_with("required option ") && diagnostic.ends_with("not specified"))
+    })
 }
 
 /// Keep only the last `STDERR_TAIL` bytes of a stream; readers never block on it.
@@ -305,73 +372,8 @@ fn startup_handshake(address: SocketAddr, nonce: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(windows)]
 pub(crate) fn child_command(program: &str, args: &[String]) -> Result<Command, String> {
-    use std::os::windows::process::CommandExt;
-    use std::path::{Path, PathBuf};
-
-    let mut executable = PathBuf::from(program);
-    // CreateProcess does not resolve npm's .cmd shims from a bare `npx`.
-    if executable.extension().is_none() {
-        let names = [format!("{program}.exe"), format!("{program}.cmd"), format!("{program}.bat")];
-        if executable.components().count() > 1 {
-            if let Some(found) = names.iter().map(PathBuf::from).find(|path| path.is_file()) {
-                executable = found;
-            }
-        } else if let Some(paths) = std::env::var_os("PATH") {
-            'search: for directory in std::env::split_paths(&paths) {
-                for name in &names {
-                    let candidate = directory.join(name);
-                    if candidate.is_file() {
-                        executable = candidate;
-                        break 'search;
-                    }
-                }
-            }
-        }
-    } else if executable.components().count() == 1 && !executable.is_file() {
-        if let Some(paths) = std::env::var_os("PATH") {
-            if let Some(found) = std::env::split_paths(&paths)
-                .map(|directory| directory.join(program)).find(|candidate| candidate.is_file()) {
-                executable = found;
-            }
-        }
-    }
-    let batch = executable.extension().and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
-    if !batch {
-        let mut command = Command::new(executable);
-        command.args(args);
-        return Ok(command);
-    }
-    // cmd.exe parses its /c string as shell syntax. Reject metacharacters and
-    // expansions in all user-configured pieces instead of interpolating them.
-    fn quoted(value: &str) -> Result<String, String> {
-        if value.chars().any(|ch| matches!(ch, '"' | '&' | '|' | '<' | '>' | '^' | '%' | '!' | '\r' | '\n' | '\0')) {
-            return Err("Unsafe MCP batch command or argument".into());
-        }
-        Ok(format!("\"{value}\""))
-    }
-    let mut line = format!("\"{}", quoted(&executable.to_string_lossy())?);
-    for arg in args {
-        line.push(' ');
-        line.push_str(&quoted(arg)?);
-    }
-    line.push('"');
-    let system_root = std::env::var_os("SystemRoot").ok_or("Windows system root unavailable")?;
-    let cmd_path = Path::new(&system_root).join("System32").join("cmd.exe");
-    if !cmd_path.is_file() { return Err("Windows command processor unavailable".into()); }
-    let mut command = Command::new(cmd_path);
-    command.args(["/d", "/s", "/c"]);
-    command.raw_arg(line);
-    Ok(command)
-}
-
-#[cfg(not(windows))]
-pub(crate) fn child_command(program: &str, args: &[String]) -> Result<Command, String> {
-    let mut command = Command::new(program);
-    command.args(args);
-    Ok(command)
+    crate::mcp_command::command_with_env(program, args, &Default::default())
 }
 
 #[derive(Clone, Copy)]
@@ -667,6 +669,49 @@ impl Drop for CallTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_argument_errors_require_explicit_cli_diagnostics() {
+        for diagnostic in [
+            "error: unknown option '--old-mode'",
+            "error: unrecognized arguments: --server",
+            "error: unexpected argument '--legacy' found\nUsage: server [OPTIONS]",
+            "Error: No such option: --stdio-old",
+            "flag provided but not defined: -old",
+            "error: the following arguments are required: mode",
+            "server.py: error: unrecognized arguments: --legacy",
+            "C:\\tools\\server.py: error: argument mode: invalid choice: 'legacy'",
+            "Error: unknown flag: --legacy",
+            "error: unrecognized subcommand 'serve'",
+            "error: unknown command 'legacy'",
+            "error: required option '--path <path>' not specified",
+        ] {
+            assert!(startup_argument_error(Some(2), false, false, Duration::from_millis(100), diagnostic.as_bytes()));
+        }
+        for diagnostic in ["fetch failed", "connection refused", "daemon stopped", "Usage: server [OPTIONS]", "{\"message\":\"error: unknown option\"}"] {
+            assert!(!startup_argument_error(Some(2), false, false, Duration::from_millis(100), diagnostic.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn parameter_detection_never_disables_an_established_or_relay_terminated_session() {
+        let diagnostic = b"error: unknown option '--old'";
+        assert!(!startup_argument_error(Some(0), false, false, Duration::ZERO, diagnostic));
+        assert!(!startup_argument_error(Some(2), true, false, Duration::ZERO, diagnostic));
+        assert!(!startup_argument_error(Some(2), false, true, Duration::ZERO, diagnostic));
+        assert!(!startup_argument_error(Some(2), false, false, Duration::from_secs(61), diagnostic));
+    }
+
+    #[test]
+    fn startup_output_detection_keeps_forwarded_bytes_unchanged() {
+        let bytes = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n";
+        let seen = Arc::new(AtomicBool::new(false));
+        let mut reader = StartupOutput { reader: io::Cursor::new(bytes), seen: Arc::clone(&seen) };
+        let mut forwarded = Vec::new();
+        io::copy(&mut reader, &mut forwarded).unwrap();
+        assert_eq!(forwarded, bytes);
+        assert!(seen.load(Ordering::Acquire));
+    }
 
     #[test]
     fn observes_split_json_lines_metadata() {

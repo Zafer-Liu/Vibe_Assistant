@@ -7,7 +7,7 @@ import {
   PowerOff, Webhook, History, RefreshCw, ChevronDown, ChevronUp, FileText, Star, Database, FolderOpen,
   ChevronRight, Plus,
 } from 'lucide-react'
-import { useMemoryFields } from '../store/memoryStore'
+import { useMemoryFields, type MemoryLoadStatus } from '../store/memoryStore'
 import { useTelemetryFields } from '../store/telemetryStore'
 import { useVisiblePolling } from '../hooks/useVisiblePolling'
 import { ErrorRecovery } from '../components/ErrorRecovery'
@@ -21,6 +21,7 @@ import { sourceLabel } from '../components/ConversationDialog'
 import { intlLocale } from '../i18n'
 import { compactTokenCount } from '../lib/compactNumber'
 import { isInjectionReady } from '../lib/memoryAgentStatus'
+import { afterNextPaint, recordStartupPhase } from '../lib/startupPerformance'
 
 function localTime(value: string) {
   // Rust serializes UTC timestamps with nanosecond precision. Normalise to
@@ -80,6 +81,14 @@ function InlineActionSuccess({ text }: { text: string }) {
   )
 }
 
+function MemorySectionStatus({ status, loadingLabel, onRetry }: { status: MemoryLoadStatus; loadingLabel?: string; onRetry: () => void }) {
+  const { t } = useTranslation()
+  if (status === 'ready') return null
+  return <p role="status" aria-live="polite" className="inline-flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400">
+    {status === 'error' ? <>{t('memory.sectionLoadFailed')}<button type="button" onClick={onRetry} className="font-medium text-violet-600 hover:underline dark:text-violet-300">{t('common.retry')}</button></> : <><Loader2 size={13} className="animate-spin motion-reduce:animate-none" />{loadingLabel ?? t('memory.overviewLoading')}</>}
+  </p>
+}
+
 function LayerWindow({ document }: { document: MemoryLayerDocument }) {
   const { t } = useTranslation()
   if (!document.window_start || !document.window_end) return null
@@ -91,9 +100,10 @@ const MEMORY_CONTENT_SCROLL_CLASS = 'max-h-80 min-w-0 max-w-full overflow-y-auto
 
 /** L1 列表行。memo + 稳定回调隔离：无关 store 更新（agent 轮询等）不再
  *  重渲染最多 200 张卡片；content-visibility 让滚出视口的行跳过布局绘制。 */
-const MemoryCard = memo(function MemoryCard({ memory: m, ranking, onPin, onEdit, onDelete }: {
+const MemoryCard = memo(function MemoryCard({ memory: m, ranking, pinDisabled, onPin, onEdit, onDelete }: {
   memory: MemoryItem
   ranking: MemoryImportance
+  pinDisabled: boolean
   onPin: (memoryId: string, pinned: boolean) => void
   onEdit: (item: MemoryItem) => void
   onDelete: (item: MemoryItem) => void
@@ -106,7 +116,7 @@ const MemoryCard = memo(function MemoryCard({ memory: m, ranking, onPin, onEdit,
       <div className="flex items-start gap-2">
         <MemoryMarkdown content={m.memory} className="flex-1 break-words" />
         <div className="flex shrink-0 gap-1">
-          <button type="button" onClick={() => { void onPin(m.id, !ranking?.pinned) }} className={`inline-flex h-7 w-7 items-center justify-center rounded hover:bg-amber-100 hover:text-amber-800 dark:hover:bg-amber-900/40 dark:hover:text-amber-200 ${ranking?.pinned ? 'text-amber-500' : 'text-gray-500 dark:text-gray-400'}`} title={pinLabel} aria-label={pinLabel}>
+          <button type="button" disabled={pinDisabled} onClick={() => { void onPin(m.id, !ranking?.pinned) }} className={`inline-flex h-7 w-7 items-center justify-center rounded hover:bg-amber-100 hover:text-amber-800 disabled:opacity-50 dark:hover:bg-amber-900/40 dark:hover:text-amber-200 ${ranking?.pinned ? 'text-amber-500' : 'text-gray-500 dark:text-gray-400'}`} title={pinLabel} aria-label={pinLabel}>
             <Star size={13} className={ranking?.pinned ? 'fill-current' : ''} />
           </button>
           <button type="button" onClick={() => onEdit(m)} className="inline-flex h-7 w-7 items-center justify-center rounded hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-500 dark:text-gray-400" title={t('common.edit')} aria-label={t('common.edit')}>
@@ -133,6 +143,7 @@ const MemoryCard = memo(function MemoryCard({ memory: m, ranking, onPin, onEdit,
 export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGraph, onOpenPending, onOpenOrganized, onOpenCapture, onOpenInjection, active = true }: { onOpenUsage?: () => void; onOpenGraph?: () => void; onOpenPending?: () => void; onOpenOrganized?: () => void; onOpenCapture?: () => void; onOpenInjection?: () => void; active?: boolean }) {
   const { t } = useTranslation()
   const { engineOnline, memories, memoryDomains, selectedMemoryDomainId, importance, loading, lastSearchResults, lastSearchQuery, memoryCacheReady, localMemoryStats, ingestStatus, l2Documents, l3Documents, checkIngest, loadMemoryLayers, consolidateShortTermMemory, draftLongTermProfile, publishLongTermProfile, updatePublishedMemoryDocument, deleteLongTermProfileDraft, organizeConversations, cancelOrganize, importMemoryFolder, checkEngine, stopEngine, search, listMemories, loadMemoryDomains, setSelectedMemoryDomain, resetL1ForReextraction, updateMemory, deleteMemory, addUserMemory, dreaming, restoreConsolidation, refreshImportance, setMemoryPinned, hookStatus, qoderHookStatus, codexHookStatus, workbuddyHookStatus, geminiHookStatus, antigravityHookStatus, agentSources, loadAgentSources } = useMemoryFields('engineOnline', 'memories', 'memoryDomains', 'selectedMemoryDomainId', 'importance', 'loading', 'lastSearchResults', 'lastSearchQuery', 'memoryCacheReady', 'localMemoryStats', 'ingestStatus', 'l2Documents', 'l3Documents', 'checkIngest', 'loadMemoryLayers', 'consolidateShortTermMemory', 'draftLongTermProfile', 'publishLongTermProfile', 'updatePublishedMemoryDocument', 'deleteLongTermProfileDraft', 'organizeConversations', 'cancelOrganize', 'importMemoryFolder', 'checkEngine', 'stopEngine', 'search', 'listMemories', 'loadMemoryDomains', 'setSelectedMemoryDomain', 'resetL1ForReextraction', 'updateMemory', 'deleteMemory', 'addUserMemory', 'dreaming', 'restoreConsolidation', 'refreshImportance', 'setMemoryPinned', 'hookStatus', 'qoderHookStatus', 'codexHookStatus', 'workbuddyHookStatus', 'geminiHookStatus', 'antigravityHookStatus', 'agentSources', 'loadAgentSources')
+  const { memoryLoadState } = useMemoryFields('memoryLoadState')
   const { telemetrySummary, telemetryLiveStatus, checkTelemetry } = useTelemetryFields('telemetrySummary', 'telemetryLiveStatus', 'checkTelemetry')
 
   const [query, setQuery] = useState('')
@@ -189,9 +200,9 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
   const [savingL2, setSavingL2] = useState(false)
   // L2 卡片的自定义添加展开态（与 L3 卡片共用同一份表单内容与提交状态）。
   const [l2UserMemoryOpen, setL2UserMemoryOpen] = useState(false)
-  // The page is unmounted when navigating away.  Keep the loading decision in
-  // the shared store so revisiting it in this app session paints immediately.
-  const [booting, setBooting] = useState(() => !memoryCacheReady)
+  // Cached sections and local editor state stay visible during background reads.
+  const domainFilterReady = selectedMemoryDomainId === 'all' || memoryLoadState.domains === 'ready'
+  const inventoryReady = memoryCacheReady && domainFilterReady
   // Native L1 extraction stores conversation summaries as `conversation`.
   // They are factual, searchable records—not user preferences. Only the
   // profile-oriented kinds belong to the preference total.
@@ -221,16 +232,15 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
   const invalidL3Drafts = l3Documents.filter((document) => document.state === 'draft' && isInvalidL3Draft(document.content))
 
   useEffect(() => {
-    let mounted = true
-    // Render a bounded loading state while the local ledger opens. Semantic
-    // and MCP checks remain deferred so the first paint never waits on CLIs.
-    void Promise.allSettled([listMemories(), loadMemoryLayers(), loadMemoryDomains()]).finally(() => {
-      if (mounted) setBooting(false)
-    })
-    void checkEngine().then((online) => { if (online) void listMemories(true) })
-    // Token reconciliation runs once as an application-start background job.
-    // This page only reads the durable SQLite result so navigation is instant.
-    return () => { mounted = false }
+    const started = performance.now()
+    const cancelPaintTiming = afterNextPaint(() => recordStartupPhase('memory_shell_painted', performance.now() - started))
+    // Each section publishes independently. SQLite inventory does not depend
+    // on the optional semantic engine becoming available.
+    void listMemories().catch(() => {})
+    void loadMemoryLayers().catch(() => {})
+    void checkEngine()
+    // Token reconciliation remains an application-start background job.
+    return cancelPaintTiming
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -247,7 +257,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
   // 间隔在设置页）。
   useEffect(() => {
     let unlisten: (() => void) | undefined
-    void listen('memory-layers-updated', () => { void loadMemoryLayers() })
+    void listen('memory-layers-updated', () => { void loadMemoryLayers(true).catch(() => {}) })
       .then((dispose) => { unlisten = dispose })
       .catch(() => {})
     return () => unlisten?.()
@@ -265,8 +275,6 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
     if (kind === 'ok') setTimeout(() => setNotice(current => current === next ? null : current), 3500)
   }, [])
 
-  // 以下 useCallback 是 hook，必须位于 `if (booting)` 提前 return 之前；
-  // 否则 booting 前后 hook 数量不一致，React 会卸载整树（白屏）。
   const openEdit = useCallback((item: MemoryItem) => {
     setEditing(item)
     setEditContent(item.memory)
@@ -310,17 +318,8 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
     flash('ok', t('memory.engineStopped'))
   }
 
-  if (booting) {
-    return <div className="flex h-full min-h-0 items-center justify-center bg-[var(--app-canvas)] px-6" role="status" aria-live="polite">
-      <div className="w-full max-w-md rounded-2xl border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-900">
-        <div className="flex items-center gap-3 text-gray-800 dark:text-gray-100"><span className="rounded-xl bg-violet-500/10 p-2.5 text-violet-600 dark:text-violet-400"><Loader2 className="animate-spin motion-reduce:animate-none" size={21} /></span><div><p className="text-sm font-semibold">{t('memory.booting')}</p><p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">{t('memory.bootingHint')}</p></div></div>
-        <div className="mt-5 space-y-2.5" aria-hidden="true"><div className="h-3 w-4/5 animate-pulse rounded bg-gray-100 dark:bg-gray-800" /><div className="h-3 w-full animate-pulse rounded bg-gray-100 dark:bg-gray-800" /><div className="h-3 w-3/5 animate-pulse rounded bg-gray-100 dark:bg-gray-800" /></div>
-      </div>
-    </div>
-  }
-
   async function handleSearch() {
-    if (!query.trim()) return
+    if (!query.trim() || !memoryCacheReady) return
     try {
       await search(query.trim(), topK)
     } catch (e) {
@@ -333,8 +332,8 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
     setRefreshing(true)
     const results = await Promise.allSettled([
       checkEngine(),
-      loadMemoryDomains(),
       listMemories(true),
+      loadMemoryLayers(true),
       checkIngest(),
       checkTelemetry({ backfill: true, refreshUsage: true, limit: 50 }),
     ])
@@ -538,7 +537,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
       const result = await dreaming((processed, total) => {
         setConsolidationProgress(t('memory.consolidateGenerating', { processed, total }))
       })
-      await listMemories()
+      await listMemories(true)
       const text = result.message || t('memory.dreamDone')
       setConsolidationResult({ kind: 'ok', text, result })
       flash('ok', t('memory.dreamDone'))
@@ -558,7 +557,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
     setRestoringConsolidation(true)
     try {
       const result = await restoreConsolidation(snapshotId)
-      await listMemories()
+      await listMemories(true)
       setConsolidationResult({ kind: 'ok', text: t('memory.dreamRestoreDone'), result })
       flash('ok', t('memory.dreamRestoreDone'))
     } catch (error) {
@@ -777,13 +776,14 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
           </div>
           {userMemoryErrors.l2 && <InlineActionError text={t('memory.workMemoryAddFailed', { error: userMemoryErrors.l2 })} />}
           {userMemorySuccesses.l2 && <InlineActionSuccess text={userMemorySuccesses.l2} />}
+          <MemorySectionStatus status={memoryLoadState.l2} onRetry={() => { void loadMemoryLayers(true).catch(() => {}) }} />
+          <UserMemoryList accent="sky" scope="l2" />
           {l2Documents.find((document) => document.state === 'published') ? (() => {
             const document = l2Documents.find((item) => item.state === 'published')!
             const content = normalizeL2Document(document.content)
             const repairedLegacyContent = content !== document.content.trim()
             const hasAnalysisPreamble = looksLikeModelAnalysis(content)
             return <div className="mt-3 flex min-h-0 flex-1 flex-col border-t border-sky-200/70 pt-3 dark:border-sky-900/70">
-              <UserMemoryList accent="sky" scope="l2" />
               {/* 已发布区块与右侧 L3 文档行同构：同一套底纹卡片 +
                   绿色状态标签 + 灰色元信息行，两卡格式统一。
                   content-visibility：滚出视口时跳过子树布局与绘制，
@@ -818,7 +818,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
               </>)}
               </div>
             </div>
-          })() : (<><p className="mt-3 text-xs text-gray-500 dark:text-gray-400">{t('memory.l2Empty')}</p><UserMemoryList accent="sky" scope="l2" /></>)}
+          })() : memoryLoadState.l2 === 'ready' && <p className="mt-3 text-xs text-gray-500 dark:text-gray-400">{t('memory.l2Empty')}</p>}
         </article>
         <article className="min-w-0 max-h-[36rem] overflow-y-auto overscroll-contain rounded-xl border border-violet-200 bg-violet-50/40 p-4 dark:border-violet-900/70 dark:bg-violet-950/20">
           <div className="flex items-start gap-2">
@@ -873,7 +873,8 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
           {userMemoryErrors.l3 && <InlineActionError text={t('memory.longTermMemoryAddFailed', { error: userMemoryErrors.l3 })} />}
           {userMemorySuccesses.l3 && <InlineActionSuccess text={userMemorySuccesses.l3} />}
          {l3DraftError && <div role="alert" className="mt-3 rounded-md border border-red-200 bg-red-50 px-2.5 py-2 text-xs leading-5 text-red-800 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-200"><span className="font-medium">{t('memory.l3DraftFailedTitle')}</span>{l3DraftError}</div>}
-        {visibleL3Documents.length || invalidL3Drafts.length ? <div id="l3-documents-content" role="region" aria-label={t('memory.l3Title')} tabIndex={0} className={`mt-3 space-y-2 border-t border-violet-200/70 pt-3 dark:border-violet-900/70 ${MEMORY_CONTENT_SCROLL_CLASS}`}><UserMemoryList accent="violet" scope="l3" />{visibleL3Documents.slice(0, 2).map((document) => {
+        <MemorySectionStatus status={memoryLoadState.l3} onRetry={() => { void loadMemoryLayers(true).catch(() => {}) }} />
+        <div id="l3-documents-content" role="region" aria-label={t('memory.l3Title')} tabIndex={0} className={`mt-3 space-y-2 border-t border-violet-200/70 pt-3 dark:border-violet-900/70 ${MEMORY_CONTENT_SCROLL_CLASS}`}><UserMemoryList accent="violet" scope="l3" />{visibleL3Documents.slice(0, 2).map((document) => {
           return <div key={document.id} className="min-w-0 rounded-md bg-white/70 px-2.5 py-2 dark:bg-gray-900/30 [content-visibility:auto] [contain-intrinsic-size:auto_320px]">
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
                 <span className={document.state === 'published' ? 'text-green-600 dark:text-green-300' : document.state === 'archived' ? 'text-gray-500 dark:text-gray-400' : 'text-amber-700 dark:text-amber-300'}>{document.state === 'published' ? t('memory.l3Published') : document.state === 'archived' ? t('memory.l3Archived') : t('memory.l3Draft')}</span>
@@ -904,12 +905,12 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
                 </div>
               )}
             </div>
-          })}{invalidL3Drafts.map((document) => <div key={document.id} className="rounded-md border border-amber-200 bg-amber-50/80 px-2.5 py-2 text-xs dark:border-amber-900/70 dark:bg-amber-950/25"><div className="flex flex-wrap items-center gap-x-2 gap-y-1"><span className="font-medium text-amber-800 dark:text-amber-200">{t('memory.l3InvalidDraftBadge')}</span><span className="text-amber-700/80 dark:text-amber-300/80">{t('memory.l3InvalidDraftSource', { count: document.source_count })}</span><button type="button" onClick={() => setL3DeleteTarget(document)} disabled={deletingL3 === document.id} className="ml-auto inline-flex shrink-0 items-center gap-1 rounded border border-red-200 bg-white/70 px-2 py-0.5 font-medium text-red-700 hover:bg-red-50 disabled:opacity-50 dark:border-red-900/70 dark:bg-gray-900/40 dark:text-red-300 dark:hover:bg-red-950/30"><Trash2 size={12} />{deletingL3 === document.id ? t('memory.l3DraftInvalidDeleting') : t('memory.l3DraftInvalidDelete')}</button></div><p className="mt-1.5 leading-5 text-amber-800 dark:text-amber-200">{t('memory.l3InvalidDraftHint')}</p></div>)}</div> : (<><p className="mt-3 text-xs text-gray-500 dark:text-gray-400">{t('memory.l3Empty')}</p><UserMemoryList accent="violet" scope="l3" /></>)}
+          })}{invalidL3Drafts.map((document) => <div key={document.id} className="rounded-md border border-amber-200 bg-amber-50/80 px-2.5 py-2 text-xs dark:border-amber-900/70 dark:bg-amber-950/25"><div className="flex flex-wrap items-center gap-x-2 gap-y-1"><span className="font-medium text-amber-800 dark:text-amber-200">{t('memory.l3InvalidDraftBadge')}</span><span className="text-amber-700/80 dark:text-amber-300/80">{t('memory.l3InvalidDraftSource', { count: document.source_count })}</span><button type="button" onClick={() => setL3DeleteTarget(document)} disabled={deletingL3 === document.id} className="ml-auto inline-flex shrink-0 items-center gap-1 rounded border border-red-200 bg-white/70 px-2 py-0.5 font-medium text-red-700 hover:bg-red-50 disabled:opacity-50 dark:border-red-900/70 dark:bg-gray-900/40 dark:text-red-300 dark:hover:bg-red-950/30"><Trash2 size={12} />{deletingL3 === document.id ? t('memory.l3DraftInvalidDeleting') : t('memory.l3DraftInvalidDelete')}</button></div><p className="mt-1.5 leading-5 text-amber-800 dark:text-amber-200">{t('memory.l3InvalidDraftHint')}</p></div>)}{memoryLoadState.l3 === 'ready' && visibleL3Documents.length === 0 && invalidL3Drafts.length === 0 && <p className="text-xs text-gray-500 dark:text-gray-400">{t('memory.l3Empty')}</p>}</div>
         </article>
       </section>
 
       {/* WebDAV/S3 同步全部 L1，作用域标签保持不变。 */}
-      <CloudVaultCard onSynced={() => { void loadMemoryLayers(); void listMemories(true); void loadMemoryDomains() }} />
+      <CloudVaultCard onSynced={() => { void loadMemoryLayers(true).catch(() => {}); void listMemories(true).catch(() => {}) }} />
 
       {/* 可检索记忆（L1） */}
       <section className="order-20 rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-4 space-y-3">
@@ -917,6 +918,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
           <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-200">{t('memory.storageTitle')}</h2>
           <select
             value={selectedMemoryDomainId}
+            disabled={memoryLoadState.domains !== 'ready'}
             onChange={(event) => { void setSelectedMemoryDomain(event.target.value) }}
             className="rounded-md border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-200"
             title={t('memory.domainFilterTitle')}
@@ -925,12 +927,12 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
             {memoryDomains.map((domain: MemoryDomainItem) => <option key={domain.id} value={domain.id}>{domain.name}</option>)}
           </select>
           <div className="ml-auto flex flex-wrap items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
-            <span>{t('memory.total')}: <b className="text-gray-700 dark:text-gray-200">{visibleStats?.total ?? localMemoryStats?.total ?? memories.length}</b></span>
-            <span className="text-violet-600 dark:text-violet-400">{t('memory.fact')}: {visibleStats?.facts ?? localMemoryStats?.facts ?? factCount}</span>
-            <span className="text-amber-600 dark:text-amber-400">{t('memory.pref')}: {visibleStats?.preferences ?? localMemoryStats?.preferences ?? prefCount}</span>
-            <span className="rounded bg-gray-100 px-1.5 py-0.5 text-gray-600 dark:bg-gray-700 dark:text-gray-200">{t('memory.durabilitySession')}: {visibleStats?.session_only ?? localMemoryStats?.session_only ?? memories.filter((memory) => memory.durability === 'session').length}</span>
-            <span className="rounded bg-sky-500/10 px-1.5 py-0.5 text-sky-700 dark:text-sky-300">{t('memory.durabilityShortTerm')}: {visibleStats?.short_term ?? localMemoryStats?.short_term ?? memories.filter((memory) => memory.durability === 'short_term').length}</span>
-            <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-emerald-700 dark:text-emerald-300">{t('memory.durabilityLongTerm')}: {visibleStats?.long_term ?? localMemoryStats?.long_term ?? memories.filter((memory) => memory.durability === 'long_term').length}</span>
+            <span>{t('memory.total')}: <b className="text-gray-700 dark:text-gray-200">{inventoryReady ? visibleStats?.total ?? localMemoryStats?.total ?? memories.length : '—'}</b></span>
+            <span className="text-violet-600 dark:text-violet-400">{t('memory.fact')}: {inventoryReady ? visibleStats?.facts ?? localMemoryStats?.facts ?? factCount : '—'}</span>
+            <span className="text-amber-600 dark:text-amber-400">{t('memory.pref')}: {inventoryReady ? visibleStats?.preferences ?? localMemoryStats?.preferences ?? prefCount : '—'}</span>
+            <span className="rounded bg-gray-100 px-1.5 py-0.5 text-gray-600 dark:bg-gray-700 dark:text-gray-200">{t('memory.durabilitySession')}: {inventoryReady ? visibleStats?.session_only ?? localMemoryStats?.session_only ?? memories.filter((memory) => memory.durability === 'session').length : '—'}</span>
+            <span className="rounded bg-sky-500/10 px-1.5 py-0.5 text-sky-700 dark:text-sky-300">{t('memory.durabilityShortTerm')}: {inventoryReady ? visibleStats?.short_term ?? localMemoryStats?.short_term ?? memories.filter((memory) => memory.durability === 'short_term').length : '—'}</span>
+            <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-emerald-700 dark:text-emerald-300">{t('memory.durabilityLongTerm')}: {inventoryReady ? visibleStats?.long_term ?? localMemoryStats?.long_term ?? memories.filter((memory) => memory.durability === 'long_term').length : '—'}</span>
             <button
               onClick={() => { void handleRefreshImportance() }}
               disabled={refreshingImportance || memories.length === 0}
@@ -961,6 +963,12 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
           </div>
         </div>
 
+        {[memoryLoadState.inventory, memoryLoadState.domains, memoryLoadState.importance].some((status) => status !== 'ready') && <div className="flex flex-wrap gap-x-4 gap-y-1">
+          <MemorySectionStatus status={memoryLoadState.inventory} onRetry={() => { void listMemories(true).catch(() => {}) }} />
+          <MemorySectionStatus status={memoryLoadState.domains} loadingLabel={t('memory.domainsLoading')} onRetry={() => { void loadMemoryDomains() }} />
+          <MemorySectionStatus status={memoryLoadState.importance} loadingLabel={t('memory.importanceLoading')} onRetry={() => { void listMemories(true).catch(() => {}) }} />
+        </div>}
+
         {/* 语义检索：检索对象就是本区块的可检索记忆（含 L0 对话回退）。 */}
         <div className="flex flex-wrap gap-2">
           <input
@@ -979,7 +987,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
           </select>
           <button
             onClick={handleSearch}
-            disabled={loading || !query.trim()}
+            disabled={loading || !memoryCacheReady || !query.trim()}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white text-sm font-medium"
           >
             {loading ? <Loader2 size={15} className="animate-spin" /> : <Search size={15} />}
@@ -1010,18 +1018,18 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
             ))}
           </div>
         )}
-        {visibleSearchResults.length === 0 && lastSearchQuery && !loading && (
+        {visibleSearchResults.length === 0 && lastSearchQuery && !loading && inventoryReady && memoryLoadState.inventory === 'ready' && (
           <p className="text-sm text-gray-500 text-center py-4">{t('memory.noResults')}</p>
         )}
 
-        {visibleMemories.length === 0 ? (
-          <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-6">{selectedMemoryDomainId === 'all' ? t('memory.empty') : t('memory.domainEmpty')}</p>
-        ) : (
+        {visibleMemories.length > 0 ? (
           <div className="space-y-1.5 max-h-[420px] overflow-y-auto pr-1">
             {visibleMemories.map((m) => (
-              <MemoryCard key={m.id} memory={m} ranking={importance[m.id]} onPin={handlePinMemory} onEdit={openEdit} onDelete={handleDelete} />
+              <MemoryCard key={m.id} memory={m} ranking={importance[m.id]} pinDisabled={memoryLoadState.importance !== 'ready'} onPin={handlePinMemory} onEdit={openEdit} onDelete={handleDelete} />
             ))}
           </div>
+        ) : inventoryReady && memoryLoadState.inventory === 'ready' && (
+          <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-6">{selectedMemoryDomainId === 'all' ? t('memory.empty') : t('memory.domainEmpty')}</p>
         )}
 
         {/* L1 清洗与去重：作为可检索记忆的子项；不是 L2/L3 的层级巩固。 */}

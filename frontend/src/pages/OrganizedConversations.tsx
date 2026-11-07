@@ -20,12 +20,14 @@ function localTime(value: string) {
 const MemoryRow = memo(function MemoryRow({
   memory: m,
   ranking,
+  pinDisabled,
   onPin,
   onEdit,
   onDelete,
 }: {
   memory: MemoryItem
   ranking?: MemoryImportance
+  pinDisabled: boolean
   onPin: (memoryId: string, pinned: boolean) => void
   onEdit: (item: MemoryItem) => void
   onDelete: (item: MemoryItem) => void
@@ -38,7 +40,7 @@ const MemoryRow = memo(function MemoryRow({
       <div className="flex items-start gap-2">
         <MemoryMarkdown content={m.memory} className="flex-1 break-words" />
         <div className="flex shrink-0 gap-1">
-          <button type="button" onClick={() => { void onPin(m.id, !ranking?.pinned) }} className={`inline-flex h-7 w-7 items-center justify-center rounded hover:bg-amber-100 hover:text-amber-800 dark:hover:bg-amber-900/40 dark:hover:text-amber-200 ${ranking?.pinned ? 'text-amber-500' : 'text-gray-500 dark:text-gray-400'}`} title={pinLabel} aria-label={pinLabel}>
+          <button type="button" disabled={pinDisabled} onClick={() => { void onPin(m.id, !ranking?.pinned) }} className={`inline-flex h-7 w-7 items-center justify-center rounded hover:bg-amber-100 hover:text-amber-800 disabled:opacity-50 dark:hover:bg-amber-900/40 dark:hover:text-amber-200 ${ranking?.pinned ? 'text-amber-500' : 'text-gray-500 dark:text-gray-400'}`} title={pinLabel} aria-label={pinLabel}>
             <Star size={13} className={ranking?.pinned ? 'fill-current' : ''} />
           </button>
           <button type="button" onClick={() => onEdit(m)} className="inline-flex h-7 w-7 items-center justify-center rounded hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-500 dark:text-gray-400" title={t('common.edit')} aria-label={t('common.edit')}>
@@ -71,6 +73,7 @@ interface ClassificationStatus {
 export const OrganizedConversations = memo(function OrganizedConversations({ onBack, active = true }: { onBack: () => void; active?: boolean }) {
   const { t } = useTranslation()
   const { memories, memoryDomains, importance, memoryCacheReady, listMemories, loadMemoryDomains, updateMemory, deleteMemory, setMemoryPinned, refreshImportance } = useMemoryFields('memories', 'memoryDomains', 'importance', 'memoryCacheReady', 'listMemories', 'loadMemoryDomains', 'updateMemory', 'deleteMemory', 'setMemoryPinned', 'refreshImportance')
+  const { memoryLoadState } = useMemoryFields('memoryLoadState')
   const [domainFilter, setDomainFilter] = useState<string>('all')
   const [refreshing, setRefreshing] = useState(false)
   const [classifying, setClassifying] = useState(false)
@@ -287,7 +290,7 @@ export const OrganizedConversations = memo(function OrganizedConversations({ onB
         ) : (
           <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto overscroll-contain pr-1">
             {visible.map((m) => (
-              <MemoryRow key={m.id} memory={m} ranking={importance[m.id]} onPin={handlePinMemory} onEdit={openEdit} onDelete={handleDelete} />
+              <MemoryRow key={m.id} memory={m} ranking={importance[m.id]} pinDisabled={memoryLoadState.importance !== 'ready'} onPin={handlePinMemory} onEdit={openEdit} onDelete={handleDelete} />
             ))}
           </div>
         )}

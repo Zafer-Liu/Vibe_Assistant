@@ -116,7 +116,7 @@ export function EquipDialog({ entry, onClose, onNotice }: {
             const status = mcpStatusState === 'ready' ? statusOf(target.id) : undefined
             const observation = mcpObservationError ? undefined : observationOf(target.id)
             const observationState = observation?.state === 'observing' && observation.active_connections === 0 ? 'awaiting_connection' : observation?.state
-            const observing = observationState !== undefined && observationState !== 'off' && observationState !== 'unsupported'
+            const observing = observationState !== undefined && !['off', 'unsupported', 'configuration_required'].includes(observationState)
             return (
               <div key={target.id} className={`rounded-lg px-2 py-2 transition ${checked ? 'bg-violet-50 dark:bg-violet-500/10' : 'hover:bg-gray-50 dark:hover:bg-gray-800'}`}>
                 <div className="flex items-center gap-2">
