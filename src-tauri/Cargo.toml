@@ -1,6 +1,6 @@
 [package]
 name = "agent-manager"
-version = "1.2.3"
+version = "1.2.4"
 description = "Local memory, Skill and MCP management workspace"
 authors = ["you"]
 edition = "2021"
