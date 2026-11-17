@@ -563,7 +563,7 @@ export function MemoryRefinementPanel({ domains, onChanged }: { domains: readonl
     const preview = [...originals.values()].slice(0, 2)
     deleteConfirmation.current = true
     setConfirmingDelete(true)
-    let confirmed = false
+    let confirmed: boolean
     try {
       confirmed = await confirm({
         title: t('memory.refinementDeleteConfirmTitle'),
@@ -593,7 +593,7 @@ export function MemoryRefinementPanel({ domains, onChanged }: { domains: readonl
     const viewedId = selectedRunId.current
     deleteConfirmation.current = true
     setConfirmingDelete(true)
-    let confirmed = false
+    let confirmed: boolean
     try {
       confirmed = await confirm({
         title: t('memory.refinementForgetTitle'),

@@ -12,9 +12,12 @@ fn importance_snapshot_preserves_case_substrings_thresholds_and_session_deduplic
         ("fixture-b", "other-session", 1, "auth token 法律责任 apple bridge copper"),
         ("fixture-c", "unmatched-session", 1, "auth only"),
     ] {
-        store.record_conversation(source, &json!({
+        let payload = json!({
             "session_id": session, "hook_event_name": "fixture", "turn": turn,
-        }), "full", &[("user".into(), text.into())]).unwrap();
+        });
+        // Completed conversation text attaches to an existing Hook receipt.
+        store.record_hook(source, &payload).unwrap();
+        store.record_conversation(source, &payload, "full", &[("user".into(), text.into())]).unwrap();
     }
     let candidates: Vec<_> = [
         ("case", "AUTH TOKEN"),

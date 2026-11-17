@@ -1075,53 +1075,9 @@ fn usage_feed_prefers_response_records_and_falls_back_to_session_totals() {
 
 #[test]
 fn native_transcript_conversation_enters_the_same_l1_queue_without_a_hook() {
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-            "CREATE TABLE agent_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, event_key TEXT NOT NULL UNIQUE,
-                source TEXT NOT NULL, session_id TEXT NOT NULL, project_path TEXT,
-                event_type TEXT NOT NULL, occurred_at TEXT NOT NULL,
-                token_source TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
-                cached_tokens INTEGER NOT NULL, payload_json TEXT NOT NULL,
-                conversation_state TEXT NOT NULL DEFAULT 'unavailable',
-                conversation_message_count INTEGER NOT NULL DEFAULT 0, conversation_text TEXT,
-                l1_state TEXT NOT NULL DEFAULT 'unavailable'
-             );
-             CREATE TABLE session_token_usage (
-                source TEXT NOT NULL, session_id TEXT NOT NULL, input_tokens INTEGER NOT NULL,
-                output_tokens INTEGER NOT NULL, cached_tokens INTEGER NOT NULL, origin TEXT NOT NULL,
-                refreshed_at TEXT NOT NULL, PRIMARY KEY(source, session_id)
-             );
-             CREATE TABLE local_memory_items (
-                id TEXT PRIMARY KEY, source_event_key TEXT NOT NULL, ordinal INTEGER NOT NULL,
-                memory TEXT NOT NULL, memory_type TEXT NOT NULL, durability TEXT NOT NULL DEFAULT 'short_term', user_defined INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL,
-                session_id TEXT NOT NULL, event_time TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                UNIQUE(source_event_key, ordinal)
-             );
-             CREATE TABLE memory_domains (
-                id TEXT PRIMARY KEY, name TEXT NOT NULL,
-                kind TEXT NOT NULL CHECK(kind IN ('builtin', 'project', 'custom')),
-                description TEXT NOT NULL DEFAULT '',
-                aliases_json TEXT NOT NULL DEFAULT '[]',
-                enabled INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-             );
-             CREATE TABLE local_memory_domains (
-                memory_id TEXT NOT NULL REFERENCES local_memory_items(id) ON DELETE CASCADE,
-                domain_id TEXT NOT NULL REFERENCES memory_domains(id) ON DELETE CASCADE,
-                weight REAL NOT NULL CHECK(weight >= 0 AND weight <= 1),
-                source TEXT NOT NULL CHECK(source IN ('auto', 'manual', 'backfill')),
-                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                PRIMARY KEY(memory_id, domain_id, source)
-             );
-             CREATE TABLE l1_deletion_tombstones (
-                memory_id TEXT PRIMARY KEY, deleted_at TEXT NOT NULL
-             );
-             INSERT OR IGNORE INTO memory_domains
-               (id, name, kind, description, aliases_json, enabled, created_at, updated_at)
-               VALUES ('unclassified', '未分类', 'builtin', '', '[]', 1, datetime('now'), datetime('now'));",
-        ).unwrap();
-    let store = TelemetryStore::from_connection(conn);
+    // Exercise the current production schema, including refinement protection
+    // and domain redirects, rather than maintaining a partial schema copy.
+    let store = TelemetryStore::in_memory();
     let transcript = std::env::temp_dir().join("qoder-session-1.jsonl");
     let messages = vec![
         ("user".to_string(), "保留这个决定".to_string()),
