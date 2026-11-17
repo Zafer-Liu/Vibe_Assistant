@@ -610,6 +610,7 @@ function CloudVaultSettings() {
           {t('settings.cloudVault.autoInterval')}
         </label>
         <select
+          aria-label={t('settings.cloudVault.autoInterval')}
           value={autoInterval}
           onChange={(e) => setAutoInterval(Number(e.target.value))}
           className="w-full rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm text-gray-900 outline-none dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100"

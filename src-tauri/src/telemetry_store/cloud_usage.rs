@@ -17,7 +17,7 @@ const LOCAL_FEED: &str = "
            CASE WHEN trim(u.session_id) = '' THEN 'legacy-session:session-total:' || u.source || ':' || u.session_id
                 ELSE u.session_id END,
            strftime('%Y-%m-%dT%H:%M:%fZ', COALESCE(
-               (SELECT MAX(e.occurred_at) FROM agent_events e
+               (SELECT e.max_occurred_at FROM session_latest_events e
                  WHERE e.source = u.source AND e.session_id = u.session_id), u.refreshed_at)),
            NULL, 'session_total', u.input_tokens, u.output_tokens, u.cached_tokens, u.origin
       FROM session_token_usage u
@@ -192,17 +192,14 @@ pub(super) fn read_usage_buckets(
 
 impl TelemetryStore {
     /// Materialize the expensive cross-device deduplication once per database
-    /// revision. All chart queries then scan this indexed connection-local table.
-    /// data_version catches other processes; total_changes catches this connection.
+    /// usage revision. Unrelated MCP logs, settings and repricing never invalidate
+    /// this snapshot; durable triggers also cover writes by other processes.
     pub(super) fn prepare_usage_query_feed(&self, conn: &mut Connection) -> Result<(), String> {
-        let data_version: i64 = conn.query_row("PRAGMA main.data_version", [], |row| row.get(0))
-            .map_err(|error| error.to_string())?;
-        let total_changes: i64 = conn.query_row("SELECT total_changes()", [], |row| row.get(0))
-            .map_err(|error| error.to_string())?;
         let mut cache = self.usage_query_cache.lock().map_err(|_| "usage query cache poisoned".to_string())?;
-        if cache.as_ref().is_some_and(|saved| saved.data_version == data_version && saved.total_changes == total_changes) {
-            return Ok(());
-        }
+        let usage_revision: i64 = conn.query_row(
+            "SELECT revision FROM app_data_revisions WHERE domain = 'usage'", [], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if cache.as_ref().is_some_and(|saved| saved.usage_revision == usage_revision) { return Ok(()); }
         // Build one consistent read snapshot, even while an MCP process writes.
         // Only TEMP tables are written; the durable usage ledger is untouched.
         let tx = conn.transaction().map_err(|error| error.to_string())?;
@@ -223,20 +220,17 @@ impl TelemetryStore {
         tx.execute(&format!("{} INSERT INTO temp.usage_query_feed SELECT * FROM usage_feed", feed_sql()), [])
             .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
-        // Remember the counter after our own TEMP writes to avoid rebuilding
-        // immediately for the next chart in the same screen.
-        let total_changes = conn.query_row("SELECT total_changes()", [], |row| row.get(0))
-            .map_err(|error| error.to_string())?;
-        *cache = Some(UsageQueryCache { data_version, total_changes });
+        *cache = Some(UsageQueryCache { usage_revision });
         Ok(())
     }
 
     pub(super) fn usage_calendar(
         &self, start_at: Option<&str>, end_at: Option<&str>, source: Option<&str>,
     ) -> Result<Vec<TelemetryUsageBucket>, String> {
-        let mut conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned".to_string())?;
-        self.prepare_usage_query_feed(&mut conn)?;
-        read_usage_buckets(&conn, start_at, end_at, source, "day")
+        self.with_usage_connection(|conn| {
+            self.prepare_usage_query_feed(conn)?;
+            read_usage_buckets(conn, start_at, end_at, source, "day")
+        })
     }
 
     /// Only locally captured records are exported; downloaded rows never echo.

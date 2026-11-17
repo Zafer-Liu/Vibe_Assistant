@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>隔离 UI 验证 · Synthetic Memory Workflows</title>
+    <style>
+      html, body { min-width: 360px; background: var(--app-canvas); color: var(--app-text); }
+      #root { overflow: auto !important; }
+      .verification-toolbar { position: fixed; inset: 0 0 auto; z-index: 10; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 20px; padding: 14px 24px; border-bottom: 1px solid var(--app-stroke); background: var(--app-surface); color: var(--app-text); }
+      .verification-toolbar h1 { margin: 0 0 5px; font-size: 16px; font-weight: 600; }
+      .verification-toolbar p { margin: 0; max-width: 85ch; font-size: 12px; color: var(--app-secondary); }
+      .verification-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+      .verification-controls button { min-height: 32px; padding: 5px 12px; border-radius: 6px; border: 1px solid var(--app-control-stroke); background: var(--app-surface); color: var(--app-text); font-size: 12px; }
+      .verification-controls button:hover { background: var(--app-hover); }
+      .verification-controls button:focus-visible { outline: 2px solid var(--app-focus); outline-offset: 2px; }
+      .verification-main { width: min(100%, 1440px); margin: auto; padding: 160px 32px 32px; }
+      .verification-main p { max-width: 85ch; margin: 12px 0; line-height: 1.8; }
+      html dialog { padding-top: 128px !important; }
+      @media (max-width: 1000px) { .verification-toolbar { padding: 10px 16px; } html dialog { padding-top: 154px !important; } .verification-main { padding: 175px 20px 20px; } }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./memory-workflows.tsx"></script>
+  </body>
+</html>

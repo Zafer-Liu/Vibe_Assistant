@@ -1,10 +1,11 @@
-import { memo, useEffect, useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   ArrowLeft, ArrowRightLeft, ChevronDown, ChevronUp, FileCode2,
   FolderSync, Globe, Loader2, RotateCcw, Scale, Search, ShieldCheck, Sparkles, Trash2, X,
 } from 'lucide-react'
 import { useConfirmDialog } from '../components/ConfirmDialog'
+import { VirtualList } from '../components/VirtualList'
 import { useSkillFields } from '../store/skillStore'
 import type { SkillDriftAgent, SkillDriftFile, SkillItem } from '../types/skill'
 import { PublishDialog } from '../features/skills/components/PublishDialog'
@@ -12,15 +13,26 @@ import { SkillDiffPane } from '../features/skills/components/SkillDiffPane'
 import { SOURCES } from '../features/skills/sources'
 
 const sourceMeta = (id: string) => SOURCES.find(s => s.id === id)
+const skillKey = (skill: SkillItem) => `${skill.source}:${skill.name}`
 
-export const PublishedSkills = memo(function PublishedSkills({ onBack, onGoSync }: { onBack: () => void; onGoSync: () => void }) {
+// Match app-card-grid's 40rem minimum and 12px gaps (the root uses 16px).
+const CARD_MINIMUM_WIDTH = 640
+
+export const PublishedSkills = memo(function PublishedSkills({ active = true, onBack, onGoSync }: { active?: boolean; onBack: () => void; onGoSync: () => void }) {
   const { t } = useTranslation()
-  const { skills, skillCacheReady, loadSkills, readSkill, setSkillStatus, publishSkill, deleteSkill, applySkillSync, publishedDrift } = useSkillFields('skills', 'skillCacheReady', 'loadSkills', 'readSkill', 'setSkillStatus', 'publishSkill', 'deleteSkill', 'applySkillSync', 'publishedDrift')
+  const { skills, skillCacheReady, skillRevision, loadSkills, readSkill, setSkillStatus, publishSkill, deleteSkill, applySkillSync, publishedDrift } = useSkillFields('skills', 'skillCacheReady', 'skillRevision', 'loadSkills', 'readSkill', 'setSkillStatus', 'publishSkill', 'deleteSkill', 'applySkillSync', 'publishedDrift')
   const [query, setQuery] = useState('')
   const [agentFilter, setAgentFilter] = useState<'all' | string>('all')
   const [loading, setLoading] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const [booting, setBooting] = useState(() => !skillCacheReady)
+  const [catalogError, setCatalogError] = useState(false)
+  const [catalogRetry, setCatalogRetry] = useState(0)
+  const catalogReading = useRef(true)
+  const [catalogReadVersion, setCatalogReadVersion] = useState(0)
+  const [driftState, setDriftState] = useState<'loading' | 'ready' | 'error'>('loading')
+  const [driftError, setDriftError] = useState<string | null>(null)
+  const [driftRetry, setDriftRetry] = useState(0)
   // 展开查看内容：key 为 `${source}:${name}`
   const [expandedKey, setExpandedKey] = useState<string | null>(null)
   const [expandedContent, setExpandedContent] = useState<string | null>(null)
@@ -32,13 +44,31 @@ export const PublishedSkills = memo(function PublishedSkills({ onBack, onGoSync 
   const [arbitrating, setArbitrating] = useState<SkillItem | null>(null)
 
   useEffect(() => {
-    let mounted = true
-    void loadSkills().catch(() => setNotice(t('skills.readFailed'))).finally(() => {
-      if (mounted) setBooting(false)
+    if (!active) return
+    let current = true
+    // Set synchronously before the overview effect so re-entry never checks
+    // drift against the catalog from a previous activation.
+    catalogReading.current = true
+    // Revalidate once on activation, without expiring external changes behind
+    // a TTL or blocking a previously loaded catalog.
+    setBooting(!skillCacheReady)
+    setCatalogError(false)
+    setDriftState('loading')
+    void loadSkills(true).catch(() => {
+      if (current) {
+        setCatalogError(true)
+        setNotice(t('skills.readFailed'))
+      }
+    }).finally(() => {
+      if (current) {
+        catalogReading.current = false
+        setBooting(false)
+        setCatalogReadVersion((value) => value + 1)
+      }
     })
-    return () => { mounted = false }
+    return () => { current = false }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loadSkills])
+  }, [active, loadSkills, catalogRetry])
 
   useEffect(() => {
     if (!notice) return
@@ -46,19 +76,29 @@ export const PublishedSkills = memo(function PublishedSkills({ onBack, onGoSync 
     return () => clearTimeout(timer)
   }, [notice])
 
-  // 漂移总览跟随技能列表变化刷新：任何装载/采纳/覆盖之后 skills 都会重载，随之重新浮现本地修改。
+  // Hidden catalog changes collapse into one refresh when this page resumes.
+  // The signal also prevents a stale in-flight read retrying IPC while hidden.
   useEffect(() => {
-    let mounted = true
-    publishedDrift()
-      .then((entries) => {
-        if (!mounted) return
+    if (!active || catalogReading.current || catalogError) return
+    const controller = new AbortController()
+    setDriftState('loading')
+    setDriftError(null)
+    void (async () => {
+      try {
+        const entries = await publishedDrift(controller.signal)
+        if (controller.signal.aborted) return
         const map: Record<string, SkillDriftAgent[]> = {}
         for (const entry of entries) map[`${entry.source}:${entry.name}`] = entry.agents
         setDriftMap(map)
-      })
-      .catch(() => { /* 漂移总览失败不阻塞页面，仅无徽标 */ })
-    return () => { mounted = false }
-  }, [skills, publishedDrift])
+        setDriftState('ready')
+      } catch (error) {
+        if (controller.signal.aborted) return
+        setDriftError(String(error))
+        setDriftState('error')
+      }
+    })()
+    return () => controller.abort()
+  }, [active, skills, skillRevision, publishedDrift, catalogRetry, catalogError, catalogReadVersion, driftRetry])
 
   // ── Derived data ──
 
@@ -177,6 +217,13 @@ export const PublishedSkills = memo(function PublishedSkills({ onBack, onGoSync 
     )
   }
 
+  if (!skillCacheReady && catalogError) {
+    return <div className="flex h-full min-h-0 flex-col items-center justify-center gap-3 bg-[var(--app-canvas)] px-6 text-center" role="alert">
+      <p className="text-sm text-gray-700 dark:text-gray-200">{t('skills.readFailed')}</p>
+      <button onClick={() => setCatalogRetry((value) => value + 1)} className="rounded-lg border border-gray-300 px-3 py-2 text-xs font-medium text-gray-700 hover:bg-gray-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-800">{t('common.reload')}</button>
+    </div>
+  }
+
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--app-canvas)]">
       {/* ── Header ── */}
@@ -240,15 +287,41 @@ export const PublishedSkills = memo(function PublishedSkills({ onBack, onGoSync 
       </div>
 
       {/* ── Content ── */}
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div className="flex min-h-0 flex-1 flex-col">
+        {catalogError && (
+          <div className="flex shrink-0 items-center gap-2 px-[var(--app-page-gutter)] pt-3 text-xs text-gray-500 dark:text-gray-400" role="alert">
+            <span>{t('skills.readFailed')}</span>
+            <button onClick={() => setCatalogRetry((value) => value + 1)} className="shrink-0 rounded-md px-2 py-1 text-violet-600 hover:bg-gray-100 dark:text-violet-400 dark:hover:bg-gray-800">{t('common.reload')}</button>
+          </div>
+        )}
+        {!catalogError && driftState !== 'ready' && (
+          <div className="flex shrink-0 items-center gap-2 px-[var(--app-page-gutter)] pt-3 text-xs text-gray-500 dark:text-gray-400" role="status">
+            {driftState === 'loading' ? (
+              <><Loader2 size={13} className="animate-spin motion-reduce:animate-none" />{t('skills.deployChecking')}</>
+            ) : (
+              <><span>{t('skills.driftLoadFailed', { error: driftError })}</span><button onClick={() => setDriftRetry((value) => value + 1)} className="shrink-0 rounded-md px-2 py-1 text-violet-600 hover:bg-gray-100 dark:text-violet-400 dark:hover:bg-gray-800">{t('common.reload')}</button></>
+            )}
+          </div>
+        )}
         {visible.length > 0 ? (
-          <div className="app-card-grid px-[var(--app-page-gutter)] py-5 2xl:py-8">
-            <p className="col-span-full text-xs leading-5 text-gray-500 dark:text-gray-400">{t('skills.syncAfterChange')}</p>
-            {visible.map((skill) => {
+          <>
+            <p className="shrink-0 px-[var(--app-page-gutter)] pt-5 pb-3 text-xs leading-5 text-gray-500 dark:text-gray-400 2xl:pt-8">{t('skills.syncAfterChange')}</p>
+            <VirtualList<SkillItem>
+              items={visible}
+              getKey={skillKey}
+              active={active}
+              estimateHeight={210}
+              gap={12}
+              minimumColumnWidth={CARD_MINIMUM_WIDTH}
+              columnGap={12}
+              resetKey={JSON.stringify([agentFilter, query.trim().toLowerCase()])}
+              className="min-h-0 flex-1 overflow-y-auto"
+              contentClassName="px-[var(--app-page-gutter)] pb-5 2xl:pb-8"
+              renderItem={(skill) => {
               const key = `${skill.source}:${skill.name}`
               const expanded = expandedKey === key
               const meta = sourceMeta(skill.source)
-              const driftAgents = driftMap[key]
+              const driftAgents = driftState === 'ready' ? driftMap[key] : undefined
               const modifiedCount = driftAgents?.filter(a => a.state === 'modified').length ?? 0
               const missingCount = driftAgents?.filter(a => a.state === 'missing').length ?? 0
               const needsArbitration = modifiedCount + missingCount > 0
@@ -317,7 +390,7 @@ export const PublishedSkills = memo(function PublishedSkills({ onBack, onGoSync 
                     </button>
                     <button
                       onClick={() => setArbitrating(skill)}
-                      disabled={loading}
+                      disabled={loading || driftState !== 'ready'}
                       className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium transition disabled:opacity-50 ${
                         needsArbitration
                           ? 'bg-amber-500 text-white hover:bg-amber-400'
@@ -373,10 +446,11 @@ export const PublishedSkills = memo(function PublishedSkills({ onBack, onGoSync 
                   )}
                 </div>
               )
-            })}
-          </div>
+              }}
+            />
+          </>
         ) : (
-          <div className="flex h-full flex-col items-center justify-center px-6 text-center">
+          <div className="flex min-h-0 flex-1 flex-col items-center justify-center overflow-y-auto px-6 text-center">
             <div className="mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-2xl bg-amber-100 dark:bg-amber-900/30">
               <Sparkles size={24} className="text-amber-600 dark:text-amber-400" />
             </div>
@@ -494,7 +568,7 @@ function ArbitrateDialog({ skill, agents, onClose, onChanged, onNotice }: {
 }) {
   const { t } = useTranslation()
   const { confirm, confirmDialog } = useConfirmDialog()
-  const { skillDriftDetail, adoptLocalSkill, applySkillSyncOne, loadSkills } = useSkillFields('skillDriftDetail', 'adoptLocalSkill', 'applySkillSyncOne', 'loadSkills')
+  const { skillDriftDetail, adoptLocalSkill, applySkillSyncOne } = useSkillFields('skillDriftDetail', 'adoptLocalSkill', 'applySkillSyncOne')
   const [rows, setRows] = useState<SkillDriftAgent[]>(agents)
   const [diffAgent, setDiffAgent] = useState<string | null>(null)
   const [diffFiles, setDiffFiles] = useState<SkillDriftFile[] | null>(null)
@@ -503,7 +577,8 @@ function ArbitrateDialog({ skill, agents, onClose, onChanged, onNotice }: {
   const [error, setError] = useState<string | null>(null)
 
   async function refresh() {
-    await loadSkills(true)
+    // onChanged already forces one full revalidation; awaiting a second
+    // forced read here would duplicate the catalog (and drift) IPC round.
     onChanged()
   }
 

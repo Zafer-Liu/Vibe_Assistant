@@ -398,6 +398,10 @@ pub struct CloudMemoryDomain {
 pub struct CloudDomainTombstone {
     pub domain_id: String,
     pub deleted_at: String,
+    /// Older clients can still consume the deletion; new clients also migrate
+    /// memberships before retiring a duplicate label's identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_into: Option<String>,
 }
 
 #[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq)]

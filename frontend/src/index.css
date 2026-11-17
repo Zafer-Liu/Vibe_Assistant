@@ -1,5 +1,6 @@
 @import "tailwindcss";
 @import "./styles/fluent.css";
+@import "./styles/select.css";
 
 /* Use class-based dark mode: add/remove .dark on <html> */
 @custom-variant dark (&:where(.dark, .dark *));

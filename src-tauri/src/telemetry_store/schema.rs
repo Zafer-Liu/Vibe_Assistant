@@ -20,6 +20,22 @@ pub(super) fn open_database() -> Result<Connection, String> {
     initialize_database(conn).map_err(|e| format!("initialize schema in {}: {e}", path.display()))
 }
 
+/// A capability can only refer to an already initialized store. Evidence reads
+/// must not migrate, probe-write, or recover unrelated model jobs on a request.
+pub(super) fn open_existing_for_evidence(budget: &crate::memory_retrieval::RecallBudget) -> Result<Connection, String> {
+    budget.remaining()?;
+    let path = dirs_next::config_dir().ok_or("unavailable")?.join("agent-manager").join("telemetry.sqlite3");
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        .map_err(|_| "unavailable".to_string())?;
+    conn.busy_timeout(budget.remaining()?.min(std::time::Duration::from_millis(10))).map_err(|_| "unavailable".to_string())?;
+    let watch = crate::memory_evidence::SqlWatch::new(&conn, budget)?;
+    let version = conn.pragma_query_value(None, "user_version", |row| row.get::<_,i64>(0)).map_err(|_| "unavailable".to_string());
+    drop(watch);
+    budget.remaining()?;
+    if version? != SCHEMA_VERSION { return Err("unavailable".into()); }
+    Ok(conn)
+}
+
 fn probe_write_access(conn: &Connection, path: &Path) -> Result<(), String> {
     // Keep the real write probe for sandbox/security-software diagnosis, once
     // per process/path. Ordinary context reads must not repeat probe DDL.
@@ -235,6 +251,169 @@ mod tests {
     }
 
     #[test]
+    fn version_two_upgrade_does_not_repeat_version_one_historical_repairs() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        migrate_database_schema(&mut conn).unwrap();
+        conn.execute_batch("PRAGMA user_version=1;
+            INSERT INTO usage_records (record_id, source, session_id, occurred_at, record_kind, origin)
+            VALUES ('version-one', 'test', 'session', '2026-11-07T01:00:00+00:00', 'response', 'test');").unwrap();
+        let conn = initialize_database(conn).unwrap();
+        let timestamp: String = conn.query_row("SELECT occurred_at FROM usage_records", [], |row| row.get(0)).unwrap();
+        assert_eq!(timestamp, "2026-11-07T01:00:00+00:00");
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let domains: i64 = conn.query_row("SELECT COUNT(*) FROM app_data_revisions WHERE domain IN ('usage', 'memory_inventory')",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(domains, 2);
+        let indexes: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('idx_memory_inventory_page', 'idx_memory_user_state_memory')",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(indexes, 2);
+    }
+
+    #[test]
+    fn failed_version_two_projection_upgrade_is_atomic_and_retryable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("projection-upgrade.sqlite3");
+        let mut conn = Connection::open(&path).unwrap();
+        migrate_database_schema(&mut conn).unwrap();
+        conn.execute_batch("PRAGMA user_version=1;
+            CREATE TABLE session_latest_events (source TEXT);").unwrap();
+        assert!(initialize_database(conn).is_err());
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, 1);
+        let partial: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE name = 'app_data_revisions'",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(partial, 0);
+        conn.execute_batch("DROP TABLE session_latest_events").unwrap();
+        let conn = initialize_database(conn).unwrap();
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    fn remove_refinement_schema_for_version_two(conn: &Connection) {
+        conn.execute_batch(
+            "DROP TABLE memory_refinement_inputs;
+             DROP TABLE memory_refinement_provenance;
+             DROP TABLE memory_refinement_edits;
+             DROP TABLE memory_refinement_reviews;
+             DROP TABLE memory_refinement_runs;
+             PRAGMA user_version=2;",
+        ).unwrap();
+    }
+
+    #[test]
+    fn version_two_database_gets_refinement_tables_without_rewriting_existing_data() {
+        let conn = initialize_database(Connection::open_in_memory().unwrap()).unwrap();
+        conn.execute_batch(
+            "INSERT INTO local_memory_items
+                 (id, source_event_key, ordinal, memory, memory_type, durability, source,
+                  session_id, created_at, updated_at)
+             VALUES ('local-l1:retained', 'retained-event', 0, 'Keep this existing fact', 'fact',
+                     'short_term', 'test', 'retained-session', '2026-11-07', '2026-11-07');
+             INSERT INTO usage_records (record_id, source, session_id, occurred_at, record_kind, origin)
+             VALUES ('before-v3', 'test', 'session', '2026-11-07T01:00:00+00:00', 'response', 'test');",
+        ).unwrap();
+        remove_refinement_schema_for_version_two(&conn);
+        let conn = initialize_database(conn).unwrap();
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let table_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name IN
+                 ('memory_refinement_runs', 'memory_refinement_inputs', 'memory_refinement_reviews',
+                  'memory_refinement_edits', 'memory_refinement_provenance')", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(table_count, 5);
+        let content: String = conn.query_row(
+            "SELECT memory FROM local_memory_items WHERE id = 'local-l1:retained'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(content, "Keep this existing fact");
+        let timestamp: String = conn.query_row(
+            "SELECT occurred_at FROM usage_records WHERE record_id = 'before-v3'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(timestamp, "2026-11-07T01:00:00+00:00", "v3 must not repeat old ledger repairs");
+        let conn = initialize_database(conn).unwrap();
+        let store = crate::telemetry_store::TelemetryStore::from_connection(conn);
+        assert!(store.refinement_history(None).unwrap().is_empty());
+        let run = store.refinement_prepare(None, false).unwrap();
+        assert_eq!(run.view.total, 1);
+        store.refinement_save(&run).unwrap();
+        assert_eq!(store.refinement_history(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_version_three_upgrade_keeps_version_two_and_can_be_retried() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("refinement-upgrade.sqlite3");
+        let conn = initialize_database(Connection::open(&path).unwrap()).unwrap();
+        remove_refinement_schema_for_version_two(&conn);
+        conn.execute_batch("CREATE TABLE memory_refinement_runs(id TEXT PRIMARY KEY);").unwrap();
+        assert!(initialize_database(conn).is_err());
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, 2, "failed upgrades must not advance the version");
+        let partial: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'memory_refinement_inputs'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(partial, 0, "failed upgrades must roll back newly created tables");
+        conn.execute_batch("DROP TABLE memory_refinement_runs;").unwrap();
+        let conn = initialize_database(conn).unwrap();
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn version_three_gets_recall_history_without_replaying_legacy_repairs() {
+        let conn = initialize_database(Connection::open_in_memory().unwrap()).unwrap();
+        conn.execute_batch(
+            "INSERT INTO local_memory_items
+                 (id, source_event_key, ordinal, memory, memory_type, durability, source,
+                  session_id, created_at, updated_at)
+             VALUES ('trace-upgrade-kept', 'kept-event', 0, 'Keep the current memory', 'fact',
+                     'short_term', 'test', 'kept-session', '2026-11-07', '2026-11-07');
+             INSERT INTO usage_records (record_id, source, session_id, occurred_at, record_kind, origin)
+             VALUES ('before-trace-upgrade', 'test', 'session', '2026-11-07T01:00:00+00:00', 'response', 'test');
+             DROP TABLE memory_recall_traces;
+             PRAGMA user_version=3;",
+        ).unwrap();
+        let conn = initialize_database(conn).unwrap();
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM memory_recall_traces", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+        let body: String = conn.query_row("SELECT memory FROM local_memory_items WHERE id = 'trace-upgrade-kept'", [], |row| row.get(0)).unwrap();
+        assert_eq!(body, "Keep the current memory");
+        let time: String = conn.query_row("SELECT occurred_at FROM usage_records WHERE record_id = 'before-trace-upgrade'", [], |row| row.get(0)).unwrap();
+        assert_eq!(time, "2026-11-07T01:00:00+00:00");
+        let conn = initialize_database(conn).unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM memory_recall_traces", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn version_four_gets_evidence_capabilities_without_rewriting_conversations() {
+        let conn = initialize_database(Connection::open_in_memory().unwrap()).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER evidence_source_insert;
+             DROP TRIGGER evidence_source_update;
+             DROP TRIGGER evidence_source_delete;
+             DROP TABLE memory_evidence_contexts;
+             DROP TABLE memory_evidence_source_revisions;
+             PRAGMA user_version=4;
+             INSERT INTO agent_events(event_key,source,session_id,event_type,occurred_at,payload_json,conversation_state,conversation_message_count,conversation_text)
+             VALUES('before-evidence','test','session','Stop','2026-11-07T01:00:00+00:00','{}','full',2,'Keep the original source');",
+        ).unwrap();
+        let conn = initialize_database(conn).unwrap();
+        assert_eq!(conn.pragma_query_value(None,"user_version",|row|row.get::<_,i64>(0)).unwrap(),SCHEMA_VERSION);
+        let (text,time): (String,String) = conn.query_row("SELECT conversation_text,occurred_at FROM agent_events WHERE event_key='before-evidence'",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(text,"Keep the original source");
+        assert_eq!(time,"2026-11-07T01:00:00+00:00");
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM memory_evidence_contexts",[],|row|row.get::<_,i64>(0)).unwrap(),0);
+        conn.execute("UPDATE agent_events SET conversation_text='Updated source' WHERE event_key='before-evidence'",[]).unwrap();
+        assert_eq!(conn.query_row("SELECT revision FROM memory_evidence_source_revisions WHERE event_key='before-evidence'",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+    }
+
+    #[test]
     fn rejects_read_only_connections_without_changing_existing_data() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("telemetry.sqlite3");
@@ -258,7 +437,7 @@ mod tests {
 }
 
 /// Increment whenever a durable table, column, trigger or data migration changes.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Shared by production and isolated tests. Normal opens configure a connection
 /// and read one version number; historical repairs run only during migration.
@@ -281,10 +460,33 @@ pub(super) fn initialize_database(mut conn: Connection) -> Result<Connection, St
         let current: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|error| error.to_string())?;
         if current > SCHEMA_VERSION { return Err("数据库已由更新的应用迁移，请更新应用".into()); }
-        if current < SCHEMA_VERSION {
-            migrate_database_schema(&mut conn)?;
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION).map_err(|error| error.to_string())?;
+        if current < 1 { migrate_database_schema(&mut conn)?; }
+        if current < 2 {
+            super::projections::initialize(&conn)?;
+            super::memory_queries::initialize(&conn)?;
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_memory_inventory_page
+                     ON local_memory_items(user_defined DESC, updated_at DESC, id DESC);
+                 CREATE INDEX IF NOT EXISTS idx_memory_user_state_memory
+                     ON memory_user_state_peer(memory_id, device);",
+            ).map_err(|error| error.to_string())?;
         }
+        // Refinement is a separate versioned upgrade: existing v1/v2 stores
+        // skip the original schema migration and still need these tables.
+        if current < 3 {
+            super::refinement::initialize(&conn)?;
+        }
+        if current < 4 {
+            super::recall_traces::initialize(&conn)?;
+        }
+        if current < 5 {
+            super::memory_evidence::initialize(&conn)?;
+        }
+        if current < 6 {
+            super::domain_merge::initialize(&conn)?;
+            super::domain_merge::merge_duplicate_names(&conn)?;
+        }
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION).map_err(|error| error.to_string())?;
         conn.execute_batch("COMMIT").map_err(|error| error.to_string())
     })();
     if let Err(error) = migrated {

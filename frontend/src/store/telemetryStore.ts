@@ -11,11 +11,15 @@ interface TelemetryStore {
   telemetryEvents: TelemetryEvent[]
   telemetryUsageRecords: TelemetryUsageRecord[]
   /** 常规刷新只读取账本；仅在用户主动刷新时回扫本机转录。 */
-  checkTelemetry: (options?: { backfill?: boolean; refreshUsage?: boolean; limit?: number }) => Promise<TelemetryUsageRefresh | null>
+  checkTelemetry: (options?: { backfill?: boolean; refreshUsage?: boolean; limit?: number; events?: boolean; details?: boolean }) => Promise<TelemetryUsageRefresh | null>
   loadUsageAnalytics: (filters: { startAt?: string; endAt?: string; source?: string; bucket: 'hour' | 'day' }) => Promise<TelemetryUsageAnalytics>
   loadUsageCalendar: (filters: { startAt?: string; endAt?: string; source?: string }) => Promise<TelemetryUsageBucket[]>
 }
 
+const summaryRequests = new Map<string, Promise<TelemetrySummary>>()
+const liveRequests = new Map<string, Promise<TelemetryLiveStatus>>()
+const eventRequests = new Map<string, Promise<TelemetryEvent[]>>()
+const recordRequests = new Map<string, Promise<TelemetryUsageRecord[]>>()
 const usageRequests = new Map<string, Promise<TelemetryUsageAnalytics>>()
 const calendarRequests = new Map<string, Promise<TelemetryUsageBucket[]>>()
 
@@ -48,20 +52,27 @@ export const useTelemetryStore = create<TelemetryStore>((set) => ({
       const usageRefresh = options.refreshUsage
         ? await telemetryApi.telemetryRefreshUsage()
         : null
-      // The summary is the primary UI. Live status is a supplementary query,
-      // so a migration/older backend must never hide the Token panel merely
-      // because that supplementary query is temporarily unavailable.
+      if (options.backfill || options.refreshUsage) {
+        // A post-write refresh must not join a read started before that write.
+        summaryRequests.clear()
+        liveRequests.clear()
+        eventRequests.clear()
+        recordRequests.clear()
+      }
+      // Overview polling does not transfer conversation bodies or unused request
+      // details. Capture/detail pages explicitly opt in when they need them.
+      const limit = options.limit ?? 20
       const [summaryResult, eventsResult, usageRecordsResult, liveResult] = await Promise.allSettled([
-        telemetryApi.telemetrySummary(),
-        telemetryApi.telemetryRecentEvents({ limit: options.limit ?? 20 }),
-        telemetryApi.telemetryUsageRecords({ limit: Math.max(options.limit ?? 20, 200) }),
-        telemetryApi.telemetryLiveStatus(),
+        coalescedRequest(summaryRequests, 'summary', () => telemetryApi.telemetrySummary()),
+        options.events ? coalescedRequest(eventRequests, String(limit), () => telemetryApi.telemetryRecentEvents({ limit })) : Promise.resolve(null),
+        options.details ? coalescedRequest(recordRequests, String(limit), () => telemetryApi.telemetryUsageRecords({ limit: Math.max(limit, 200) })) : Promise.resolve(null),
+        coalescedRequest(liveRequests, 'live', () => telemetryApi.telemetryLiveStatus()),
       ])
       set((state) => {
         const next = {
           telemetrySummary: summaryResult.status === 'fulfilled' ? summaryResult.value : state.telemetrySummary,
-          telemetryEvents: eventsResult.status === 'fulfilled' ? eventsResult.value : state.telemetryEvents,
-          telemetryUsageRecords: usageRecordsResult.status === 'fulfilled' ? usageRecordsResult.value : state.telemetryUsageRecords,
+          telemetryEvents: eventsResult.status === 'fulfilled' && eventsResult.value !== null ? eventsResult.value : state.telemetryEvents,
+          telemetryUsageRecords: usageRecordsResult.status === 'fulfilled' && usageRecordsResult.value !== null ? usageRecordsResult.value : state.telemetryUsageRecords,
           telemetryLiveStatus: liveResult.status === 'fulfilled' ? liveResult.value : state.telemetryLiveStatus,
         }
         return jsonEqual(state.telemetrySummary, next.telemetrySummary) && jsonEqual(state.telemetryEvents, next.telemetryEvents) && jsonEqual(state.telemetryUsageRecords, next.telemetryUsageRecords) && jsonEqual(state.telemetryLiveStatus, next.telemetryLiveStatus)

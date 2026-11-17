@@ -71,7 +71,7 @@ pub(super) fn domain_timestamp(value: &str) -> Result<chrono::DateTime<chrono::U
 
 /// Definition updates converge by timestamp, with a deterministic tie-break for equal timestamps.
 /// Deletion is permanent for an ID; creating a new label gives it a new UUID.
-fn upsert_cloud_domain(transaction: &Transaction, domain: &CloudMemoryDomain) -> Result<bool, String> {
+fn upsert_cloud_domain(transaction: &Transaction, domain: &CloudMemoryDomain) -> Result<Option<String>, String> {
     if domain.id.trim().is_empty() || domain.name.trim().is_empty()
         || !matches!(domain.kind.as_str(), "builtin" | "project" | "custom")
     {
@@ -83,7 +83,13 @@ fn upsert_cloud_domain(transaction: &Transaction, domain: &CloudMemoryDomain) ->
         "SELECT EXISTS(SELECT 1 FROM memory_domain_tombstones WHERE domain_id = ?1)",
         [&domain.id], |row| row.get(0),
     ).map_err(|error| error.to_string())?;
-    if deleted { return Ok(false) }
+    if deleted {
+        let target = domain_merge::resolve(transaction, &domain.id)?;
+        if target.is_none() && !domain_merge::explicitly_deleted(transaction,&domain.id)? {
+            return Err("标签合并目标尚未到达，未覆盖原有关联".into());
+        }
+        return Ok(target);
+    }
     let aliases = serde_json::to_string(&domain.aliases).map_err(|error| error.to_string())?;
     let existing: Option<(String, String, String, String, bool, String, String)> = transaction.query_row(
         "SELECT name, kind, description, aliases_json, enabled, created_at, updated_at
@@ -97,7 +103,7 @@ fn upsert_cloud_domain(transaction: &Transaction, domain: &CloudMemoryDomain) ->
             domain.enabled, &domain.created_at, &domain.updated_at);
         let old_order = (&name, &kind, &description, &old_aliases, enabled, &created_at, &updated_at);
         if incoming_time < old_time || (incoming_time == old_time && incoming_order <= old_order) {
-            return Ok(true);
+            return domain_merge::resolve(transaction, &domain.id);
         }
     }
     transaction.execute(
@@ -111,7 +117,8 @@ fn upsert_cloud_domain(transaction: &Transaction, domain: &CloudMemoryDomain) ->
         params![domain.id, domain.name, domain.kind, domain.description, aliases,
             domain.enabled, domain.created_at, domain.updated_at],
     ).map_err(|error| error.to_string())?;
-    Ok(true)
+    domain_merge::merge_duplicate_names(transaction)?;
+    domain_merge::resolve(transaction, &domain.id)
 }
 
 /// Missing tags are legacy data; an explicit empty list removes old assignments.
@@ -133,21 +140,22 @@ pub(super) fn apply_cloud_domains(
         {
             return Err("云端记忆的领域标签无效".into());
         }
-        if upsert_cloud_domain(transaction, &link.domain)? { active.push(link); }
+        if let Some(id) = upsert_cloud_domain(transaction, &link.domain)? { active.push((id,link)); }
     }
     transaction.execute("DELETE FROM local_memory_domains WHERE memory_id = ?1", [memory_id])
         .map_err(|error| error.to_string())?;
-    for link in &active {
+    for (id,link) in &active {
+        let Some(id) = domain_merge::resolve(transaction, id)? else { continue };
         transaction.execute(
             "INSERT INTO local_memory_domains
                 (memory_id, domain_id, weight, source, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)
              ON CONFLICT(memory_id, domain_id, source) DO UPDATE SET
-                weight = excluded.weight, updated_at = excluded.updated_at",
-            params![memory_id, link.domain.id, link.weight, link.source, now],
+                weight = MAX(weight,excluded.weight), updated_at = excluded.updated_at",
+            params![memory_id, id, link.weight, link.source, now],
         ).map_err(|error| error.to_string())?;
     }
-    if !active.iter().any(|link| link.source == "backfill") {
+    if !active.iter().any(|(_,link)| link.source == "backfill") {
         // Extraction-time auto labels are not a completed classification decision.
         transaction.execute("DELETE FROM memory_domain_classification_state WHERE memory_id = ?1", [memory_id])
             .map_err(|error| error.to_string())?;
@@ -273,11 +281,11 @@ impl TelemetryStore {
                     continue;
                 }
             }
-            let assignments: Vec<MemoryDomainAssignment> = override_item.domains.iter().map(|link| {
-                MemoryDomainAssignment { domain_id: link.domain.id.clone(), weight: link.weight }
-            }).collect();
+            let mut assignments = Vec::new();
             for link in &override_item.domains {
-                upsert_cloud_domain(&transaction, &link.domain)?;
+                if let Some(id) = upsert_cloud_domain(&transaction, &link.domain)? {
+                    assignments.push(MemoryDomainAssignment { domain_id: id, weight: link.weight });
+                }
             }
             transaction.execute(
                 "DELETE FROM local_memory_domains WHERE memory_id = ?1 AND source IN ('auto', 'backfill')",
@@ -367,10 +375,11 @@ impl TelemetryStore {
         }).map_err(|error| error.to_string())?;
         let domains = rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
         let mut statement = conn.prepare(
-            "SELECT domain_id, deleted_at FROM memory_domain_tombstones ORDER BY domain_id",
+            "SELECT t.domain_id,t.deleted_at,m.target_id FROM memory_domain_tombstones t
+             LEFT JOIN memory_domain_merges m ON m.source_id=t.domain_id ORDER BY t.domain_id",
         ).map_err(|error| error.to_string())?;
         let rows = statement.query_map([], |row| Ok(CloudDomainTombstone {
-            domain_id: row.get(0)?, deleted_at: row.get(1)?,
+            domain_id: row.get(0)?, deleted_at: row.get(1)?, merged_into: row.get(2)?,
         })).map_err(|error| error.to_string())?;
         let tombstones = rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
         Ok(CloudDomainCatalog { domains, tombstones })
@@ -395,10 +404,31 @@ impl TelemetryStore {
                         AND excluded.deleted_at > memory_domain_tombstones.deleted_at)",
                 params![tombstone.domain_id, tombstone.deleted_at],
             ).map_err(|error| error.to_string())?;
-            transaction.execute("DELETE FROM memory_domains WHERE id = ?1", [&tombstone.domain_id])
-                .map_err(|error| error.to_string())?;
+            if let Some(target) = &tombstone.merged_into {
+                domain_merge::record_redirect(&transaction, &tombstone.domain_id, target, &tombstone.deleted_at)?;
+            }
         }
-        for domain in &catalog.domains { upsert_cloud_domain(&transaction, domain)?; }
+        // Keep retired definitions until their memberships have been moved.
+        // Target definitions must exist before a first-time peer applies merges.
+        for domain in &catalog.domains {
+            let retired: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM memory_domain_tombstones WHERE domain_id=?1)",
+                [&domain.id], |row|row.get(0)).map_err(|error|error.to_string())?;
+            if !retired { upsert_cloud_domain(&transaction, domain)?; }
+        }
+        for tombstone in &catalog.tombstones {
+            let target: Option<String> = transaction.query_row("SELECT target_id FROM memory_domain_merges WHERE source_id=?1",
+                [&tombstone.domain_id], |row| row.get(0)).optional().map_err(|error| error.to_string())?;
+            if let Some(target) = target {
+                if let Some(canonical) = domain_merge::resolve(&transaction, &target)? {
+                    domain_merge::merge(&transaction, &tombstone.domain_id, &canonical, &tombstone.deleted_at)?;
+                    continue;
+                }
+                if !domain_merge::explicitly_deleted(&transaction,&target)? {
+                    return Err("云端标签合并目标尚未到达，未删除原有关联，请稍后同步".into());
+                }
+            }
+            transaction.execute("DELETE FROM memory_domains WHERE id=?1", [&tombstone.domain_id]).map_err(|error| error.to_string())?;
+        }
         transaction.commit().map_err(|error| error.to_string())
     }
 }

@@ -1,0 +1,173 @@
+/* Shared Fluent selection controls. Keep native select semantics and keyboard handling. */
+:root {
+  --app-menu-shadow: 0 8px 24px #0000001f, 0 2px 6px #0000000f;
+  --app-select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23616161' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+}
+.dark {
+  --app-menu-shadow: 0 8px 24px #00000052, 0 2px 6px #00000029;
+  --app-select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23b8b8b8' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+}
+
+/* The arrow and closed control also work on WebView versions without base-select. */
+.fluent-app select:where(:not([multiple]):not([size]), :not([multiple])[size="1"]) {
+  appearance: none;
+  max-inline-size: 100%;
+  min-block-size: 32px;
+  padding-inline: 10px 34px;
+  border: 1px solid var(--app-control-stroke);
+  border-bottom-color: var(--app-control-bottom);
+  border-radius: 6px;
+  background-color: var(--app-layer);
+  background-image: var(--app-select-chevron);
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  color: var(--app-text);
+  font-family: var(--font-sans);
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  transition: background-color 120ms, border-color 120ms;
+}
+.fluent-app select:enabled:hover { background-color: var(--app-hover); }
+.fluent-app select:disabled {
+  color: var(--app-secondary);
+  opacity: .55;
+  cursor: not-allowed;
+}
+.fluent-app select:focus { outline: none; box-shadow: none; }
+.fluent-app select:focus-visible {
+  outline: 2px solid var(--app-focus);
+  outline-offset: 2px;
+}
+.fluent-app select[aria-invalid="true"] { border-color: var(--color-red-600); }
+.fluent-app .app-select-with-icon { padding-inline-start: 36px; }
+
+/* WebView2 / Chromium's picker lives in the top layer: dialogs and scroll panes cannot clip it. */
+@supports (appearance: base-select) {
+  .fluent-app select:where(:not([multiple]):not([size]), :not([multiple])[size="1"]),
+  .fluent-app select::picker(select) { appearance: base-select; }
+  .fluent-app select:where(:not([multiple]):not([size]), :not([multiple])[size="1"]) {
+    align-items: center;
+    gap: 12px;
+    padding-inline-end: 10px;
+    background-image: none;
+  }
+  .fluent-app select::picker-icon {
+    content: "";
+    flex: none;
+    inline-size: 14px;
+    block-size: 14px;
+    margin-inline-start: auto;
+    background: currentColor;
+    color: var(--app-secondary);
+    mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") center / contain no-repeat;
+    transition: rotate 140ms var(--app-ease);
+  }
+  .fluent-app select:open { border-color: var(--app-control-bottom); }
+  .fluent-app select:open::picker-icon { rotate: 180deg; }
+  .fluent-app select::picker(select) {
+    /* Keep the picker below its control; only horizontal collision avoidance is allowed. */
+    position-area: block-end span-inline-end;
+    position-try-fallbacks: flip-inline;
+    min-inline-size: anchor-size(self-inline);
+    max-inline-size: min(40rem, calc(100vw - 16px));
+    max-block-size: max(0px, min(320px, calc(100% - 12px)));
+    margin-block: 4px;
+    padding: 4px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    border: 1px solid var(--app-control-stroke);
+    border-radius: 8px;
+    background: var(--app-surface);
+    color: var(--app-text);
+    box-shadow: var(--app-menu-shadow);
+    font: inherit;
+    scrollbar-width: thin;
+    scrollbar-color: var(--app-scrollbar) transparent;
+  }
+  .fluent-app select option, .app-combobox-option {
+    position: relative;
+    min-block-size: 32px;
+    padding: 6px 12px 6px 32px;
+    border-radius: 4px;
+    color: var(--app-text);
+    font-weight: 400;
+    line-height: 1.5;
+    text-align: start;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    cursor: pointer;
+  }
+  .fluent-app select option:checked { background: var(--app-accent-soft); }
+  .fluent-app select option:enabled:hover, .fluent-app select option:focus-visible { background: var(--app-hover); outline: none; }
+  .fluent-app select option:checked:enabled:hover { background: var(--app-accent-soft); }
+  .fluent-app select option:disabled { color: var(--app-secondary); opacity: .55; cursor: not-allowed; }
+  .fluent-app select option::checkmark, .app-combobox-option[data-selected="true"]::before {
+    content: "";
+    position: absolute;
+    inset-inline-start: 10px;
+    inset-block-start: 50%;
+    translate: 0 -50%;
+    inline-size: 14px;
+    block-size: 14px;
+    color: var(--app-accent);
+    background: currentColor;
+    mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m5 12 4 4L19 6'/%3E%3C/svg%3E") center / contain no-repeat;
+  }
+  .fluent-app select optgroup { padding-block: 4px; }
+  .fluent-app select optgroup > legend { padding: 6px 12px; color: var(--app-secondary); font-size: 12px; font-weight: 600; }
+}
+
+.app-combobox { position: relative; min-width: 0; }
+.fluent-app .app-combobox-input {
+  width: 100%;
+  min-height: 32px;
+  padding: 6px 34px 6px 10px;
+  border: 1px solid var(--app-control-stroke);
+  border-bottom-color: var(--app-control-bottom);
+  border-radius: 6px;
+  background: var(--app-layer);
+  color: var(--app-text);
+  font-size: 14px;
+}
+.fluent-app .app-combobox-input:disabled { opacity: .55; cursor: not-allowed; }
+.app-combobox-chevron {
+  position: absolute;
+  inset-inline-end: 10px;
+  top: 50%;
+  translate: 0 -50%;
+  color: var(--app-secondary);
+  pointer-events: none;
+  transition: rotate 140ms var(--app-ease);
+}
+.app-combobox:has([aria-expanded="true"]) .app-combobox-chevron { rotate: 180deg; }
+.app-combobox-list {
+  position: fixed;
+  margin: 0;
+  padding: 4px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--app-control-stroke);
+  border-radius: 8px;
+  background: var(--app-surface);
+  color: var(--app-text);
+  box-shadow: var(--app-menu-shadow);
+  font-family: var(--font-sans);
+  font-size: 14px;
+}
+.app-combobox-option { position: relative; padding: 6px 12px 6px 32px; border-radius: 4px; overflow-wrap: anywhere; cursor: pointer; }
+.app-combobox-option[data-selected="true"] { background: var(--app-accent-soft); }
+.app-combobox-option[data-active="true"] { background: var(--app-hover); outline: 1px solid var(--app-focus); outline-offset: -1px; }
+
+@media (forced-colors: active) {
+  .fluent-app select, .fluent-app .app-combobox-input, .app-combobox-list { border-color: ButtonText; }
+  .fluent-app select option:checked, .app-combobox-option[data-selected="true"], .app-combobox-option[data-active="true"] { background: Highlight; color: HighlightText; }
+  .fluent-app select option::checkmark, .app-combobox-option[data-selected="true"]::before { color: inherit; }
+  .fluent-app select:disabled, .fluent-app select option:disabled, .fluent-app .app-combobox-input:disabled { color: GrayText; opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fluent-app select::picker-icon, .app-combobox-chevron { transition: none; }
+}

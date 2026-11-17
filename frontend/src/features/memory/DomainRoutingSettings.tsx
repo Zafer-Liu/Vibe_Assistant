@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { useTranslation } from 'react-i18next'
 import { Brain, CheckCircle2, Loader2, Pencil, Plus, Trash2, X } from 'lucide-react'
 import { useConfirmDialog } from '../../components/ConfirmDialog'
+import { Combobox } from '../../components/Combobox'
 
 type DecisionProvider = 'jev' | 'ollama'
 
@@ -225,8 +226,14 @@ export function DomainRoutingSettings() {
           </select>
         </label>
         <label className="text-xs text-gray-500">{t('memory.domainModel')}
-          <input list={config.provider === 'ollama' ? 'domain-ollama-models' : undefined} value={config.model} onChange={(event) => updateConfig({ model: event.target.value })} placeholder={config.provider === 'ollama' ? t('memory.domainOllamaModelPlaceholder') : 'jev-latest'} className="mt-1 w-full rounded-md border border-gray-300 bg-white px-2.5 py-1.5 text-sm text-gray-800 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100" />
-          {config.provider === 'ollama' && <datalist id="domain-ollama-models">{models.map((model) => <option key={model} value={model} />)}</datalist>}
+          <Combobox
+            value={config.model}
+            options={config.provider === 'ollama' ? models : []}
+            onValueChange={model => updateConfig({ model })}
+            label={t('memory.domainModel')}
+            placeholder={config.provider === 'ollama' ? t('memory.domainOllamaModelPlaceholder') : 'jev-latest'}
+            className="mt-1"
+          />
         </label>
         <label className="text-xs text-gray-500">{t('memory.domainEndpoint')}
           <input value={config.endpoint} onChange={(event) => updateConfig({ endpoint: event.target.value })} className="mt-1 w-full rounded-md border border-gray-300 bg-white px-2.5 py-1.5 text-sm text-gray-800 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100" />

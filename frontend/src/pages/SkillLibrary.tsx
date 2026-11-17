@@ -2,11 +2,12 @@ import { EquipmentProfiles, EquipmentProfilesButton } from '../features/equipmen
 import { SOURCES, sourceColor, type SourceFilter } from '../features/skills/sources'
 import { PublishDialog } from '../features/skills/components/PublishDialog'
 import { DeployDialog } from '../features/skills/components/DeployDialog'
-import { memo, useEffect, useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listen } from '@tauri-apps/api/event'
 import { BookOpenText, Check, ChevronRight, FileCode2, FolderSync, RefreshCw, Search, Sparkles, Copy, CheckCheck, Hash, Globe, Rocket, ShieldCheck, Layers, RotateCcw, Loader2, Trash2, X } from 'lucide-react'
 import { useConfirmDialog } from '../components/ConfirmDialog'
+import { VirtualList } from '../components/VirtualList'
 import { useSkillFields } from '../store/skillStore'
 import type { SkillDocument, SkillItem } from '../types/skill'
 
@@ -42,7 +43,10 @@ const ORIGIN_LABEL_KEY: Record<SkillOrigin, string> = {
   builtin: 'skills.originBuiltin',
 }
 
-export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOpenSync, onSyncOpened }: {
+const skillKey = (skill: SkillItem) => `${skill.source}:${skill.name}`
+
+export const SkillLibrary = memo(function SkillLibrary({ active = true, onOpenPublished, autoOpenSync, onSyncOpened }: {
+  active?: boolean
   onOpenPublished?: () => void
   autoOpenSync?: boolean
   onSyncOpened?: () => void
@@ -70,15 +74,27 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
   // Shared catalog cache survives page navigation; only its first creation
   // deserves a blocking loading state.
   const [booting, setBooting] = useState(() => !skillCacheReady)
+  const [catalogError, setCatalogError] = useState(false)
+  const [catalogRetry, setCatalogRetry] = useState(0)
 
   useEffect(() => {
-    let mounted = true
-    void loadSkills().catch(() => setNotice(t('skills.readFailed'))).finally(() => {
-      if (mounted) setBooting(false)
+    if (!active) return
+    let current = true
+    // One forced revalidation per activation observes external library edits;
+    // the existing catalog stays usable while concurrent callers share the read.
+    setBooting(!skillCacheReady)
+    setCatalogError(false)
+    void loadSkills(true).catch(() => {
+      if (current) {
+        setCatalogError(true)
+        setNotice(t('skills.readFailed'))
+      }
+    }).finally(() => {
+      if (current) setBooting(false)
     })
-    return () => { mounted = false }
+    return () => { current = false }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loadSkills])
+  }, [active, loadSkills, catalogRetry])
 
   // Auto-dismiss transient notices so they never linger as stale chrome.
   useEffect(() => {
@@ -89,11 +105,11 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
 
   // 「已发布」页可带参跳入：进入后直接打开同步对话框。
   useEffect(() => {
-    if (autoOpenSync) {
+    if (active && autoOpenSync) {
       setSyncOpen(true)
       onSyncOpened?.()
     }
-  }, [autoOpenSync, onSyncOpened])
+  }, [active, autoOpenSync, onSyncOpened])
 
   // ── Derived data ──
 
@@ -141,14 +157,21 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
 
   // ── Actions ──
 
+  // 慢速 skill_read 后到时不得覆盖更新的选择（最后点击者胜，而非最后返回者）。
+  const selectToken = useRef(0)
+
   async function selectSkill(skill: SkillItem) {
+    const token = ++selectToken.current
     setLoading(true)
     try {
-      setSelected(await readSkill(skill.source, skill.name))
+      const document = await readSkill(skill.source, skill.name)
+      if (token !== selectToken.current) return
+      setSelected(document)
     } catch (error) {
+      if (token !== selectToken.current) return
       setNotice(t('skills.readSkillFailed', { error: String(error) }))
     } finally {
-      setLoading(false)
+      if (token === selectToken.current) setLoading(false)
     }
   }
 
@@ -375,6 +398,13 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
     </div>
   }
 
+  if (!skillCacheReady && catalogError) {
+    return <div className="flex h-full min-h-0 flex-col items-center justify-center gap-3 bg-[var(--app-canvas)] px-6 text-center" role="alert">
+      <p className="text-sm text-gray-700 dark:text-gray-200">{t('skills.readFailed')}</p>
+      <button onClick={() => setCatalogRetry((value) => value + 1)} className="rounded-lg border border-gray-300 px-3 py-2 text-xs font-medium text-gray-700 hover:bg-gray-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-800">{t('common.reload')}</button>
+    </div>
+  }
+
   if (equipmentOpen) return <EquipmentProfiles onBack={() => { setEquipmentOpen(false); void loadSkills() }} />
 
   return (
@@ -491,15 +521,24 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
             <span className="text-xs text-gray-500 dark:text-gray-400">{t('skills.totalCount', { count: visibleSkills.length })}</span>
           </div>
 
-          <div className="min-h-0 flex-1 overflow-y-auto p-2">
-            {visibleSkills.map((skill) => {
+          {visibleSkills.length > 0 ? (
+            <VirtualList<SkillItem>
+              items={visibleSkills}
+              getKey={skillKey}
+              active={active}
+              estimateHeight={filter === 'published' ? 150 : 80}
+              gap={2}
+              resetKey={JSON.stringify([filter, originFilter, searchTerm])}
+              className="min-h-0 flex-1 overflow-y-auto"
+              contentClassName="p-2"
+              renderItem={(skill) => {
               const key = `${skill.source}:${skill.name}`
               const isSelected = selected?.item.source === skill.source && selected.item.name === skill.name
               const isChecked = selectedIds.has(key)
               return (
                <div
                  key={key}
-                  className={`group mb-0.5 w-full rounded-lg transition-all ${
+                  className={`group w-full rounded-lg transition-all ${
                     isSelected
                       ? 'border-l-[3px] border-l-violet-500 bg-violet-50 dark:border-l-violet-400 dark:bg-violet-500/10'
                       : 'border-l-[3px] border-l-transparent hover:bg-gray-100 dark:hover:bg-gray-800'
@@ -559,8 +598,10 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
                  )}
                </div>
               )
-            })}
-            {!visibleSkills.length && (
+              }}
+            />
+          ) : (
+            <div className="min-h-0 flex-1 overflow-y-auto p-2">
               <div className="px-4 py-12 text-center">
                 <div className="mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-2xl bg-amber-100 dark:bg-amber-900/30">
                   <Sparkles size={24} className="text-amber-600 dark:text-amber-400" />
@@ -568,8 +609,8 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
                 <p className="text-sm font-medium text-gray-700 dark:text-gray-200">{t('skills.emptyTitle')}</p>
                 <p className="mt-1 text-xs leading-5 text-gray-500 dark:text-gray-400">{t('skills.emptyHint')}</p>
               </div>
-            )}
-          </div>
+            </div>
+          )}
 
           {/* ── 批量操作栏：仅在勾选后出现，吸附在列表底部 ── */}
           {selectedIds.size > 0 && (
@@ -582,7 +623,7 @@ export const SkillLibrary = memo(function SkillLibrary({ onOpenPublished, autoOp
               </div>
               <div className="flex items-center gap-2">
                 <ShieldCheck size={12} className="shrink-0 text-gray-500" />
-                <select value={bulkTarget} onChange={(e) => setBulkTarget(e.target.value)} className="min-w-0 flex-1 rounded-md border border-gray-300 bg-white px-1.5 py-1 text-xs text-gray-700 outline-none focus:border-violet-400 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200">
+                <select aria-label={t('skills.bulkTargetLabel')} value={bulkTarget} onChange={(e) => setBulkTarget(e.target.value)} className="min-w-0 flex-1 rounded-md border border-gray-300 bg-white px-1.5 py-1 text-xs text-gray-700 outline-none focus:border-violet-400 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200">
                   {SOURCES.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
                 </select>
                 <button disabled={loading} onClick={() => { void bulkAssign(bulkTarget, true) }} className="inline-flex items-center gap-1 rounded-md bg-violet-600 px-2 py-1 text-xs font-medium text-white transition hover:bg-violet-500 disabled:opacity-50">{t('skills.bulkEquip')}</button>

@@ -6,8 +6,11 @@ import { useMemoryFields } from '../store/memoryStore'
 import type { MemoryImportance, MemoryItem } from '../types/memory'
 import { MemoryBreadcrumb } from '../components/MemoryBreadcrumb'
 import { MemoryMarkdown } from '../components/MemoryMarkdown'
+import { VirtualList } from '../components/VirtualList'
 import { Modal } from '../components/Modal'
 import { intlLocale } from '../i18n'
+
+const memoryKey = (memory: MemoryItem) => memory.id
 
 function localTime(value: string) {
   const normalized = value.trim().replace(/(\.\d{3})\d+(?=(Z|[+-]\d{2}:\d{2})$)/, '$1')
@@ -87,8 +90,10 @@ export const OrganizedConversations = memo(function OrganizedConversations({ onB
 
   useEffect(() => {
     if (!active) return
-    void listMemories(true)
-    void loadMemoryDomains()
+    // Revalidation keeps the previous list visible; a rejection only surfaces
+    // through memoryLoadState, never as an unhandled promise.
+    void listMemories(true).catch(() => {})
+    void loadMemoryDomains().catch(() => {})
   }, [listMemories, loadMemoryDomains, active])
 
   const domainCounts = useMemo(() => {
@@ -148,10 +153,15 @@ export const OrganizedConversations = memo(function OrganizedConversations({ onB
         && (config.provider === 'ollama' || config.has_api_key)
       if (!ready) throw new Error(t('memory.pending.classifyNotReady'))
       const BATCH_SIZE = 4
+      // Reconcile each batch with live SQLite progress. Keep this pass bounded:
+      // new memories and items edited during classification remain for the next pass.
+      const remaining = new Set(initial.pending_ids)
       let saved = initial
-      for (let index = 0; index < initial.pending_ids.length; index += BATCH_SIZE) {
-        const slice = initial.pending_ids.slice(index, index + BATCH_SIZE)
+      while (remaining.size > 0) {
+        const slice = saved.pending_ids.filter((id) => remaining.has(id)).slice(0, BATCH_SIZE)
+        if (slice.length === 0) break
         await invoke('memory_domain_classify_batch', { memoryIds: slice })
+        for (const id of slice) remaining.delete(id)
         saved = await loadClassificationStatus()
       }
       setClassifyNotice({
@@ -279,8 +289,15 @@ export const OrganizedConversations = memo(function OrganizedConversations({ onB
       </section>
 
       <section className="mt-6 flex min-h-0 flex-1 flex-col rounded-2xl border border-slate-200 bg-white p-5 shadow-[0_1px_2px_rgba(15,23,42,0.03)] dark:border-slate-800 dark:bg-slate-900 sm:p-6" aria-label={t('memory.organized.listLabel')}>
-        {!memoryCacheReady ? (
-          <div className="flex min-h-48 items-center justify-center gap-2 text-sm text-slate-500"><Loader2 size={16} className="animate-spin motion-reduce:animate-none" />{t('memory.organized.loading')}</div>
+        {!memoryCacheReady && memories.length === 0 ? (
+          memoryLoadState.inventory === 'error' ? (
+            <div role="alert" className="flex min-h-48 flex-col items-center justify-center gap-3 text-center">
+              <p className="text-sm text-slate-600 dark:text-slate-300">{t('memory.sectionLoadFailed')}</p>
+              <button type="button" onClick={() => { void listMemories(true).catch(() => {}) }} className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800">{t('common.retry')}</button>
+            </div>
+          ) : (
+            <div className="flex min-h-48 items-center justify-center gap-2 text-sm text-slate-500"><Loader2 size={16} className="animate-spin motion-reduce:animate-none" />{t('memory.organized.loading')}</div>
+          )
         ) : visible.length === 0 ? (
           <div className="flex min-h-48 flex-col items-center justify-center text-center">
             <span className="grid h-11 w-11 place-items-center rounded-xl bg-slate-500/10 text-slate-500"><Brain size={20} /></span>
@@ -288,11 +305,10 @@ export const OrganizedConversations = memo(function OrganizedConversations({ onB
             <p className="mt-1 max-w-md text-sm text-slate-500 dark:text-slate-400">{t('memory.organized.emptyDesc')}</p>
           </div>
         ) : (
-          <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto overscroll-contain pr-1">
-            {visible.map((m) => (
-              <MemoryRow key={m.id} memory={m} ranking={importance[m.id]} pinDisabled={memoryLoadState.importance !== 'ready'} onPin={handlePinMemory} onEdit={openEdit} onDelete={handleDelete} />
-            ))}
-          </div>
+          <VirtualList items={visible} getKey={memoryKey} active={active}
+            className="min-h-0 flex-1 overscroll-contain pr-1" estimateHeight={120} gap={6}
+            resetKey={domainFilter} aria-label={t('memory.organized.listLabel')}
+            renderItem={(m) => <MemoryRow memory={m} ranking={importance[m.id]} pinDisabled={memoryLoadState.importance !== 'ready'} onPin={handlePinMemory} onEdit={openEdit} onDelete={handleDelete} />} />
         )}
       </section>
 

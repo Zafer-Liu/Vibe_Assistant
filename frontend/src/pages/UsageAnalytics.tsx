@@ -2,7 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listen } from '@tauri-apps/api/event'
 import {
-  Activity, BarChart3, CalendarDays, ChevronDown, Database, FileClock,
+  Activity, BarChart3, CalendarDays, Database, FileClock,
   Calculator, Gauge, Grid3X3, RefreshCw, SlidersHorizontal, Sparkles, Zap,
 } from 'lucide-react'
 import { useTelemetryFields } from '../store/telemetryStore'
@@ -118,12 +118,13 @@ function displayTime(value: string) {
 
 function tokenTotal(event: TelemetryUsageRecord) { return event.input_tokens + event.output_tokens }
 
-function boundsFor(range: RangeKey) {
+function boundsFor(range: RangeKey, now = new Date()) {
   if (range === 'all') return { bucket: 'day' as const }
-  const now = new Date()
   const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
-  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (range === 'today' ? 0 : range === '7d' ? 6 : 29))
-  return { startAt: start.toISOString(), endAt: tomorrow.toISOString(), bucket: range === 'today' ? 'hour' as const : 'day' as const }
+  // Use the local calendar so Monday stays at local midnight across DST/month/year boundaries.
+  const daysBack = range === 'today' ? 0 : range === '7d' ? (now.getDay() + 6) % 7 : 29
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysBack)
+  return { startAt: start.toISOString(), endAt: (range === '7d' ? now : tomorrow).toISOString(), bucket: range === 'today' ? 'hour' as const : 'day' as const }
 }
 
 function bucketLabel(bucket: TelemetryUsageBucket, range: RangeKey) {
@@ -202,32 +203,38 @@ function UsageTrend({ buckets, range }: { buckets: TelemetryUsageBucket[]; range
   </div>
 }
 
-function UsageHeatmap({ cells, loading }: { cells: TelemetryUsageHeatCell[]; loading: boolean }) {
+function UsageHeatmap({ cells, loading, range, asOf }: { cells: TelemetryUsageHeatCell[]; loading: boolean; range: RangeKey; asOf: Date }) {
   const { t } = useTranslation()
   const { theme } = useTheme()
-  const values = new Map(cells.map(cell => [`${cell.weekday}:${cell.hour}`, cell]))
-  const maxTokens = Math.max(0, ...cells.map(cell => cell.input_tokens + cell.output_tokens))
+  const currentDay = (asOf.getDay() + 6) % 7
+  const isFuture = (weekday: number, hour: number) => range === '7d' && (
+    (weekday + 6) % 7 > currentDay || (weekday === asOf.getDay() && hour > asOf.getHours())
+  )
+  const visibleCells = cells.filter(cell => !isFuture(cell.weekday, cell.hour))
+  const values = new Map(visibleCells.map(cell => [`${cell.weekday}:${cell.hour}`, cell]))
+  const maxTokens = Math.max(0, ...visibleCells.map(cell => cell.input_tokens + cell.output_tokens))
   // 与 Token 活动日历同一套四分位分级，色阶才对得上。
-  const thresholds = heatThresholds(cells.map(cell => cell.input_tokens + cell.output_tokens))
+  const thresholds = heatThresholds(visibleCells.map(cell => cell.input_tokens + cell.output_tokens))
   const scale = theme === 'dark' ? 'dark' : 'light'
   const emptyColor = USAGE_HEATMAP_EMPTY[scale]
   const legend = [emptyColor, ...USAGE_HEAT_GREEN[scale]]
   const dayOrder = [1, 2, 3, 4, 5, 6, 0]
   const dayLabel = (weekday: number) => new Intl.DateTimeFormat(intlLocale(), { weekday: 'short' })
     .format(new Date(2024, 0, 7 + weekday))
+  const description = t(range === '7d' ? 'memory.usage.heatmapWeekDesc' : 'memory.usage.heatmapDesc')
 
   return <section className="mt-7 rounded-2xl border border-slate-200 bg-white p-5 shadow-[0_1px_2px_rgba(15,23,42,0.03)] dark:border-slate-800 dark:bg-slate-900 sm:p-7" aria-labelledby="usage-heatmap-title">
     <div className="flex items-start gap-3">
       <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-emerald-50 text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-300"><Grid3X3 size={20} /></span>
       <div>
         <h2 id="usage-heatmap-title" className="font-semibold text-slate-900 dark:text-slate-100">{t('memory.usage.heatmapTitle')}</h2>
-        <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">{t('memory.usage.heatmapDesc')}</p>
+        <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">{description}</p>
       </div>
     </div>
-    {loading ? <div className="mt-5 h-44 animate-pulse rounded-xl bg-slate-100 dark:bg-slate-800" /> : maxTokens === 0 ? <div className="mt-4 rounded-lg border border-dashed border-slate-200 px-4 py-8 text-center text-sm text-slate-500 dark:border-slate-800 dark:text-slate-400">{t('memory.usage.heatmapEmpty')}</div> : (
+    {loading ? <div className="mt-5 h-44 animate-pulse rounded-xl bg-slate-100 dark:bg-slate-800" /> : maxTokens === 0 && range !== '7d' ? <div className="mt-4 rounded-lg border border-dashed border-slate-200 px-4 py-8 text-center text-sm text-slate-500 dark:border-slate-800 dark:text-slate-400">{t('memory.usage.heatmapEmpty')}</div> : (
       <>
         <div className="mt-5 overflow-x-auto pb-1">
-          <div className="grid min-w-[690px] grid-cols-[3.5rem_repeat(24,minmax(1.25rem,1fr))] gap-1" role="img" aria-label={t('memory.usage.heatmapDesc')}>
+          <div className="grid min-w-[690px] grid-cols-[3.5rem_repeat(24,minmax(1.25rem,1fr))] gap-1" role="img" aria-label={description}>
             <span />
             {Array.from({ length: 24 }, (_, hour) => <span key={hour} className="text-center font-mono text-[11px] tabular-nums text-slate-500">{hour % 3 === 0 ? hour.toString().padStart(2, '0') : ''}</span>)}
             {dayOrder.flatMap(weekday => {
@@ -235,6 +242,8 @@ function UsageHeatmap({ cells, loading }: { cells: TelemetryUsageHeatCell[]; loa
               return [
                 <span key={`label-${weekday}`} className="flex items-center text-xs text-slate-500 dark:text-slate-400">{label}</span>,
                 ...Array.from({ length: 24 }, (_, hour) => {
+                  // Keep the full grid, but future slots have no usage fill or tooltip.
+                  if (isFuture(weekday, hour)) return <span key={`${weekday}-${hour}`} aria-hidden="true" className="aspect-square min-h-5 rounded-[4px] border border-slate-900/10 dark:border-white/10" style={{ backgroundColor: emptyColor }} />
                   const cell = values.get(`${weekday}:${hour}`)
                   const tokens = (cell?.input_tokens ?? 0) + (cell?.output_tokens ?? 0)
                   const level = heatLevel(tokens, thresholds)
@@ -511,6 +520,7 @@ export const UsageAnalytics = memo(function UsageAnalytics({ active = true }: { 
   const [range, setRange] = useState<RangeKey>('today')
   const [source, setSource] = useState('all')
   const [analytics, setAnalytics] = useState<TelemetryUsageAnalytics | null>(null)
+  const [analyticsAsOf, setAnalyticsAsOf] = useState(() => new Date())
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [loadError, setLoadError] = useState('')
@@ -528,10 +538,12 @@ export const UsageAnalytics = memo(function UsageAnalytics({ active = true }: { 
   // responses cannot overwrite the current view, including after hiding it.
   const reloadAnalytics = useCallback(async () => {
     const version = ++requestVersion.current
+    const asOf = new Date()
     try {
-      const result = await loadUsageAnalytics({ ...boundsFor(range), source })
+      const result = await loadUsageAnalytics({ ...boundsFor(range, asOf), source })
       if (version === requestVersion.current) {
         setAnalytics(result)
+        setAnalyticsAsOf(asOf)
         setLoadError('')
       }
     } catch (error) {
@@ -607,8 +619,8 @@ export const UsageAnalytics = memo(function UsageAnalytics({ active = true }: { 
           <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">{t('memory.usage.desc')}</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <label className="sr-only" htmlFor="usage-source">{t('memory.usage.sourceLabel')}</label><div className="relative"><select id="usage-source" value={source} onChange={event => setSource(event.target.value)} className="h-10 appearance-none rounded-lg border border-slate-200 bg-white py-0 pl-3 pr-9 text-sm font-medium text-slate-700 outline-none transition hover:border-slate-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"><option value="all">{t('memory.usage.allSources')}</option>{(analytics?.sources ?? []).map(item => <option key={item} value={item}>{sourceLabel(item)}</option>)}</select><ChevronDown size={16} className="pointer-events-none absolute right-3 top-3 text-slate-500" /></div>
-          <div className="relative"><select value={range} onChange={event => setRange(event.target.value as RangeKey)} className="h-10 appearance-none rounded-lg border border-slate-200 bg-white py-0 pl-9 pr-9 text-sm font-medium text-slate-700 outline-none transition hover:border-slate-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"><option value="today">{t('memory.usage.rangeToday')}</option><option value="7d">{t('memory.usage.range7d')}</option><option value="30d">{t('memory.usage.range30d')}</option><option value="all">{t('memory.usage.rangeAll')}</option></select><CalendarDays size={16} className="pointer-events-none absolute left-3 top-3 text-slate-500" /><ChevronDown size={16} className="pointer-events-none absolute right-3 top-3 text-slate-500" /></div>
+          <select id="usage-source" aria-label={t('memory.usage.sourceLabel')} value={source} onChange={event => setSource(event.target.value)} className="h-10 py-0 text-sm"><option value="all">{t('memory.usage.allSources')}</option>{(analytics?.sources ?? []).map(item => <option key={item} value={item}>{sourceLabel(item)}</option>)}</select>
+          <div className="relative"><select aria-label={t('memory.usage.rangeLabel')} value={range} onChange={event => setRange(event.target.value as RangeKey)} className="app-select-with-icon h-10 py-0 text-sm"><option value="today">{t('memory.usage.rangeToday')}</option><option value="7d">{t('memory.usage.range7d')}</option><option value="30d">{t('memory.usage.range30d')}</option><option value="all">{t('memory.usage.rangeAll')}</option></select><CalendarDays size={16} className="pointer-events-none absolute left-3 top-3 text-[var(--app-secondary)]" aria-hidden="true" /></div>
           <button type="button" onClick={() => { void refresh() }} disabled={refreshing} className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:bg-slate-50 disabled:cursor-wait disabled:opacity-60 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"><RefreshCw size={16} className={refreshing ? 'animate-spin motion-reduce:animate-none' : ''} />{t('memory.usage.rescan')}</button>
         </div>
       </header>
@@ -630,7 +642,7 @@ export const UsageAnalytics = memo(function UsageAnalytics({ active = true }: { 
       </section>
 
       {(analytics?.daily_only_tokens ?? 0) > 0 && <p role="status" className="mt-5 text-sm text-amber-700 dark:text-amber-300">{t('memory.usage.dailyOnlyHint', { tokens: amount(analytics?.daily_only_tokens ?? 0) })}</p>}
-      <UsageHeatmap cells={analytics?.heatmap ?? []} loading={loading} />
+      <UsageHeatmap cells={analytics?.heatmap ?? []} loading={loading} range={range} asOf={analyticsAsOf} />
 
       <PricingEstimator
         groups={analytics?.cost_groups ?? []}

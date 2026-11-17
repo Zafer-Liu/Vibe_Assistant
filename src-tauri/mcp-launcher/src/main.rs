@@ -185,6 +185,22 @@ fn stderr_classification(tail: &Arc<Mutex<Vec<u8>>>) -> Option<&'static str> {
     })
 }
 
+/// Forward raw bytes without text decoding or waiting for EOF to flush a
+/// partial JSONL message. The peer, not this launcher, owns input encoding.
+fn copy_flushed(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
+    let mut buffer = [0u8; 8192];
+    loop {
+        let count = match input.read(&mut buffer) {
+            Ok(0) => return output.flush(),
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        output.write_all(&buffer[..count])?;
+        output.flush()?;
+    }
+}
+
 fn relay_io(child: &mut Child, mut heartbeat: Option<&mut FallbackHeartbeat>, stderr_tail: &Arc<Mutex<Vec<u8>>>) -> Result<i32, String> {
     let mut input = match child.stdin.take() {
         Some(input) => input,
@@ -197,13 +213,13 @@ fn relay_io(child: &mut Child, mut heartbeat: Option<&mut FallbackHeartbeat>, st
     let (events, receiver) = mpsc::channel();
     let input_events = events.clone();
     let input_pump = std::thread::spawn(move || {
-        let result = io::copy(&mut io::stdin(), &mut input);
+        let result = copy_flushed(&mut io::stdin().lock(), &mut input);
         drop(input);
         let _ = input_events.send((true, result.is_ok()));
     });
     let output_pump = std::thread::spawn(move || {
         let mut stdout = io::stdout().lock();
-        let result = io::copy(&mut output, &mut stdout).and_then(|_| stdout.flush());
+        let result = copy_flushed(&mut output, &mut stdout);
         let _ = events.send((false, result.is_ok()));
     });
     let mut failed = false;
@@ -346,6 +362,58 @@ fn original_command(program: &str, args: &[String], environment: &std::collectio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_pump_preserves_legacy_bytes_and_flushes_before_reading_again() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        struct Input<'a> { bytes: &'a [u8], flushed: Rc<Cell<bool>>, interrupted: bool }
+        impl Read for Input<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.interrupted {
+                    self.interrupted = false;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                assert!(self.flushed.get(), "forwarded bytes must reach the peer before the next read");
+                let count = self.bytes.len().min(buffer.len()).min(3);
+                buffer[..count].copy_from_slice(&self.bytes[..count]);
+                self.bytes = &self.bytes[count..];
+                Ok(count)
+            }
+        }
+        struct Output { bytes: Vec<u8>, flushed: Rc<Cell<bool>>, flushes: usize }
+        impl Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.flushed.set(false);
+                let count = bytes.len().min(2); // Exercise write_all's partial-write handling.
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushed.set(true);
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+        let bytes = b"{\"query\":\"\xd6\xd0\xce\xc4\"}\r\n\xff\n";
+        let flushed = Rc::new(Cell::new(true));
+        let mut input = Input { bytes, flushed: flushed.clone(), interrupted: true };
+        let mut output = Output { bytes: Vec::new(), flushed, flushes: 0 };
+        copy_flushed(&mut input, &mut output).unwrap();
+        assert_eq!(output.bytes, bytes);
+        assert!(output.flushes > 1);
+    }
+
+    #[test]
+    fn byte_pump_reports_a_closed_peer() {
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> { Err(io::ErrorKind::BrokenPipe.into()) }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let error = copy_flushed(&mut io::Cursor::new(b"request\n"), &mut Closed).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
 
     #[test]
     fn upstream_diagnostics_never_expose_stderr_values() {

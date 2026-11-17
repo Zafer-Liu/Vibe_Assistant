@@ -1,8 +1,10 @@
 import { create } from 'zustand'
 import { useShallow } from 'zustand/react/shallow'
 import { invoke } from '@tauri-apps/api/core'
-import { createBgeConsolidationCandidateBatches, searchMemoriesWithBge } from '../lib/bgeSemanticSearch'
+import { createBgeConsolidationCandidateBatches } from '../lib/bgeSemanticSearch'
 import type { AddEventItem, AddResult, ConsolidationResult, EngineStatus, HookStatus, IngestStatus, L1ResetResult, LocalMemoryStats, MemoryConversationDetail, MemoryDomainItem, MemoryImportance, MemoryImportanceSummary, MemoryImportResult, MemoryItem, MemoryLayerDocument, MemoryLayerRunResult, OrganizeConversationsResult, PendingMemorySession } from '../types/memory'
+import type { MemoryRetrievalDiagnostics, MemoryRetrievalResponse, MemoryRetrievalRouting } from '../types/memory'
+import type { EvidenceAccess } from '../types/memoryEvidence'
 import type { AgentSourceInfo } from '../types/agentSources'
 import type { MemoryInjectionLog, MemoryInjectionStats } from '../types/memoryInjection'
 
@@ -14,6 +16,22 @@ import { timeStartupPhase } from '../lib/startupPerformance'
 export const GLOBAL_USER_ID = 'agent-manager'
 
 export type MemoryLoadStatus = 'idle' | 'loading' | 'ready' | 'error'
+
+const MEMORY_PAGE_LIMIT = 500
+const IMPORTANCE_BATCH_LIMIT = 400
+const MEMORY_INVENTORY_CHANGED_PREFIX = 'MEMORY_INVENTORY_CHANGED:'
+const MEMORY_INVENTORY_RESTART_LIMIT = 2
+interface MemoryPageCursor {
+  user_defined: boolean
+  updated_at: string
+  id: string
+  revision: string
+}
+interface MemoryPage {
+  items: MemoryItem[]
+  next_cursor: MemoryPageCursor | null
+}
+
 interface MemoryLoadState {
   inventory: MemoryLoadStatus
   domains: MemoryLoadStatus
@@ -68,6 +86,32 @@ function withMemoryDomains(memories: MemoryItem[], domains: MemoryDomainItem[], 
   return enriched.every((memory, position) => memory === memories[position]) ? memories : enriched
 }
 
+function retrievalMemories(response: MemoryRetrievalResponse, memoryDomains: MemoryDomainItem[]): MemoryItem[] {
+  const domains = new Map(memoryDomains.map((domain) => [domain.id, domain]))
+  return response.memories.map((hit, index) => ({
+    id: hit.id,
+    memory: hit.content,
+    memory_type: hit.type,
+    durability: hit.durability,
+    user_defined: hit.user_defined,
+    last_update_at: hit.updated_at,
+    event_time: hit.event_time,
+    source_agent: hit.source_agent ?? undefined,
+    session_id: hit.session_id ?? undefined,
+    score: hit.score ?? hit.fused_score,
+    semantic_score: hit.semantic_score,
+    keyword_score: hit.keyword_score,
+    fused_score: hit.fused_score,
+    semantic_rank: hit.semantic_rank,
+    keyword_rank: hit.keyword_rank,
+    rank: hit.rank ?? index + 1,
+    source: hit.source,
+    retrieval_source: hit.source === 'conversation' ? 'conversation' : 'local',
+    retrieval_method: hit.source === 'semantic+keyword' ? 'hybrid' : hit.source === 'semantic' ? 'semantic' : 'keyword',
+    domains: (hit.domains ?? []).map((id) => domains.get(id) ?? { id, name: id, description: '', memory_count: 0 }),
+  }))
+}
+
 interface MemoryStore {
   /** 内置记忆引擎在线状态 */
   engineOnline: boolean | null
@@ -99,7 +143,7 @@ interface MemoryStore {
   l2Documents: MemoryLayerDocument[]
   l3Documents: MemoryLayerDocument[]
   localMemoryStats: LocalMemoryStats | null
-  /** Base SQLite inventory is usable, independently of optional enrichment. */
+  /** Every SQLite page is loaded; optional enrichment may still be pending. */
   memoryCacheReady: boolean
   memoryLoadState: MemoryLoadState
   memories: MemoryItem[]
@@ -108,6 +152,9 @@ interface MemoryStore {
   lastAddEvents: AddEventItem[]
   lastSearchResults: MemoryItem[]
   lastSearchQuery: string
+  lastSearchRetrieval: (MemoryRetrievalDiagnostics & { routing?: MemoryRetrievalRouting }) | null
+  /** Ephemeral source capability; never persisted with query history. */
+  lastSearchEvidenceAccess: EvidenceAccess | null
   importance: Record<string, MemoryImportance>
   loading: boolean
   setActiveAgent: (id: string | null) => Promise<void>
@@ -142,6 +189,7 @@ interface MemoryStore {
   /** 用户手动添加自定义长期记忆：只有用户能删改；scope 指定归属 L2/L3，两层相互独立。 */
   addUserMemory: (content: string, memoryType: string, scope: 'l2' | 'l3') => Promise<MemoryItem>
   search: (query: string, topK: number) => Promise<MemoryItem[]>
+  applyRecallResponse: (response: MemoryRetrievalResponse) => void
   listMemories: (force?: boolean) => Promise<void>
   loadMemoryDomains: (force?: boolean) => Promise<MemoryDomainItem[]>
   setSelectedMemoryDomain: (domainId: string) => Promise<void>
@@ -196,47 +244,137 @@ export const useMemoryStore = create<MemoryStore>((set, get) => {
   })
   const l2Request = createLayerRequest('l2')
   const l3Request = createLayerRequest('l3')
-  const runSearch = async (query: string, topK: number, isCurrent = () => true) => {
-    set({ loading: true, lastSearchQuery: query })
+  let searchRevision = 0
+  let activeSearch: number | null = null
+  let mutationLoads = 0
+  let lastSearchLimit = 10
+  const syncLoading = () => set({ loading: activeSearch !== null || mutationLoads > 0 })
+  const invalidateSearch = () => {
+    searchRevision += 1
+    activeSearch = null
+    set({ lastSearchEvidenceAccess: null })
+    syncLoading()
+  }
+  const runSearch = async (query: string, topK: number, isCurrent = () => true): Promise<MemoryItem[]> => {
+    if (!isCurrent()) return []
+    const revision = ++searchRevision
+    const domainId = get().selectedMemoryDomainId
+    const current = () => revision === searchRevision && isCurrent() && get().selectedMemoryDomainId === domainId
+    lastSearchLimit = topK
+    activeSearch = revision
+    set({ loading: true, lastSearchQuery: query, lastSearchResults: [], lastSearchRetrieval: null, lastSearchEvidenceAccess: null })
     try {
-      const results = await searchMemoriesWithBge(query, get().memories, topK)
-      if (isCurrent() && get().lastSearchQuery === query) set({ lastSearchResults: results })
+      if (!query.trim()) return []
+      // A selected domain must still exist; never widen an invalid selection
+      // or a failed semantic request to the entire library.
+      if (domainId !== 'all' && !get().memoryDomains.some((domain) => domain.id === domainId)) return []
+      const response = await invoke<MemoryRetrievalResponse>('memory_retrieval_search', {
+        arguments: {
+          query,
+          limit: topK,
+          domain_mode: domainId === 'all' ? 'off' : 'manual',
+          ...(domainId === 'all' ? {} : { domains: [domainId] }),
+        },
+      })
+      if (!current()) return []
+      const results = retrievalMemories(response, get().memoryDomains)
+      set({ lastSearchResults: results, lastSearchRetrieval: { ...response.retrieval, routing: response.routing }, lastSearchEvidenceAccess: response.evidence_access ?? null })
       return results
+    } catch (error) {
+      if (!current()) return []
+      throw error
     } finally {
-      set({ loading: false })
+      // An obsolete request never owns the current request's spinner.
+      if (activeSearch === revision) {
+        activeSearch = null
+        syncLoading()
+      }
     }
   }
   const inventoryRequest = createMemoryRequest(async (isCurrent) => {
-    setLoadState({ inventory: 'loading', importance: 'loading' })
-    // SQLite is authoritative. Publish it before optional metadata/importance;
-    // the semantic sidecar is used for retrieval, never inventory reconciliation.
-    const inventory = timeStartupPhase('memory_l1', () => invoke<MemoryItem[]>('local_memory_list_all'))
-      .then((items) => {
+    // Revalidation keeps the previous complete list visible (stale-while-
+    // revalidate): stats, search, and virtualized scroll must not blink to a
+    // loading state on every mutation or page re-entry. First load (or a
+    // deliberate reset) still publishes pages progressively.
+    const hadCompleteCache = get().memoryCacheReady && get().memories.length > 0
+    if (!hadCompleteCache) {
+      set((state) => ({
+        memoryCacheReady: false,
+        memoryLoadState: { ...state.memoryLoadState, inventory: 'loading', importance: 'loading' },
+      }))
+    } else {
+      setLoadState({ inventory: 'loading', importance: 'loading' })
+    }
+    // Publish each bounded SQLite page, but only the last page makes this a
+    // complete library for search/graph consumers. The sidecar is retrieval only.
+    const inventory = timeStartupPhase('memory_l1', async () => {
+      const items = new Map<string, MemoryItem>()
+      let cursor: MemoryPageCursor | null = null
+      let restarts = 0
+      for (;;) {
         if (!isCurrent()) return []
-        const memories = withMemoryDomains(items.map((item) => ({
-          ...item, retrieval_source: 'local' as const, retrieval_method: 'local' as const,
-        })), get().memoryDomains, domainLinks)
-        set((state) => ({
-          memories,
-          memoryCacheReady: true,
-          memoryLoadState: { ...state.memoryLoadState, inventory: 'ready' },
-        }))
-        return memories
-      }).catch((error) => {
-        if (isCurrent()) setLoadState({ inventory: 'error' })
-        throw error
-      })
+        let page: MemoryPage
+        try {
+          page = await invoke<MemoryPage>('local_memory_page', { cursor, limit: MEMORY_PAGE_LIMIT })
+        } catch (error) {
+          if (!isCurrent()) return []
+          const message = error instanceof Error ? error.message : String(error)
+          if (!message.startsWith(MEMORY_INVENTORY_CHANGED_PREFIX) || restarts >= MEMORY_INVENTORY_RESTART_LIMIT) throw error
+          // Count retries on the shared traversal, so coalesced public callers
+          // restart at most twice instead of each starting another read.
+          restarts += 1
+          cursor = null
+          items.clear()
+          if (!hadCompleteCache) set({ memories: [], memoryCacheReady: false })
+          continue
+        }
+        if (!isCurrent()) return []
+        for (const item of page.items) items.set(item.id, {
+          ...item, retrieval_source: 'local', retrieval_method: 'local',
+        })
+        const complete = page.next_cursor === null
+        let published: MemoryItem[] | undefined
+        if (complete || !hadCompleteCache) {
+          published = withMemoryDomains([...items.values()], get().memoryDomains, domainLinks)
+          set((state) => ({
+            memories: published,
+            memoryCacheReady: complete,
+            memoryLoadState: { ...state.memoryLoadState, inventory: complete ? 'ready' : 'loading' },
+          }))
+        }
+        if (complete) return published ?? withMemoryDomains([...items.values()], get().memoryDomains, domainLinks)
+        cursor = page.next_cursor
+      }
+    }).catch((error) => {
+      if (isCurrent()) set((state) => ({
+        // Keep any previous complete list usable; the section status surfaces
+        // the failure and offers retry instead of an eternal spinner.
+        memoryCacheReady: state.memoryCacheReady && state.memories.length > 0,
+        memoryLoadState: { ...state.memoryLoadState, inventory: 'error' },
+      }))
+      throw error
+    })
     const stats = timeStartupPhase('memory_stats', () => invoke<LocalMemoryStats>('local_memory_stats'))
       .then((localMemoryStats) => { if (isCurrent()) set({ localMemoryStats }) })
     const domains = domainsRequest.run(true)
     const importance = inventory.then(async (memories) => {
       if (!isCurrent()) return
-      const records = await timeStartupPhase('memory_importance', () =>
-        invoke<MemoryImportance[]>('memory_importance_list', { memoryIds: memories.map((memory) => memory.id) }))
-      if (isCurrent()) set((state) => ({
-        importance: Object.fromEntries(records.map((record) => [record.memory_id, record])),
-        memoryLoadState: { ...state.memoryLoadState, importance: 'ready' },
-      }))
+      await timeStartupPhase('memory_importance', async () => {
+        let importance: Record<string, MemoryImportance> = {}
+        for (let offset = 0; offset < memories.length; offset += IMPORTANCE_BATCH_LIMIT) {
+          if (!isCurrent()) return
+          const records = await invoke<MemoryImportance[]>('memory_importance_list', {
+            memoryIds: memories.slice(offset, offset + IMPORTANCE_BATCH_LIMIT).map((memory) => memory.id),
+          })
+          if (!isCurrent()) return
+          importance = { ...importance, ...Object.fromEntries(records.map((record) => [record.memory_id, record])) }
+          set({ importance })
+        }
+        if (isCurrent()) set((state) => ({
+          importance,
+          memoryLoadState: { ...state.memoryLoadState, importance: 'ready' },
+        }))
+      })
     }).catch((error) => {
       if (isCurrent()) setLoadState({ importance: 'error' })
       throw error
@@ -245,7 +383,7 @@ export const useMemoryStore = create<MemoryStore>((set, get) => {
       if (!isCurrent()) return
       // Preserve the existing search reconciliation after inventory/tag refresh.
       if (results[0].status === 'fulfilled' && get().lastSearchQuery.trim()) {
-        await runSearch(get().lastSearchQuery, 10, isCurrent).catch(() => [])
+        await runSearch(get().lastSearchQuery, lastSearchLimit, isCurrent).catch(() => [])
       }
       if (!isCurrent()) return
       return results.slice(0, 2).find((result) => result.status === 'rejected')
@@ -304,6 +442,10 @@ export const useMemoryStore = create<MemoryStore>((set, get) => {
   lastSearchResults: [],
 
   lastSearchQuery: '',
+
+  lastSearchRetrieval: null,
+
+  lastSearchEvidenceAccess: null,
 
   importance: {},
 
@@ -511,7 +653,8 @@ export const useMemoryStore = create<MemoryStore>((set, get) => {
 
   async addMemory(messages) {
     const { memoryScope } = get()
-    set({ loading: true })
+    mutationLoads += 1
+    syncLoading()
     try {
       const data = await request<{ data?: AddResult }>('/v1/memory/add', {
         user_id: memoryScope,
@@ -523,18 +666,21 @@ export const useMemoryStore = create<MemoryStore>((set, get) => {
       set({ lastAddEvents: events })
       return events
     } finally {
-      set({ loading: false })
+      mutationLoads -= 1
+      syncLoading()
     }
   },
 
   async addUserMemory(content, memoryType, scope) {
-    set({ loading: true })
+    mutationLoads += 1
+    syncLoading()
     try {
       const item = await invoke<MemoryItem>('local_memory_add_user', { content, memoryType, scope })
       await get().listMemories(true)
       return item
     } finally {
-      set({ loading: false })
+      mutationLoads -= 1
+      syncLoading()
     }
   },
 
@@ -542,13 +688,39 @@ export const useMemoryStore = create<MemoryStore>((set, get) => {
     return runSearch(query, topK)
   },
 
+  applyRecallResponse(response) {
+    invalidateSearch()
+    const domains = response.routing?.active_domains ?? []
+    // This updates the inventory filter only after the explicit replay call.
+    // The inspector sends the historical arguments unchanged, including auto
+    // routing or multiple explicit domains; no replacement search runs here.
+    const selectedDomain = domains.length === 1 && get().memoryDomains.some((domain) => domain.id === domains[0])
+      ? domains[0] : 'all'
+    const limit = response.retrieval?.result_limit
+    if (typeof limit === 'number' && Number.isFinite(limit)) lastSearchLimit = Math.max(1, Math.min(50, Math.trunc(limit)))
+    set({
+      selectedMemoryDomainId: selectedDomain,
+      lastSearchQuery: response.query ?? '',
+      lastSearchResults: retrievalMemories(response, get().memoryDomains),
+      lastSearchRetrieval: { ...response.retrieval, routing: response.routing },
+      lastSearchEvidenceAccess: response.evidence_access ?? null,
+    })
+  },
+
   async listMemories(force = false) {
     // Normal reentry uses the base cache; active reads share one promise. A
     // forced refresh must still invalidate an older snapshot after a mutation.
     if (!force && get().memoryCacheReady && get().memoryLoadState.inventory !== 'loading') return
-    const snapshot = await inventoryRequest.run(force)
-    const failure = await snapshot.completion
-    if (failure?.status === 'rejected') throw failure.reason
+    if (force) invalidateSearch()
+    let snapshot = await inventoryRequest.run(force)
+    for (;;) {
+      const failure = await snapshot.completion
+      if (failure?.status === 'rejected') throw failure.reason
+      if (get().memoryCacheReady) return
+      // A newer force refresh may have started during optional enrichment.
+      // Full-inventory callers join its base read before they resolve.
+      snapshot = await inventoryRequest.run()
+    }
   },
 
   async loadMemoryDomains(force = false) {
@@ -556,13 +728,17 @@ export const useMemoryStore = create<MemoryStore>((set, get) => {
   },
 
   async setSelectedMemoryDomain(domainId) {
-    set({ selectedMemoryDomainId: domainId })
-    await get().listMemories(true)
-    await get().search(get().lastSearchQuery, 10).catch(() => [])
+    invalidateSearch()
+    set({ selectedMemoryDomainId: domainId, lastSearchResults: [], lastSearchRetrieval: null })
+    // Domain membership is applied by Rust; changing a filter does not mutate
+    // the inventory or require another complete traversal of the library.
+    await runSearch(get().lastSearchQuery, lastSearchLimit).catch(() => [])
   },
 
   async resetL1ForReextraction() {
     const result = await invoke<L1ResetResult>('local_memory_reset_for_reextraction')
+    invalidateSearch()
+    set({ lastSearchResults: [], lastSearchRetrieval: null })
     inventoryRequest.invalidate()
     domainsRequest.invalidate()
     l2Request.invalidate()

@@ -407,6 +407,16 @@ async fn route(
             }
         }
 
+        ("POST", p) if p == "/memory/evidence" || p.starts_with("/memory/evidence?") => {
+            let payload = body.to_string();
+            match tauri::async_runtime::spawn_blocking(move || {
+                handle_memory_evidence(&payload, crate::telemetry_store::shared_store().as_deref())
+            }).await {
+                Ok(result) => result,
+                Err(_) => ("500 Internal Server Error", json!({"error":"unavailable"}).to_string()),
+            }
+        }
+
         ("POST", p) if p == "/memory/profile" || p.starts_with("/memory/profile?") => {
             handle_memory_profile(crate::telemetry_store::shared_store().as_deref())
         }
@@ -493,10 +503,25 @@ fn handle_memory_recall(
     // 路由与语义检索共享 3000ms 预算：JEV 先消耗的时间会从后续语义检索
     // 预算中扣除。远程决策或嵌入慢时按本地检索降级，避免两段串行请求
     // 各自占满一个完整超时。
-    match crate::memory_mcp::recall_with_store_budget(store, &arguments, Some(3_000)) {
+    match crate::memory_retrieval::recall_for_entry(store, &arguments, Some(3_000), "http") {
         Ok(value) => ("200 OK", value.to_string()),
         Err(error) => bad_request(error),
     }
+}
+
+/// Same capability and excerpt contract as MCP and the desktop command.
+fn handle_memory_evidence(
+    body: &str, store: Option<&crate::telemetry_store::TelemetryStore>,
+) -> (&'static str, String) {
+    let arguments = match parse_json_body(body) { Ok(value) => value, Err(error) => return bad_request(error) };
+    let request: crate::memory_evidence::EvidenceRequest = match serde_json::from_value(arguments) {
+        Ok(request) => request,
+        Err(_) => return bad_request("invalid_request".into()),
+    };
+    let Some(store) = store else { return store_unavailable() };
+    let budget = crate::memory_retrieval::RecallBudget::new(std::time::Duration::from_secs(1));
+    ("200 OK", serde_json::to_string(&crate::memory_evidence::read_with_store(store, &request, &budget))
+        .unwrap_or_else(|_| "{\"status\":\"unavailable\"}".into()))
 }
 
 /// `POST /memory/profile`：`{}` → `{profile: string|null}`。
@@ -719,6 +744,7 @@ mod tests {
         for (path, body) in [
             ("/memory/recall", r#"{"query":"部署"}"#.to_string()),
             ("/memory/profile", "{}".to_string()),
+            ("/memory/evidence", serde_json::json!({"context_token":"a".repeat(64),"memory_ids":["test"]}).to_string()),
             (
                 "/telemetry/usage?source=dsh",
                 format!(
@@ -732,6 +758,7 @@ mod tests {
         // 端点只收 POST。
         for path in [
             "/memory/recall",
+            "/memory/evidence",
             "/memory/profile",
             "/skills/list",
             "/skills/read",
@@ -744,6 +771,7 @@ mod tests {
         // 非法 JSON 一律 400（在账本检查之前）。
         for path in [
             "/memory/recall",
+            "/memory/evidence",
             "/skills/read",
             "/telemetry/usage?source=dsh",
             "/collect/trigger?source=dsh",
@@ -810,6 +838,38 @@ mod tests {
             super::handle_memory_recall(r#"{"query":"x"}"#, None).0,
             "503 Service Unavailable"
         );
+    }
+
+    #[test]
+    fn http_recall_returns_a_capability_that_reads_only_its_current_source() {
+        let store = crate::telemetry_store::TelemetryStore::in_memory();
+        let conn = store.conn.lock().unwrap();
+        conn.execute("INSERT INTO agent_events(event_key,source,session_id,event_type,occurred_at,payload_json,conversation_state,conversation_message_count,conversation_text) VALUES('http-source','synthetic','http-session','Stop','2026-01-01','{}','full',2,'ORBIT_HTTP is the source evidence for the isolated route test.')",[]).unwrap();
+        conn.execute("INSERT INTO local_memory_items(id,source_event_key,ordinal,memory,memory_type,durability,source,session_id,user_defined,created_at,updated_at) VALUES('http-memory','http-source',0,'ORBIT_HTTP source evidence','fact','short_term','synthetic','http-session',0,'2026-01-01','2026-01-01')",[]).unwrap();
+        conn.execute("INSERT INTO local_memory_domains VALUES('http-memory','work',1,'manual','2026-01-01','2026-01-01')",[]).unwrap();
+        drop(conn);
+        let (status,body) = super::handle_memory_recall(r#"{"query":"ORBIT_HTTP","domain_mode":"manual","domains":["work"],"limit":1}"#,Some(&store));
+        assert_eq!(status,"200 OK");
+        let recall:serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(recall["memories"][0]["id"],"http-memory");
+        assert_eq!(recall["evidence_access"]["status"],"ready");
+        assert_eq!(recall["retrieval"]["trace_status"],"saved");
+        let request=serde_json::json!({"context_token":recall["evidence_access"]["context_token"],"memory_ids":["http-memory"],"query":"ORBIT_HTTP","max_chars":1000});
+        let (status,body)=super::handle_memory_evidence(&request.to_string(),Some(&store));
+        assert_eq!(status,"200 OK");
+        let evidence:serde_json::Value=serde_json::from_str(&body).unwrap();
+        assert_eq!(evidence["status"],"ok");
+        assert!(evidence["items"][0]["sources"][0]["excerpt"]["text"].as_str().unwrap().contains("source evidence"));
+        let mut denied=request; denied["memory_ids"]=serde_json::json!(["not-returned"]);
+        let (_,body)=super::handle_memory_evidence(&denied.to_string(),Some(&store));
+        let denied:serde_json::Value=serde_json::from_str(&body).unwrap();
+        assert_eq!(denied["status"],"forbidden_scope");
+        assert_eq!(denied["returned_chars"],0);
+        let conn=store.conn.lock().unwrap();
+        let entrypoint:String=conn.query_row("SELECT entrypoint FROM memory_recall_traces",[],|row|row.get(0)).unwrap();
+        assert_eq!(entrypoint,"http");
+        let history:String=conn.query_row("SELECT trace_json FROM memory_recall_traces",[],|row|row.get(0)).unwrap();
+        assert!(!history.contains(recall["evidence_access"]["context_token"].as_str().unwrap()));
     }
 
     #[test]

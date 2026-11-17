@@ -50,6 +50,7 @@ dependencies = [
  "aes-gcm",
  "chrono",
  "dirs-next",
+ "encoding_rs",
  "futures-util",
  "hmac",
  "keyring",

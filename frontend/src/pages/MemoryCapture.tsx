@@ -33,7 +33,7 @@ export const MemoryCapture = memo(function MemoryCapture({ onBack, onOpenInjecti
   const [notice, setNotice] = useState<{ kind: 'ok' | 'err'; text: string; recovery?: RecoveryTarget } | null>(null)
 
   useEffect(() => {
-    if (active) void Promise.allSettled([loadAgentSources(), checkTelemetry({ limit: 50 }), loadDshBridge()])
+    if (active) void Promise.allSettled([loadAgentSources(), checkTelemetry({ limit: 50, events: true }), loadDshBridge()])
   }, [active, loadAgentSources, checkTelemetry, loadDshBridge])
   useVisiblePolling(checkIngest, 10_000, active)
 
@@ -46,7 +46,7 @@ export const MemoryCapture = memo(function MemoryCapture({ onBack, onOpenInjecti
   async function handleRefresh() {
     if (refreshing) return
     setRefreshing(true)
-    try { await Promise.all([checkIngest(), loadAgentSources(), checkTelemetry({ backfill: true, limit: 50 })]) }
+    try { await Promise.all([checkIngest(), loadAgentSources(), checkTelemetry({ backfill: true, limit: 50, events: true })]) }
     catch (error) { flash('err', String(error)) }
     finally { setRefreshing(false) }
   }

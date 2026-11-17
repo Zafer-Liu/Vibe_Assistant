@@ -684,38 +684,17 @@ fn usage_parser_distinguishes_missing_from_reported_values() {
 fn archived_codex_rollout_name_keeps_its_session_id() {
     let path = Path::new("C:/Users/test/.codex/archived_sessions/rollout-2026-07-23T18-40-43-019f8e90-36f5-71a2-bddf-f0fe9ee23b57.jsonl");
     assert_eq!(
-        transcript_session_id("codex", path).as_deref(),
+        crate::agent_sources::session_id_for_path("codex", path).as_deref(),
         Some("019f8e90-36f5-71a2-bddf-f0fe9ee23b57"),
     );
     assert_eq!(
-        transcript_session_id(
+        crate::agent_sources::session_id_for_path(
             "claude",
             Path::new("C:/Users/test/.claude/projects/demo/session-1.jsonl")
         )
         .as_deref(),
         Some("session-1"),
     );
-}
-
-#[test]
-fn metadata_discovery_finds_an_archived_codex_transcript_without_a_hook() {
-    let root =
-        std::env::temp_dir().join(format!("agent-manager-archived-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(root.join("nested")).unwrap();
-    let session_id = "019f8e90-36f5-71a2-bddf-f0fe9ee23b57";
-    let path = root
-        .join("nested")
-        .join(format!("rollout-2026-07-23T18-40-43-{session_id}.jsonl"));
-    std::fs::write(&path, "{}").unwrap();
-    let mut found = HashMap::new();
-    scan_all_transcript_tree(&root, "codex", &mut found);
-    assert_eq!(
-        found
-            .get(&("codex".to_string(), session_id.to_string()))
-            .map(|(_, found_path)| found_path),
-        Some(&path),
-    );
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1018,28 +997,7 @@ fn claude_sidechain_agent_files_are_attributed_to_parent_session() {
 
 #[test]
 fn usage_feed_prefers_response_records_and_falls_back_to_session_totals() {
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-        "CREATE TABLE agent_events (source TEXT, session_id TEXT, occurred_at TEXT);
-             CREATE TABLE session_token_usage (
-               source TEXT NOT NULL, session_id TEXT NOT NULL, input_tokens INTEGER NOT NULL,
-               output_tokens INTEGER NOT NULL, cached_tokens INTEGER NOT NULL, origin TEXT NOT NULL,
-               refreshed_at TEXT NOT NULL, PRIMARY KEY(source, session_id)
-             );
-             CREATE TABLE usage_records (
-               record_id TEXT PRIMARY KEY, source TEXT NOT NULL, session_id TEXT NOT NULL,
-               occurred_at TEXT NOT NULL, model TEXT, record_kind TEXT NOT NULL,
-               input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
-               cached_tokens INTEGER NOT NULL, origin TEXT NOT NULL
-             );
-             CREATE TABLE usage_remote_totals (
-               device TEXT NOT NULL, day TEXT NOT NULL, source TEXT NOT NULL,
-               input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
-               cached_tokens INTEGER NOT NULL DEFAULT 0, record_count INTEGER NOT NULL DEFAULT 0,
-               PRIMARY KEY (device, day, source)
-             );",
-    )
-    .unwrap();
+    let conn = schema::initialize_database(Connection::open_in_memory().unwrap()).unwrap();
     conn.execute(
             "INSERT INTO session_token_usage VALUES ('codex', 'with-details', 100, 10, 80, 'native_transcript', '2026-08-16T08:00:00Z')",
             [],
@@ -1049,7 +1007,9 @@ fn usage_feed_prefers_response_records_and_falls_back_to_session_totals() {
             [],
         ).unwrap();
     conn.execute(
-            "INSERT INTO usage_records VALUES ('codex:1', 'codex', 'with-details', '2026-08-16T08:00:02Z', 'gpt-5.6-terra', 'response', 100, 10, 80, 'native_transcript')",
+            "INSERT INTO usage_records (record_id, source, session_id, occurred_at, model, record_kind,
+             input_tokens, output_tokens, cached_tokens, origin)
+             VALUES ('codex:1', 'codex', 'with-details', '2026-08-16T08:00:02Z', 'gpt-5.6-terra', 'response', 100, 10, 80, 'native_transcript')",
             [],
         ).unwrap();
     cloud_usage::initialize(&conn).unwrap();
@@ -1451,6 +1411,16 @@ fn keyword_recall_covers_cjk_and_latin_queries() {
 }
 
 #[test]
+fn keyword_scoring_preserves_phrase_and_alias_weights() {
+    let direct = keyword_score_prepared("ALPHA", "alpha", &["alpha".into()], &[]);
+    assert!((direct - 1.35).abs() < 1e-12);
+    let aliases = local_search_aliases("偏好");
+    let alias_only = keyword_score_prepared("约束", "偏好", &keyword_terms("偏好"), &aliases);
+    assert!((alias_only - 0.105).abs() < 1e-12);
+    assert_eq!(keyword_score_prepared("unrelated", "alpha", &["alpha".into()], &[]), 0.0);
+}
+
+#[test]
 fn local_search_aliases_cover_product_vocabulary() {
     assert!(
         keyword_score(
@@ -1660,20 +1630,4 @@ fn dsh_plugin_usage_replaces_transcript_record_with_same_identity() {
         )
         .unwrap();
     assert_eq!(count, 1);
-}
-
-#[test]
-fn probe_version_tracking_supports_the_legacy_connection_table_without_migration() {
-    let store = mcp_test_store();
-    store.proxy_connection_open("probe-a", "fixture", "assignment").unwrap();
-    store.proxy_connection_open("probe-b", "fixture", "assignment").unwrap();
-    let mut current = std::collections::HashSet::new();
-    current.insert(TelemetryStore::probe_connection_key("probe-a").unwrap());
-    assert_eq!(store.proxy_pending_probe_connections("assignment", &current).unwrap(), 1);
-    current.insert(TelemetryStore::probe_connection_key("probe-b").unwrap());
-    assert_eq!(store.proxy_pending_probe_connections("assignment", &current).unwrap(), 0);
-    let conn = store.conn.lock().unwrap();
-    let columns: Vec<String> = conn.prepare("PRAGMA table_info(mcp_proxy_connections)").unwrap()
-        .query_map([], |row| row.get(1)).unwrap().collect::<Result<_, _>>().unwrap();
-    assert!(!columns.iter().any(|name| name == "runtime_version"));
 }

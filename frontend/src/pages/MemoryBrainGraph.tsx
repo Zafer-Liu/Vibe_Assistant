@@ -36,7 +36,7 @@ export const MemoryBrainGraph = memo(function MemoryBrainGraph({
 
   useEffect(() => {
     if (!active) return
-    if (!memoryCacheReady) void listMemories()
+    if (!memoryCacheReady) void listMemories().catch(() => {})
     void loadMemoryDomains()
   }, [active, memoryCacheReady, listMemories, loadMemoryDomains])
 
@@ -51,7 +51,7 @@ export const MemoryBrainGraph = memo(function MemoryBrainGraph({
     }
   }, [refreshing, loadMemoryDomains, listMemories])
 
-  const { corpus, loading: keywordLoading, failed: keywordFailed } = useKeywordCorpus(memories, active, keywordRevision)
+  const { corpus, loading: keywordLoading, failed: keywordFailed } = useKeywordCorpus(memories, active && memoryCacheReady, keywordRevision)
   const effectiveLobes = useMemo<EffectiveLobe[]>(() => {
     const byId = new Map(memoryDomains.map((domain) => [domain.id, domain]))
     for (const memory of memories) {
@@ -140,7 +140,7 @@ export const MemoryBrainGraph = memo(function MemoryBrainGraph({
         onZoomIn={() => viewportControllerRef.current?.zoomIn()}
         onZoomOut={() => viewportControllerRef.current?.zoomOut()}
         onResetView={() => viewportControllerRef.current?.resetCamera()}
-        refreshing={refreshing || keywordLoading}
+        refreshing={refreshing || !memoryCacheReady || keywordLoading}
         onRefresh={() => { void handleRefresh() }}
         activeLobeId={activeLobeId}
         onSelectLobeFilter={handleSelectLobeFilter}
@@ -151,20 +151,20 @@ export const MemoryBrainGraph = memo(function MemoryBrainGraph({
           <button type="button" onClick={() => setKeywordRevision((value) => value + 1)} className="ml-2 underline underline-offset-2">{t('common.refresh')}</button>
         </p>
       )}
-      <div className="relative flex min-h-0 flex-1 overflow-hidden rounded-lg border border-gray-200 bg-white dark:border-gray-700 dark:bg-neutral-800" aria-busy={keywordLoading || deferredSearch !== searchQuery}>
+      <div className="relative flex min-h-0 flex-1 overflow-hidden rounded-lg border border-gray-200 bg-white dark:border-gray-700 dark:bg-neutral-800" aria-busy={!memoryCacheReady || keywordLoading || deferredSearch !== searchQuery}>
         <GraphCanvasViewport
-          active={active}
+          active={active && memoryCacheReady}
           isDark={theme === 'dark'}
           topology={topology}
           selectedNodeId={selectedNodeId}
           adjacencyMap={adjacencyMap}
           showCrossSynapses={showCrossSynapses}
           searchActive={deferredSearch.trim().length > 0}
-          loading={keywordLoading}
+          loading={!memoryCacheReady || keywordLoading}
           onSelectNode={setSelectedNodeId}
           controllerRef={viewportControllerRef}
         />
-        {selectedNode && (
+        {memoryCacheReady && selectedNode && (
           <GraphInspectorDrawer
             key={selectedNode.id}
             selectedNode={selectedNode}

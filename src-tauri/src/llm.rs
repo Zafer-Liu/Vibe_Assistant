@@ -42,6 +42,57 @@ const LLM_PROVIDERS_SETTING_KEY: &str = "llm_providers";
 const MEMORY_EXTRACTION_SETTING_KEY: &str = "memory_extraction_config";
 const OLLAMA_CONFIG_SETTING_KEY: &str = "ollama_config";
 
+static MEMORY_EXTRACTION_CONFIG_CHANGED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+pub(crate) fn notify_memory_extraction_config_changed() {
+    MEMORY_EXTRACTION_CONFIG_CHANGED.notify_one();
+}
+
+pub(crate) async fn wait_for_memory_extraction_config_change() {
+    MEMORY_EXTRACTION_CONFIG_CHANGED.notified().await;
+}
+
+/// Observe the authoritative selection and selected registry revision without
+/// resolving credentials, running migration/cleanup, or rewriting settings.
+/// Cloud sync writes the registry directly, bypassing the local save commands;
+/// the automatic dispatcher polls this small fingerprint as a fallback.
+pub(crate) fn memory_extraction_config_fingerprint() -> Result<[u8; 32], String> {
+    use rusqlite::OptionalExtension;
+    let mirror_config = || -> Result<MemoryExtractionConfig, String> {
+        match std::fs::read_to_string(memory_extraction_config_path()) {
+            Ok(text) => serde_json::from_str(&text).map_err(|_| "记忆提取配置无法解析".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(MemoryExtractionConfig::default()),
+            Err(_) => Err("记忆提取配置无法读取".into()),
+        }
+    };
+    let bytes = if let Some(store) = crate::telemetry_store::shared_store() {
+        let conn = store.conn.lock().map_err(|_| "模型配置数据库锁已损坏")?;
+        let raw: Option<String> = conn.query_row(
+            "SELECT value_json FROM app_settings WHERE setting_key=?1",
+            [MEMORY_EXTRACTION_SETTING_KEY], |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        let config = normalize_memory_extraction_config(match raw {
+            Some(raw) => serde_json::from_str(&raw).map_err(|_| "记忆提取配置无法解析")?,
+            None => mirror_config()?,
+        });
+        let identity: Option<(String, i64, Option<String>)> = match config.provider_id.as_deref() {
+            Some(id) => conn.query_row(
+                "SELECT p.id,p.revision,c.id FROM model_provider_connections p
+                 LEFT JOIN model_provider_credentials c ON c.provider_id=p.id
+                 WHERE p.namespace=?1 AND p.legacy_id=?2",
+                [crate::model_registry::LLM, id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).optional().map_err(|error| error.to_string())?,
+            None => None,
+        };
+        serde_json::to_vec(&(true, config.provider_id, identity))
+    } else {
+        let config = normalize_memory_extraction_config(mirror_config()?);
+        serde_json::to_vec(&(false, config.provider_id))
+    }.map_err(|error| error.to_string())?;
+    Ok(Sha256::digest(bytes).into())
+}
+
 /// Encrypt a key with a fresh GCM nonce.  The nonce is stored alongside the
 /// ciphertext so each saved provider is independently decryptable.
 pub(crate) fn encrypt_api_key(plain: &str) -> Result<String, String> {
@@ -268,6 +319,8 @@ pub fn memory_extraction_config() -> MemoryExtractionConfig {
 fn save_memory_extraction_config(config: &MemoryExtractionConfig) -> Result<(), String> {
     if let Some(store) = crate::telemetry_store::shared_store() {
         store.app_setting_set(MEMORY_EXTRACTION_SETTING_KEY, config)?;
+        // The authoritative write already succeeded even if the mirror fails.
+        notify_memory_extraction_config_changed();
     }
     // Compatibility mirror for older versions; SQLite is the authoritative
     // location once it has been initialized.
@@ -276,7 +329,9 @@ fn save_memory_extraction_config(config: &MemoryExtractionConfig) -> Result<(), 
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     let text = serde_json::to_string_pretty(config).map_err(|error| error.to_string())?;
-    std::fs::write(path, text).map_err(|error| error.to_string())
+    std::fs::write(path, text).map_err(|error| error.to_string())?;
+    notify_memory_extraction_config_changed();
+    Ok(())
 }
 
 /// Sanitized compatibility projection of the authoritative registry.
@@ -631,6 +686,14 @@ fn failure(kind: &'static str, message: String) -> ModelFailure {
     ModelFailure { kind, message }
 }
 
+fn text_request_timeout(is_minimax: bool, purpose: crate::llm_trace::ModelPurpose) -> std::time::Duration {
+    // Refinement includes relational review and can take longer than extraction.
+    // Its orchestration layer retains the tighter per-call and whole-batch caps.
+    std::time::Duration::from_secs(if is_minimax { 600 }
+        else if purpose == crate::llm_trace::ModelPurpose::MemoryReview { 300 }
+        else { 120 })
+}
+
 async fn send_text_request(
     provider: &LlmProvider,
     messages: &[serde_json::Value],
@@ -671,15 +734,7 @@ async fn send_text_request(
         "{}/chat/completions",
         provider.base_url.trim_end_matches('/')
     );
-    // MiniMax M3 can spend several minutes on the large map/reduce prompts
-    // used by 30-day memory consolidation.  Keep the shorter default for
-    // ordinary providers while allowing the configured MiniMax endpoint to
-    // finish its reasoning pass instead of being cut off at 120 seconds.
-    let request_timeout = if is_minimax {
-        std::time::Duration::from_secs(600)
-    } else {
-        std::time::Duration::from_secs(120)
-    };
+    let request_timeout = text_request_timeout(is_minimax, trace.snapshot.purpose);
     // MiniMax credentials are region-bound: a key issued for minimaxi.com can
     // be rejected by minimax.io (and vice versa) with error 2049.  The settings
     // connection test uses the configured URL, so memory extraction must use
@@ -717,15 +772,15 @@ async fn send_text_request(
         .or_else(|| response.headers().get("request-id"))
         .and_then(|v| v.to_str().ok())
         .map(|v| crate::llm_trace::safe_text(v, &provider.api_key));
-    let value = response.json::<serde_json::Value>().await.map_err(|_| {
-        failure(
-            if status.is_success() {
-                "invalid_json"
-            } else {
-                "http"
-            },
-            format!("模型响应无法解析（HTTP {status}）"),
-        )
+    let value = response.json::<serde_json::Value>().await.map_err(|error| {
+        if error.is_timeout() && status.is_success() {
+            failure("timeout", format!("模型请求失败（{}）: 请求超时，请稍后重试", provider.name))
+        } else {
+            failure(
+                if status.is_success() { "invalid_json" } else { "http" },
+                format!("模型响应无法解析（HTTP {status}）"),
+            )
+        }
     })?;
     trace.observe(provider, &value);
     if !status.is_success() {
@@ -753,7 +808,7 @@ async fn send_text_request(
             if is_minimax {
                 format!("MiniMax 未返回最终文本（结束原因：{finish_reason}）。已启用 reasoning_split；请检查模型名称与服务端额度后重试")
             } else {
-                "记忆提取模型未返回文本内容".to_string()
+                format!("记忆提取模型未返回最终文本（结束原因：{finish_reason}）")
             }
         }))?;
     let answer = strip_thinking_blocks(&content);
@@ -761,7 +816,7 @@ async fn send_text_request(
         if is_minimax {
             format!("MiniMax 最终文本在思考过滤后为空（结束原因：{finish_reason}）。请提高最大输出 Token 或稍后重试")
         } else {
-            "记忆提取模型仅返回了思考内容，未返回最终文本".to_string()
+            format!("记忆提取模型仅返回了思考内容，未返回最终文本（结束原因：{finish_reason}）")
         }
     }))
 }
@@ -769,7 +824,24 @@ fn explain_request_error(error: &reqwest::Error) -> String {
     if error.is_timeout() {
         "请求超时，请稍后重试".into()
     } else if error.is_connect() {
-        format!("无法建立 HTTPS 连接（{}）", error)
+        use std::error::Error;
+        let mut cause = error.source();
+        let mut details = String::new();
+        while let Some(source) = cause {
+            details.push_str(&source.to_string().to_ascii_lowercase());
+            details.push(' ');
+            cause = source.source();
+        }
+        // Inspect nested causes, but expose only fixed categories. Raw errors
+        // can contain proxy URLs, credentials or other connection details.
+        let reason = if details.contains("certificate") || details.contains("unknownissuer") {
+            "TLS 证书校验失败，请检查证书或代理配置"
+        } else if details.contains("dns") || details.contains("resolve") || details.contains("name resolution") {
+            "域名解析失败，请检查网络或代理"
+        } else {
+            "连接阶段失败，请检查网络或代理后重试"
+        };
+        format!("无法建立 HTTPS 连接（{reason}）")
     } else if error.is_request() {
         format!("请求发送失败（{}）", error)
     } else {
@@ -818,6 +890,7 @@ fn save_llm_provider_impl(provider: LlmProviderInput) -> Result<(), String> {
         &serde_json::to_value(&provider).map_err(|e| e.to_string())?,
         secret,
     )?;
+    notify_memory_extraction_config_changed();
     Ok(())
 }
 #[tauri::command]
@@ -832,7 +905,9 @@ fn delete_llm_provider_impl(id: String) -> Result<(), String> {
         return Err("Cannot delete built-in provider".into());
     }
     load_providers()?;
-    crate::model_registry::Registry::shared()?.delete(crate::model_registry::LLM, &id)
+    crate::model_registry::Registry::shared()?.delete(crate::model_registry::LLM, &id)?;
+    notify_memory_extraction_config_changed();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1170,6 +1245,54 @@ mod request_evidence_tests {
         for private in ["private prompt", "private thought", "fixture-key"] {
             assert!(!evidence.contains(private));
         }
+    }
+
+    #[tokio::test]
+    async fn memory_review_preserves_configured_reasoning_budget_without_a_4096_cap() {
+        let body = json!({"model":"MiniMax-fixture", "choices":[{"finish_reason":"stop",
+            "message":{"content":"{\"actions\":[]}"}}]}).to_string();
+        for (configured, expected) in [(None, 16_384), (Some(16_384), 16_384), (Some(2048), 2048)] {
+            let (mut provider, server) = upstream(200, &body);
+            provider.max_output_tokens = configured;
+            let store = Arc::new(TelemetryStore::in_memory());
+            let mut trace = ModelTrace::start(&provider, ModelContext::new(ModelPurpose::MemoryReview), Some(store)).unwrap();
+            complete_traced(&provider, &[json!({"role":"user","content":"review fixture"})], None, &mut trace)
+                .await.unwrap();
+            let sent = server.join().unwrap();
+            assert_eq!(sent["max_tokens"], expected);
+            assert_eq!(sent["max_completion_tokens"], expected);
+            assert_eq!(sent["reasoning_split"], true);
+        }
+    }
+
+    #[test]
+    fn memory_review_http_budget_does_not_shorten_the_reasoning_deadline() {
+        assert_eq!(text_request_timeout(false, ModelPurpose::MemoryReview).as_secs(), 300);
+        assert_eq!(text_request_timeout(false, ModelPurpose::MemoryExtract).as_secs(), 120);
+        assert_eq!(text_request_timeout(true, ModelPurpose::MemoryReview).as_secs(), 600);
+        assert_eq!(text_request_timeout(true, ModelPurpose::MemoryExtract).as_secs(), 600);
+    }
+
+    #[tokio::test]
+    async fn glm_review_keeps_saved_budget_and_reports_empty_length_responses() {
+        let body = json!({"model":"GLM-5.3", "choices":[{"finish_reason":"length",
+            "message":{"reasoning_content":"private reasoning"}}],
+            "usage":{"completion_tokens":8192}}).to_string();
+        let (mut provider, server) = upstream(200, &body);
+        provider.model = "GLM-5.3".into();
+        provider.max_output_tokens = Some(8192);
+        let store = Arc::new(TelemetryStore::in_memory());
+        let mut trace = ModelTrace::start(&provider, ModelContext::new(ModelPurpose::MemoryReview), Some(store.clone())).unwrap();
+        let error = complete_traced(&provider, &[], None, &mut trace).await.unwrap_err();
+        assert!(error.contains("结束原因：length"));
+        let sent = server.join().unwrap();
+        assert_eq!(sent["max_tokens"], 8192);
+        assert!(sent.get("reasoning_split").is_none());
+        assert!(sent.get("thinking").is_none(), "do not guess provider-specific thinking settings");
+        let record = read_traces(&store, None, 1).unwrap().remove(0);
+        assert_eq!(record.error_kind.as_deref(), Some("empty_content"));
+        assert_eq!(record.finish_reason.as_deref(), Some("length"));
+        assert_eq!(record.usage.output_tokens, Some(8192));
     }
 
     #[tokio::test]

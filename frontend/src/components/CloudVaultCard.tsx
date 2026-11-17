@@ -209,7 +209,7 @@ export function CloudVaultCard({ onSynced }: { onSynced?: () => void }) {
               <button type="button" onClick={() => setConflictsOpen(false)} className="ml-auto rounded p-1 text-gray-500 hover:bg-black/5 dark:hover:bg-white/10" aria-label={t('common.close')}><X size={17} /></button>
             </header>
             {selected ? <div className="min-h-0 overflow-y-auto p-5">
-              {conflicts.length > 1 && <select value={selected.object_key} onChange={(event) => setSelectedConflictKey(event.target.value)} className="mb-4 w-full rounded-md border border-gray-200 bg-white px-2.5 py-1.5 text-xs dark:border-gray-700 dark:bg-gray-800"><>{conflicts.map((item) => <option key={item.object_key} value={item.object_key}>{item.object_key}</option>)}</></select>}
+              {conflicts.length > 1 && <select aria-label={t('memory.cloudCard.conflictTitle')} value={selected.object_key} onChange={(event) => setSelectedConflictKey(event.target.value)} className="mb-4 w-full rounded-md border border-gray-200 bg-white px-2.5 py-1.5 text-xs dark:border-gray-700 dark:bg-gray-800"><>{conflicts.map((item) => <option key={item.object_key} value={item.object_key}>{item.object_key}</option>)}</></select>}
               <div className="grid gap-3 md:grid-cols-2">
                 <ConflictPane title={t('memory.cloudCard.local')} value={localText} changedAt={selected.local_updated_at} />
                 <ConflictPane title={t('memory.cloudCard.remote')} value={remoteText} changedAt={selected.remote_updated_at} />

@@ -33,6 +33,8 @@ Releases/*.snap
 .playwright-mcp/
 src-tauri/.playwright-mcp/
 agent-manager-review/
+/.archify/
+/.verification/
 .trae/
 .workbuddy
 .cache/

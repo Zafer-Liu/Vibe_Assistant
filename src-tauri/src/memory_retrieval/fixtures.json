@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "chinese_short_query",
+      "query": "缓存",
+      "limit": 2,
+      "memories": [
+        { "id": "cache", "content": "语义缓存按模型与正文签名失效", "domains": ["project"] },
+        { "id": "queue", "content": "后台队列最多同时处理两个会话", "domains": ["project"] }
+      ],
+      "semantic": ["queue", "cache"],
+      "keyword": ["cache"],
+      "expected": ["cache", "queue"]
+    },
+    {
+      "name": "technical_identifier",
+      "query": "recall_memory",
+      "limit": 1,
+      "memories": [
+        { "id": "mcp", "content": "recall_memory 提供按领域检索记忆", "domains": ["development"] },
+        { "id": "other", "content": "会话开局加载工作记忆", "domains": ["development"] }
+      ],
+      "semantic": ["other", "mcp"],
+      "keyword": ["mcp"],
+      "expected": ["mcp"],
+      "forbidden": ["other"]
+    },
+    {
+      "name": "mixed_language",
+      "query": "embedding 模型切换",
+      "limit": 1,
+      "memories": [
+        { "id": "model", "content": "embedding 模型切换后不能复用旧向量", "domains": ["development"] }
+      ],
+      "semantic": ["model"],
+      "keyword": ["model"],
+      "expected": ["model"]
+    },
+    {
+      "name": "same_text_distinct_projects",
+      "query": "构建输出目录",
+      "limit": 2,
+      "memories": [
+        { "id": "project-a", "content": "构建输出写入 dist", "domains": ["a"] },
+        { "id": "project-b", "content": "构建输出写入 dist", "domains": ["b"] }
+      ],
+      "semantic": ["project-a", "project-b"],
+      "keyword": ["project-a", "project-b"],
+      "expected": ["project-a", "project-b"]
+    },
+    {
+      "name": "scope_before_truncation",
+      "query": "构建输出目录",
+      "limit": 1,
+      "domains": ["b"],
+      "memories": [
+        { "id": "project-a", "content": "构建输出写入 dist", "domains": ["a"] },
+        { "id": "project-b", "content": "构建输出写入 dist", "domains": ["b"] }
+      ],
+      "semantic": ["project-a", "project-b"],
+      "keyword": ["project-a", "project-b"],
+      "expected": ["project-b"],
+      "forbidden": ["project-a"]
+    },
+    {
+      "name": "opposing_evidence",
+      "query": "编译约束",
+      "limit": 2,
+      "memories": [
+        { "id": "allow", "content": "允许执行编译", "domains": ["project"], "event_time": "2026-01-01" },
+        { "id": "deny", "content": "不允许执行编译", "domains": ["project"], "event_time": "2026-11-10" }
+      ],
+      "semantic": ["allow", "deny"],
+      "keyword": ["deny", "allow"],
+      "expected": ["allow", "deny"]
+    },
+    {
+      "name": "old_evidence_is_reachable",
+      "query": "固定工具目录",
+      "limit": 1,
+      "memories": [
+        { "id": "old", "content": "工具目录由用户配置确定", "domains": ["development"], "event_time": "2020-01-01" },
+        { "id": "new", "content": "今天打开了设置页", "domains": ["development"], "event_time": "2026-11-10" }
+      ],
+      "semantic": ["new", "old"],
+      "keyword": ["old"],
+      "expected": ["old"]
+    },
+    {
+      "name": "deleted_vectors_and_duplicate_votes",
+      "query": "当前配置",
+      "limit": 2,
+      "memories": [
+        { "id": "current", "content": "当前配置以本地账本为准", "domains": ["project"] }
+      ],
+      "semantic": ["deleted", "current", "current"],
+      "keyword": ["current", "current"],
+      "expected": ["current"],
+      "forbidden": ["deleted"]
+    },
+    {
+      "name": "unrelated_query_can_be_empty",
+      "query": "海洋潮汐数据",
+      "limit": 6,
+      "memories": [
+        { "id": "development", "content": "项目使用本地记忆账本", "domains": ["development"] }
+      ],
+      "semantic": [],
+      "keyword": [],
+      "expected": [],
+      "forbidden": ["development"]
+    }
+  ]
+}

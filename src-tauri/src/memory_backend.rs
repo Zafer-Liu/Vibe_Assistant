@@ -26,6 +26,7 @@ use crate::llm;
 use crate::telemetry_store::{MemoryImportance, MemoryImportanceCandidate};
 
 mod local_semantic;
+pub(crate) use local_semantic::evaluation as evaluation_embedding;
 
 const SEMANTIC_MEMORY_OWNER: &str = "agent-manager";
 const SEMANTIC_INDEX_BATCH_SIZE: usize = 24;
@@ -44,6 +45,22 @@ pub struct SemanticMemory {
     pub memory: String,
     pub memory_type: String,
     pub score: Option<f64>,
+}
+
+/// Semantic-stage outcome; partial caches are visible rather than silently
+/// triggering a full index build in an interactive request.
+pub(crate) struct SemanticRecall {
+    pub memories: Vec<SemanticMemory>,
+    pub mode: &'static str,
+    pub total: Option<usize>,
+    pub cached: Option<usize>,
+    pub pending: Option<usize>,
+}
+
+impl SemanticRecall {
+    pub(crate) fn fallback(mode: &'static str) -> Self {
+        Self { memories: Vec::new(), mode, total: None, cached: None, pending: None }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -519,6 +536,38 @@ pub fn queue_semantic_l1_reindex() -> Result<usize, String> {
     Ok(count)
 }
 
+/// Refinement must not trigger a cold whole-library vector build just to find
+/// a few neighbours. Cold/changed indexes degrade to lexical review and retain
+/// retryable semantic coverage instead.
+pub(crate) const REFINEMENT_SEMANTIC_BUDGET: std::time::Duration = local_semantic::REFINEMENT_BUDGET;
+
+pub(crate) fn refinement_semantic_neighbours(
+    store: &crate::telemetry_store::TelemetryStore, memory_id: &str, query: &str,
+    domains: Option<&[String]>, budget: &crate::memory_retrieval::RecallBudget,
+) -> Result<SemanticRecall, String> {
+    budget.remaining()?;
+    let config = semantic_config_read_with_budget(store, Some(budget))?.ok_or("语义检索未配置")?;
+    local_semantic::search_refinement(store, config, memory_id, query, 5, domains, budget)
+}
+
+/// Queue a bounded native refresh after an approved refinement mutation. The
+/// cache is disposable; foreground retrieval always rechecks the L1 ledger.
+pub(crate) fn queue_refined_l1_index(store: crate::telemetry_store::TelemetryStore) -> Result<(), String> {
+    if let Some(config) = semantic_config_read_raw(&store)? {
+        if let Some(guard) = try_begin_embed_build() {
+            tauri::async_runtime::spawn_blocking(move || {
+                let _guard = guard;
+                if let Err(error) = local_semantic::build_index_background(&store, config) {
+                    eprintln!("[memory-refinement] background index refresh: {error}");
+                }
+            });
+        }
+    } else {
+        queue_semantic_l1_reindex()?;
+    }
+    Ok(())
+}
+
 /// Unlike app_setting_get, propagate SQLite and JSON errors instead of
 /// silently presenting a broken stored configuration as disabled.
 ///
@@ -526,14 +575,25 @@ pub fn queue_semantic_l1_reindex() -> Result<usize, String> {
 /// the config to the frontend must pass it through
 /// `local_semantic::public_config` first; internal consumers (search, embed)
 /// need the key.
-fn semantic_config_read_raw(telemetry: &crate::telemetry_store::TelemetryStore) -> Result<Option<Value>, String> {
+pub(crate) fn semantic_config_read_raw(telemetry: &crate::telemetry_store::TelemetryStore) -> Result<Option<Value>, String> {
+    semantic_config_read_with_budget(telemetry, None)
+}
+
+fn semantic_config_read_with_budget(
+    telemetry: &crate::telemetry_store::TelemetryStore, budget: Option<&crate::memory_retrieval::RecallBudget>,
+) -> Result<Option<Value>, String> {
     use rusqlite::OptionalExtension;
-    let conn = telemetry.conn.lock().map_err(|_| "telemetry store lock poisoned".to_string())?;
-    let raw: Option<String> = conn.query_row(
-        "SELECT value_json FROM app_settings WHERE setting_key = ?1",
-        ["memory_semantic_embedding"],
-        |row| row.get(0),
-    ).optional().map_err(|error| error.to_string())?;
+    let read = |conn: &mut rusqlite::Connection| conn.query_row(
+        "SELECT value_json FROM app_settings WHERE setting_key = ?1", ["memory_semantic_embedding"], |row| row.get(0),
+    ).optional().map_err(|error| error.to_string());
+    let raw: Option<String> = match budget {
+        Some(budget) => {
+            let raw = telemetry.with_budgeted_read_connection(budget, read);
+            budget.remaining()?;
+            raw?
+        }
+        None => telemetry.with_read_connection(read)?,
+    };
     let Some(raw) = raw else { return Ok(None) };
     let value: Value = serde_json::from_str(&raw)
         .map_err(|_| "invalid stored memory_semantic_embedding JSON".to_string())?;
@@ -605,10 +665,9 @@ pub async fn memory_semantic_embed_texts(
 // ---------------------------------------------------------------------------
 // Vector index: progress status, manual build, and scheduled auto-build.
 //
-// The vector cache is otherwise lazy — `local_semantic::search` only embeds
-// documents that are still uncached when a query arrives. These commands and
-// the scheduler below make indexing proactive and observable so newly
-// consolidated memories are searchable without waiting for the next query.
+// Interactive recall reads cached document vectors without building the index.
+// These commands and the scheduler below fill missing vectors proactively so
+// newly consolidated memories become available to semantic retrieval.
 // ---------------------------------------------------------------------------
 
 /// Cheap cached/total/pending count for the settings page progress bar. Never
@@ -633,13 +692,13 @@ pub async fn memory_semantic_index_build(
 ) -> Result<Value, String> {
     let config = semantic_config_read_raw(&telemetry)?
         .ok_or_else(|| "语义检索未配置：请先在设置中启用并保存 embedding 服务".to_string())?;
-    if !try_begin_embed_build() {
-        return Err("已有索引构建任务在进行中，请稍后再试".to_string());
-    }
+    let guard = try_begin_embed_build()
+        .ok_or_else(|| "已有索引构建任务在进行中，请稍后再试".to_string())?;
     let store = telemetry.inner().clone();
-    let result = tokio::task::spawn_blocking(move || local_semantic::build_index(&store, config))
-        .await.map_err(|_| "index build task failed".to_string())?;
-    end_embed_build();
+    let result = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        local_semantic::build_index(&store, config)
+    }).await.map_err(|_| "index build task failed".to_string())?;
     match result {
         Ok(value) => {
             let embedded = value.get("embedded").and_then(Value::as_u64).unwrap_or(0);
@@ -672,6 +731,8 @@ const EMBEDDING_AUTO_BUILD_SETTING_KEY: &str = "memory_semantic_embedding_auto_b
 const EMBED_BUILD_LAST_KEY: &str = "memory_semantic_embedding_auto_build_last";
 /// 检查周期：半小时醒一次看是否到期。
 const EMBED_BUILD_TICK: Duration = Duration::from_secs(1800);
+/// 未完成的后台批次短暂退让后续跑；完成或失败仍按用户配置的间隔调度。
+const EMBED_BUILD_CONTINUE_DELAY: Duration = Duration::from_secs(5);
 /// 启动延迟：让 L1 整理队列与遥测回补先跑完，避免与启动高峰抢资源。
 const EMBED_BUILD_STARTUP_DELAY: Duration = Duration::from_secs(900);
 
@@ -715,23 +776,29 @@ pub fn memory_embedding_auto_build_set(
 /// 两类后台任务互不阻塞。
 static EMBED_BUILD_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn try_begin_embed_build() -> bool {
+struct EmbedBuildGuard;
+
+fn try_begin_embed_build() -> Option<EmbedBuildGuard> {
     EMBED_BUILD_RUNNING
         .compare_exchange(false, true, std::sync::atomic::Ordering::Acquire, std::sync::atomic::Ordering::Relaxed)
-        .is_ok()
+        .ok()
+        .map(|_| EmbedBuildGuard)
 }
 
-fn end_embed_build() {
-    EMBED_BUILD_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+impl Drop for EmbedBuildGuard {
+    fn drop(&mut self) {
+        EMBED_BUILD_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
-/// 后台按间隔增量构建向量索引：只算未缓存的新记忆，没有新内容时不产生任何
-/// 请求。每轮 tick 现读现用配置，改完无需重启。跨进程安全由 `ensure_indexed`
-/// 内的 BuildLease 保证；未配置语义检索时静默跳过。
+/// 后台按间隔增量构建向量索引：只算未缓存的新记忆，没有新内容时不启动运行时
+/// 或获取构建租约。每轮只跑有限批次，释放跨进程租约并退让给前台查询，未完成时
+/// 短暂等待后续跑。每轮现读配置；未配置语义检索时静默跳过。
 pub fn start_embedding_auto_build_scheduler(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(EMBED_BUILD_STARTUP_DELAY).await;
         loop {
+            let mut next_tick = EMBED_BUILD_TICK;
             if let Some(store) = crate::telemetry_store::shared_store() {
                 let config = parse_embedding_auto_build_config(
                     store.app_setting_get::<Value>(EMBEDDING_AUTO_BUILD_SETTING_KEY),
@@ -745,115 +812,157 @@ pub fn start_embedding_auto_build_scheduler(app: tauri::AppHandle) {
                             >= chrono::Duration::hours(config.interval_hours as i64)
                     })
                     .unwrap_or(true);
-                if config.enabled && due && try_begin_embed_build() {
-                    // 未配置语义检索时静默跳过，不打扰用户。
-                    if let Ok(Some(embedding_config)) = semantic_config_read_raw(&store) {
-                        let store_for_build = store.clone();
-                        let result = tokio::task::spawn_blocking(move || {
-                            local_semantic::build_index(&store_for_build, embedding_config)
-                        })
-                        .await;
-                        // 无论成败都盖时间戳：失败端点按间隔重试，而非每 30 分钟。
-                        let _ = store.app_setting_set(EMBED_BUILD_LAST_KEY, &chrono::Utc::now().to_rfc3339());
-                        match result {
-                            Ok(Ok(value)) => {
-                                let embedded = value.get("embedded").and_then(Value::as_u64).unwrap_or(0);
-                                if embedded > 0 {
-                                    let _ = app.emit("memory-embedding-index-updated", ());
+                if config.enabled && due {
+                    if let Some(guard) = try_begin_embed_build() {
+                        // 未配置语义检索时静默跳过，不打扰用户。
+                        if let Ok(Some(embedding_config)) = semantic_config_read_raw(&store) {
+                            let store_for_build = store.clone();
+                            let result = tokio::task::spawn_blocking(move || {
+                                // The worker owns the guard even if its async caller
+                                // is cancelled; a panic also releases the local gate.
+                                let _guard = guard;
+                                local_semantic::build_index_background(&store_for_build, embedding_config)
+                            }).await;
+                            let mut complete_or_failed = true;
+                            match result {
+                                Ok(Ok(value)) => {
+                                    let embedded = value.get("embedded").and_then(Value::as_u64).unwrap_or(0);
+                                    if embedded > 0 {
+                                        let _ = app.emit("memory-embedding-index-updated", ());
+                                    }
+                                    if value.get("pending").and_then(Value::as_u64).unwrap_or(0) > 0 {
+                                        complete_or_failed = false;
+                                        next_tick = EMBED_BUILD_CONTINUE_DELAY;
+                                    }
                                 }
+                                Ok(Err(error)) => eprintln!("[memory-semantic] auto build failed: {error}"),
+                                Err(_) => eprintln!("[memory-semantic] auto build task failed"),
                             }
-                            Ok(Err(error)) => eprintln!("[memory-semantic] auto build failed: {error}"),
-                            Err(_) => eprintln!("[memory-semantic] auto build task failed"),
+                            // A cooperative yield is not a completed attempt. Keep
+                            // it due until all pending work is cached. Failures
+                            // retain the configured interval rather than hot retry.
+                            if complete_or_failed {
+                                let _ = store.app_setting_set(EMBED_BUILD_LAST_KEY, &chrono::Utc::now().to_rfc3339());
+                            }
                         }
+                    } else {
+                        next_tick = EMBED_BUILD_CONTINUE_DELAY;
                     }
-                    end_embed_build();
                 }
             }
-            tokio::time::sleep(EMBED_BUILD_TICK).await;
+            tokio::time::sleep(next_tick).await;
         }
     });
 }
 
-/// Query the local vector index from an MCP subprocess.  MCP runs in a
-/// separate executable and therefore cannot use the desktop process's Tauri
-/// state; configured embeddings use the native L1 ledger and a derived cache.
-/// Without that setting, retain the optional loopback MindMemOS route.
-pub fn search_semantic_l1_memories(
+/// Interactive search never constructs the corpus index or starts a cold
+/// runtime. The caller owns the deadline; missing vectors are queued separately.
+pub(crate) fn search_semantic_l1_interactive(
+    telemetry: &crate::telemetry_store::TelemetryStore,
     query: &str,
     limit: u32,
     domains: Option<&[String]>,
-) -> Result<Vec<SemanticMemory>, String> {
-    let telemetry = crate::telemetry_store::TelemetryStore::new()?;
-    if let Some(config) = semantic_config_read_raw(&telemetry)? {
-        return local_semantic::search(&telemetry, config, query, limit, domains);
+    budget: &crate::memory_retrieval::RecallBudget,
+) -> Result<SemanticRecall, String> {
+    if let Some(config) = semantic_config_read_raw(telemetry)? {
+        let result = local_semantic::search_interactive(telemetry, config, query, limit, domains, budget)?;
+        if result.pending.unwrap_or(0) > 0 || result.mode == "local_fallback_runtime" {
+            queue_interactive_index(telemetry.clone(), result.mode == "local_fallback_runtime");
+        }
+        return Ok(result);
     }
+    // The old sidecar cannot apply a domain constraint. Never widen the scope
+    // merely because a configured native index is unavailable.
     if domains.is_some() {
-        return Err("旧 MindMemOS 检索通道不支持域内候选过滤，请配置本地语义索引".into());
+        return Ok(SemanticRecall::fallback("local_fallback_legacy_scope"));
     }
-    if !MemoryBackend::probe(API_PORT) {
-        return Err("本地语义记忆服务未运行".into());
-    }
-    let response = reqwest::blocking::Client::new()
+    let timeout = budget.remaining()?;
+    let response = reqwest::blocking::Client::builder()
+        .no_proxy().redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(timeout.min(Duration::from_secs(1))).timeout(timeout)
+        .build().map_err(|_| "could not initialize semantic client".to_string())?
         .post(format!("http://127.0.0.1:{API_PORT}/v1/memory/search"))
-        .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", semantic_api_key()))
         .json(&serde_json::json!({
-            "user_id": SEMANTIC_MEMORY_OWNER,
-            "agent_id": SEMANTIC_MEMORY_OWNER,
-            "query": query,
-            "top_k": limit.clamp(1, 100),
-            "search_strategy": "fast",
-            "rerank": true,
+            "user_id": SEMANTIC_MEMORY_OWNER, "agent_id": SEMANTIC_MEMORY_OWNER,
+            "query": query, "top_k": limit.clamp(1, 100),
+            "search_strategy": "fast", "rerank": true,
         }))
-        .timeout(Duration::from_secs(8))
-        .send()
-        .map_err(|error| {
-            if error.is_timeout() {
-                "语义检索超时".to_string()
-            } else {
-                error.to_string()
-            }
-        })?;
-    let status = response.status();
-    let value = response
-        .json::<Value>()
-        .map_err(|error| error.to_string())?;
-    if !status.is_success()
-        || !matches!(value.get("code").and_then(Value::as_str), None | Some("ok"))
-    {
-        return Err(value
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("语义检索失败")
-            .to_string());
+        .send().map_err(|_| "legacy semantic service unavailable".to_string())?;
+    if !response.status().is_success() {
+        return Err("legacy semantic service returned an error".into());
     }
-    Ok(value
-        .pointer("/data/memories")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|item| {
-            let memory = item
-                .get("memory")
-                .or_else(|| item.get("content"))
-                .and_then(Value::as_str)?
-                .trim();
-            (!memory.is_empty()).then(|| SemanticMemory {
-                id: item
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("semantic")
-                    .to_string(),
-                memory: memory.to_string(),
-                memory_type: item
-                    .get("memory_type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("semantic")
-                    .to_string(),
-                score: item.get("score").and_then(Value::as_f64),
-            })
-        })
-        .collect())
+    let value = response.json::<Value>().map_err(|_| "invalid semantic response".to_string())?;
+    budget.remaining()?;
+    if !matches!(value.get("code").and_then(Value::as_str), None | Some("ok")) {
+        return Err("legacy semantic service returned an error".into());
+    }
+    let ledger = telemetry.local_l1_memory_snapshot()?;
+    // One old content-based vector can nominate multiple current identities;
+    // fusion must still keep distinct projects and evidence separate.
+    let mut by_content: HashMap<&str, Vec<_>> = HashMap::new();
+    for memory in &ledger {
+        by_content.entry(memory.memory.trim()).or_default().push(memory);
+    }
+    let mut memories = Vec::new();
+    for item in value.pointer("/data/memories").and_then(Value::as_array).into_iter().flatten() {
+        let Some(content) = item.get("memory").or_else(|| item.get("content")).and_then(Value::as_str) else { continue };
+        if let Some(current) = by_content.get(content.trim()) {
+            for memory in current {
+                memories.push(SemanticMemory { id: memory.id.clone(), memory: memory.memory.clone(),
+                    memory_type: memory.memory_type.clone(), score: item.get("score").and_then(Value::as_f64) });
+            }
+        }
+    }
+    Ok(SemanticRecall { memories, mode: "semantic_legacy", total: None, cached: None, pending: None })
+}
+
+static INTERACTIVE_INDEX_QUEUED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static INTERACTIVE_INDEX_LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+struct InteractiveIndexGuard;
+impl Drop for InteractiveIndexGuard {
+    fn drop(&mut self) { INTERACTIVE_INDEX_QUEUED.store(false, std::sync::atomic::Ordering::Release); }
+}
+
+/// Coalesce cold-search refreshes and honor the existing automatic-build switch.
+/// Failures are cooled down instead of retried on every keystroke/search.
+fn queue_interactive_index(store: crate::telemetry_store::TelemetryStore, warm_runtime: bool) {
+    use std::sync::atomic::Ordering;
+    let Ok(mut last) = INTERACTIVE_INDEX_LAST.get_or_init(|| Mutex::new(None)).try_lock() else { return };
+    if last.is_some_and(|at| at.elapsed() < Duration::from_secs(60)) { return; }
+    if INTERACTIVE_INDEX_QUEUED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() { return; }
+    *last = Some(Instant::now());
+    drop(last);
+    tauri::async_runtime::spawn(async move {
+        let _queued = InteractiveIndexGuard;
+        let mut warm = warm_runtime;
+        loop {
+            let automatic = parse_embedding_auto_build_config(store.app_setting_get_readonly::<Value>(EMBEDDING_AUTO_BUILD_SETTING_KEY));
+            // Configured runtime auto-start supports a cached query even when
+            // automatic corpus indexing is disabled; no vectors are built then.
+            if !automatic.enabled && !warm { break; }
+            let config = match semantic_config_read_raw(&store) { Ok(Some(config)) => config, _ => break };
+            let Some(guard) = try_begin_embed_build() else { break };
+            let worker_store = store.clone();
+            let warm_this_pass = warm;
+            warm = false;
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                let _guard = guard;
+                if warm_this_pass { local_semantic::warm_runtime(config.clone())?; }
+                if automatic.enabled {
+                    local_semantic::build_index_background(&worker_store, config)
+                } else { Ok(serde_json::json!({ "pending": 0 })) }
+            }).await;
+            match result {
+                Ok(Ok(status)) if status.get("pending").and_then(Value::as_u64).unwrap_or(0) > 0 => {
+                    tokio::time::sleep(EMBED_BUILD_CONTINUE_DELAY).await;
+                }
+                Ok(Ok(_)) => break,
+                _ => { eprintln!("[memory-semantic] deferred interactive index refresh failed"); break; }
+            }
+        }
+    });
 }
 
 async fn all_memories(backend: &MemoryBackend) -> Result<Vec<SnapshotMemory>, String> {
@@ -1008,6 +1117,15 @@ pub async fn memory_importance_refresh(
     telemetry: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
 ) -> Result<MemoryImportanceSummary, String> {
     let memories = importance_memory_inventory(&state, &telemetry).await?;
+    let state = state.inner().clone();
+    let telemetry = telemetry.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || refresh_importance_records(&state, &telemetry, memories))
+        .await.map_err(|error| format!("重要度计算任务失败：{error}"))?
+}
+
+fn refresh_importance_records(
+    state: &MemoryBackend, telemetry: &crate::telemetry_store::TelemetryStore, memories: Vec<SnapshotMemory>,
+) -> Result<MemoryImportanceSummary, String> {
     if memories.is_empty() {
         return Ok(MemoryImportanceSummary {
             reviewed: 0,

@@ -1,23 +1,14 @@
-import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { invoke } from '@tauri-apps/api/core'
 import { LanguageSwitcher } from './components/LanguageSwitcher'
-import { PortManager } from './pages/PortManager'
-import { NetworkManager } from './pages/NetworkManager'
-import { EnvManager } from './pages/EnvManager'
-import { Settings } from './pages/Settings'
 import { MemoryCenter } from './pages/MemoryCenter'
-import { SkillLibrary } from './pages/SkillLibrary'
-import { PublishedSkills } from './pages/PublishedSkills'
-import { SkillMarketplace } from './pages/SkillMarketplace'
-import { McpLibrary } from './pages/McpLibrary'
-import { UsageAnalytics } from './pages/UsageAnalytics'
-import { PendingMemories } from './pages/PendingMemories'
-import { OrganizedConversations } from './pages/OrganizedConversations'
-import { MemoryInjection } from './pages/MemoryInjection'
-import { MemoryCapture } from './pages/MemoryCapture'
-import { MemoryHelp } from './pages/MemoryHelp'
-import { MemoryBrainGraph } from './pages/MemoryBrainGraph'
+import {
+  PortManager, NetworkManager, EnvManager, Settings, SkillLibrary, PublishedSkills,
+  SkillMarketplace, McpLibrary, UsageAnalytics, PendingMemories, OrganizedConversations,
+  MemoryInjection, MemoryCapture, MemoryHelp, MemoryBrainGraph, PageLoadBoundary,
+  useLikelyPagePreload,
+} from './lib/pageLoaders'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { RecoveryNavigationContext, type RecoveryTarget } from './components/ErrorRecovery'
 import { useDocumentVisible } from './hooks/useVisiblePolling'
@@ -75,14 +66,23 @@ export default function App() {
   const openRecoveryTarget = useCallback((target: RecoveryTarget) => setPage(target), [])
   // 记忆族页面访问过即保持挂载：返回时不再
   // 重新挂载触发全量数据重查，消除往返卡顿。未激活时仅 CSS 隐藏。
+  // keptNow 在渲染期同步包含当前页：首次导航的那一帧就要挂载目标页，
+  // 不能等 passive effect 的第二次提交（否则出现一帧空白内容区）。
+  const keptKey = useMemo(() => (
+    MCP_PAGES.includes(page as typeof MCP_PAGES[number]) ? 'mcp-library' : page
+  ), [page])
   const [keptPages, setKeptPages] = useState<Set<string>>(new Set())
+  const keptNow = useMemo(() => {
+    if (!(KEPT_PAGES.includes(keptKey) || keptKey === 'mcp-library')) return keptPages
+    return keptPages.has(keptKey) ? keptPages : new Set(keptPages).add(keptKey)
+  }, [keptPages, keptKey])
   useEffect(() => {
-    const keepKey = MCP_PAGES.includes(page as typeof MCP_PAGES[number]) ? 'mcp-library' : page
-    if (KEPT_PAGES.includes(keepKey) || keepKey === 'mcp-library') {
-      setKeptPages((previous) => previous.has(keepKey) ? previous : new Set(previous).add(keepKey))
+    if (KEPT_PAGES.includes(keptKey) || keptKey === 'mcp-library') {
+      setKeptPages((previous) => previous.has(keptKey) ? previous : new Set(previous).add(keptKey))
     }
-  }, [page])
+  }, [keptKey])
   const [showOnboarding, setShowOnboarding] = useState(needsOnboarding)
+  useLikelyPagePreload(page === 'memory' && documentVisible && !showOnboarding && !keptNow.has('skills'))
   // 从「已发布」页跳入 Skill 库时自动打开同步对话框
   const [skillsAutoSync, setSkillsAutoSync] = useState(false)
   // Preserve the remaining module navigation preferences.
@@ -136,6 +136,11 @@ export default function App() {
   }
   const clearSkillsAutoSync = useCallback(() => setSkillsAutoSync(false), [])
   const goSkillSync = useCallback(() => { setSkillsAutoSync(true); setPage('skills') }, [])
+  // 稳定引用：McpLibrary 家族保持挂载时，任何 App 状态变化都不应因内联箭头
+  // 函数击穿 memo 触发其整树重渲染。
+  const openMcpSection = useCallback((section: 'services' | 'tools' | 'calls' | 'errors' | 'help') => {
+    setPage({ services: 'mcp-library', tools: 'mcp-tools', calls: 'mcp-calls', errors: 'mcp-errors', help: 'mcp-help' }[section] as NavPage)
+  }, [])
 
   const { width: sidebarWidth, onColMouseDown } = useResizable({
     minW: 216, maxW: 360, defaultW: 240,
@@ -166,7 +171,12 @@ export default function App() {
     { group: t('nav.settings'), icon: <Settings2 size={17} />, pages: [['settings-general', 'nav.settingsGeneral'], ['settings-llm', 'nav.settingsLlm'], ['settings-memory', 'nav.settingsMemory'], ['settings-cloud', 'nav.settingsCloud']] },
   ]
   const destinations: NavigationDestination[] = navigationFamilies.flatMap(family => family.pages.map(([id, label]) => ({ id, label: t(label), group: family.group, icon: family.icon })))
-  const currentDestination = destinations.find(destination => destination.id === page)!
+  // 'settings' is a legacy alias kept for startup flags and recovery targets;
+  // it redirects via effect, but the contextbar must never dereference a
+  // destination the navigation families do not list (that crashed App's render).
+  const destinationPage = page === 'settings' ? 'settings-general' : page
+  const currentDestination = destinations.find(destination => destination.id === destinationPage)
+    ?? { id: destinationPage, label: t('nav.settings'), group: t('nav.settings'), icon: <Settings2 size={17} /> }
 
   return (
     <RecoveryNavigationContext.Provider value={openRecoveryTarget}>
@@ -313,116 +323,121 @@ export default function App() {
         <div className="app-contextbar"><Home size={14} aria-hidden="true" /><span>{currentDestination.group}</span>{currentDestination.group !== currentDestination.label && <><ChevronRight size={12} aria-hidden="true" /><span className="app-contextbar-current">{currentDestination.label}</span></>}<button type="button" onClick={() => setNavigationOpen(true)} className="app-contextbar-search" aria-label={t('shell.searchPages')}><Search size={13} /><span>Ctrl K</span></button></div>
         <div className="app-page-host" data-page={page} ref={pageHost}>
 
-        {keptPages.has('memory') && (
+        {keptNow.has('memory') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'memory' ? '' : 'hidden'}`}>
             <ErrorBoundary>
               <MemoryCenter onOpenUsage={openUsage} onOpenGraph={openMemoryGraph} onOpenPending={openPendingMemories} onOpenOrganized={openOrganizedConversations} onOpenCapture={openMemoryCapture} onOpenInjection={openMemoryInjection} active={page === 'memory' && documentVisible} />
             </ErrorBoundary>
           </div>
         )}
-        {keptPages.has('memory-graph') && (
+        {keptNow.has('memory-graph') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'memory-graph' ? '' : 'hidden'}`}>
-            <ErrorBoundary>
+            <PageLoadBoundary>
               <MemoryBrainGraph onBack={openMemory} active={page === 'memory-graph' && documentVisible} />
-            </ErrorBoundary>
+            </PageLoadBoundary>
           </div>
         )}
-        {keptPages.has('usage') && (
+        {keptNow.has('usage') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'usage' ? '' : 'hidden'}`}>
-            <ErrorBoundary>
+            <PageLoadBoundary>
               <UsageAnalytics active={page === 'usage' && documentVisible} />
-            </ErrorBoundary>
+            </PageLoadBoundary>
           </div>
         )}
-        {keptPages.has('pending-memories') && (
+        {keptNow.has('pending-memories') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'pending-memories' ? '' : 'hidden'}`}>
-            <ErrorBoundary>
+            <PageLoadBoundary>
               <PendingMemories onBack={openMemory} active={page === 'pending-memories' && documentVisible} />
-            </ErrorBoundary>
+            </PageLoadBoundary>
           </div>
         )}
-        {keptPages.has('organized-conversations') && (
+        {keptNow.has('organized-conversations') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'organized-conversations' ? '' : 'hidden'}`}>
-            <ErrorBoundary>
+            <PageLoadBoundary>
               <OrganizedConversations onBack={openMemory} active={page === 'organized-conversations' && documentVisible} />
-            </ErrorBoundary>
+            </PageLoadBoundary>
           </div>
         )}
-        {keptPages.has('memory-injection') && (
+        {keptNow.has('memory-injection') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'memory-injection' ? '' : 'hidden'}`}>
-            <ErrorBoundary>
+            <PageLoadBoundary>
               <MemoryInjection onBack={openMemory} onOpenCapture={openMemoryCapture} active={page === 'memory-injection' && documentVisible} />
-            </ErrorBoundary>
+            </PageLoadBoundary>
           </div>
         )}
-        {keptPages.has('memory-capture') && (
+        {keptNow.has('memory-capture') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'memory-capture' ? '' : 'hidden'}`}>
-            <ErrorBoundary>
+            <PageLoadBoundary>
               <MemoryCapture onBack={openMemory} onOpenInjection={openMemoryInjection} active={page === 'memory-capture' && documentVisible} />
-            </ErrorBoundary>
+            </PageLoadBoundary>
           </div>
         )}
-        {keptPages.has('memory-help') && (
+        {keptNow.has('memory-help') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'memory-help' ? '' : 'hidden'}`}>
-            <ErrorBoundary>
+            <PageLoadBoundary>
               <MemoryHelp onBack={openMemory} />
-            </ErrorBoundary>
+            </PageLoadBoundary>
           </div>
         )}
-        {keptPages.has('skills') && (
+        {keptNow.has('skills') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'skills' ? '' : 'hidden'}`}>
-            <ErrorBoundary>
+            <PageLoadBoundary>
               <SkillLibrary
+                active={page === 'skills' && documentVisible}
                 onOpenPublished={openPublishedSkills}
                 autoOpenSync={skillsAutoSync}
                 onSyncOpened={clearSkillsAutoSync}
               />
-            </ErrorBoundary>
+            </PageLoadBoundary>
           </div>
         )}
-        {keptPages.has('published-skills') && (
+        {keptNow.has('published-skills') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'published-skills' ? '' : 'hidden'}`}>
-            <ErrorBoundary>
-              <PublishedSkills onBack={openSkills} onGoSync={goSkillSync} />
-            </ErrorBoundary>
+            <PageLoadBoundary>
+              <PublishedSkills active={page === 'published-skills' && documentVisible} onBack={openSkills} onGoSync={goSkillSync} />
+            </PageLoadBoundary>
           </div>
         )}
-        {keptPages.has('skill-marketplace') && (
+        {keptNow.has('skill-marketplace') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${page === 'skill-marketplace' ? '' : 'hidden'}`}>
-            <ErrorBoundary>
+            <PageLoadBoundary>
               <SkillMarketplace />
-            </ErrorBoundary>
+            </PageLoadBoundary>
           </div>
         )}
-        {keptPages.has('mcp-library') && (
+        {keptNow.has('mcp-library') && (
           <div className={`flex flex-1 flex-col overflow-hidden ${MCP_PAGES.includes(page as typeof MCP_PAGES[number]) ? '' : 'hidden'}`}>
-            <ErrorBoundary>
+            <PageLoadBoundary>
               <McpLibrary
                 active={MCP_PAGES.includes(page as typeof MCP_PAGES[number]) && documentVisible}
                 section={page === 'mcp-tools' ? 'tools' : page === 'mcp-calls' ? 'calls' : page === 'mcp-errors' ? 'errors' : page === 'mcp-help' ? 'help' : 'services'}
-                onSectionChange={section => setPage({ services: 'mcp-library', tools: 'mcp-tools', calls: 'mcp-calls', errors: 'mcp-errors', help: 'mcp-help' }[section] as NavPage)}
+                onSectionChange={openMcpSection}
               />
-            </ErrorBoundary>
+            </PageLoadBoundary>
           </div>
         )}
-        {page === 'ports' && <PortManager />}
+        {page === 'ports' && (
+          <PageLoadBoundary>
+            <PortManager />
+          </PageLoadBoundary>
+        )}
         {page === 'network' && (
-          <ErrorBoundary>
+          <PageLoadBoundary>
             <NetworkManager />
-          </ErrorBoundary>
+          </PageLoadBoundary>
         )}
         {page === 'env-vars' && (
-          <ErrorBoundary>
+          <PageLoadBoundary>
             <EnvManager />
-          </ErrorBoundary>
+          </PageLoadBoundary>
         )}
         {(SETTINGS_PAGES.includes(page as typeof SETTINGS_PAGES[number]) || page === 'settings') && !showOnboarding && (
-          <ErrorBoundary>
+          <PageLoadBoundary>
             <Settings
               section={page === 'settings' ? 'general' : page === 'settings-llm' ? 'llm' : page === 'settings-memory' ? 'memory' : page === 'settings-cloud' ? 'cloud' : 'general'}
               onOpenOnboarding={() => setShowOnboarding(true)}
             />
-          </ErrorBoundary>
+          </PageLoadBoundary>
         )}
 
         </div>

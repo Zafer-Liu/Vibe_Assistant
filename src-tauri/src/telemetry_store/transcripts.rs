@@ -9,21 +9,20 @@ use std::path::{Path, PathBuf};
 pub(crate) fn discover_native_transcripts(
     sessions: &[(String, String, Option<PathBuf>)],
 ) -> HashMap<(String, String), PathBuf> {
-    let wanted = |source: &str| {
-        sessions
-            .iter()
-            .filter(|(kind, _, _)| kind == source)
-            .map(|(_, session_id, _)| session_id.clone())
-            .collect::<HashSet<_>>()
-    };
+    let wanted = sessions.iter()
+        .filter(|(_, _, path)| !path.as_ref().is_some_and(|path| path.is_file()))
+        .map(|(source, session_id, _)| (source.clone(), session_id.clone()))
+        .collect::<HashSet<_>>();
+    if wanted.is_empty() { return HashMap::new(); }
+    let sources = wanted.iter().map(|(source, _)| source.as_str()).collect::<HashSet<_>>();
     let mut found = HashMap::new();
-    for source in crate::agent_sources::AGENT_SOURCE_IDS {
-        let wanted = wanted(source);
-        if wanted.is_empty() {
-            continue;
-        }
-        for root in crate::agent_sources::transcript_roots(source) {
-            scan_transcript_tree(&root, source, &wanted, &mut found);
+    // A missing Hook path must not touch unrelated slow/network roots or wait
+    // for their background inventory refreshes on the HTTP response path.
+    for source in sources {
+        let inventory = super::transcript_inventory::source_transcript_inventory(source);
+        for file in inventory.iter() {
+            let key = (file.source.clone(), file.session_id.clone());
+            if wanted.contains(&key) { found.entry(key).or_insert_with(|| file.path.clone()); }
         }
     }
     found
@@ -36,116 +35,12 @@ pub(crate) fn discover_native_transcripts(
 /// `sessions` tree for usage history.  Transcript roots come from the agent
 /// source registry so per-device overrides apply to every supported Agent.
 pub fn discover_all_native_transcripts() -> Vec<(String, String, PathBuf)> {
-    let mut latest = HashMap::<(String, String), (std::time::SystemTime, PathBuf)>::new();
-    for source in crate::agent_sources::AGENT_SOURCE_IDS {
-        for root in crate::agent_sources::transcript_roots(source) {
-            scan_all_transcript_tree(root.as_path(), source, &mut latest);
-        }
-    }
-    latest
-        .into_iter()
-        .map(|((source, session_id), (_, path))| (source, session_id, path))
-        .collect()
-}
-
-pub(super) fn scan_all_transcript_tree(
-    root: &Path,
-    source: &str,
-    found: &mut HashMap<(String, String), (std::time::SystemTime, PathBuf)>,
-) {
-    let mut pending = vec![root.to_path_buf()];
-    let mut visited = 0usize;
-    while let Some(directory) = pending.pop() {
-        if visited >= 20_000 {
-            break;
-        }
-        let Ok(entries) = std::fs::read_dir(directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            visited += 1;
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-                continue;
-            }
-            // DeepSeek Harness 的转录是 `session.vN.jsonl.zstd`（扩展名 zstd）。
-            let is_transcript = matches!(
-                path.extension().and_then(|extension| extension.to_str()),
-                Some("jsonl") | Some("zstd")
-            );
-            if !is_transcript {
-                continue;
-            }
-            let Some(session_id) = transcript_session_id(source, &path) else {
-                continue;
-            };
-            let modified = entry
-                .metadata()
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            let key = (source.to_string(), session_id);
-            if found
-                .get(&key)
-                .map(|(current, _)| modified > *current)
-                .unwrap_or(true)
-            {
-                found.insert(key, (modified, path));
-            }
-        }
-    }
-}
-
-pub(super) fn transcript_session_id(source: &str, path: &Path) -> Option<String> {
-    crate::agent_sources::session_id_for_path(source, path)
-}
-
-pub(super) fn scan_transcript_tree(
-    root: &Path,
-    source: &str,
-    wanted: &HashSet<String>,
-    found: &mut HashMap<(String, String), PathBuf>,
-) {
-    let mut pending = vec![root.to_path_buf()];
-    // A safety ceiling prevents an unrelated, malformed profile directory
-    // from making the Memory Center refresh indefinitely.
-    let mut visited = 0usize;
-    while let Some(dir) = pending.pop() {
-        if visited >= 20_000
-            || found.keys().filter(|(kind, _)| kind == source).count() >= wanted.len()
-        {
-            break;
-        }
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            visited += 1;
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-                continue;
-            }
-            // DeepSeek Harness 的转录是 `session.vN.jsonl.zstd`（扩展名 zstd）。
-            let is_transcript = matches!(
-                path.extension().and_then(|extension| extension.to_str()),
-                Some("jsonl") | Some("zstd")
-            );
-            if !is_transcript {
-                continue;
-            }
-            // 会话 id 推导统一走注册表：Claude/Qoder/WorkBuddy 用文件 stem，
-            // Codex 用文件名末尾 UUID，MiniMax/Kimi 用会话目录名。
-            let session_id = crate::agent_sources::session_id_for_path(source, &path)
-                .filter(|id| wanted.contains(id));
-            if let Some(session_id) = session_id {
-                found
-                    .entry((source.to_string(), session_id.to_string()))
-                    .or_insert(path);
-            }
-        }
-    }
+    let inventory = super::native_transcript_inventory(false);
+    let mut seen = HashSet::new();
+    inventory.iter().filter_map(|file| {
+        let key = (file.source.clone(), file.session_id.clone());
+        seen.insert(key.clone()).then(|| (key.0, key.1, file.path.clone()))
+    }).collect()
 }
 
 /// Codex 的 `total_token_usage` / `last_token_usage` 里 `input_tokens` 不含

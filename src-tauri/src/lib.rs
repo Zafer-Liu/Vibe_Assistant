@@ -17,6 +17,7 @@ mod model_registry;
 pub(crate) mod model_sync;
 mod mcp;
 mod mcp_command;
+mod mcp_jsonl;
 mod mcp_fallback_resolver;
 mod mcp_probe_protocol;
 mod mcp_probe_connections;
@@ -30,6 +31,9 @@ mod memory_backend;
 mod memory_domain;
 mod memory_ingest;
 mod memory_mcp;
+mod memory_refinement;
+mod memory_retrieval;
+mod memory_evidence;
 mod network_info;
 mod ports;
 mod pricing;
@@ -101,10 +105,11 @@ pub fn run() {
             // Publish this build's memory runtime without changing any client
             // binding or waiting for the MCP management page to be opened.
             tauri::async_runtime::spawn_blocking(|| {
-                if memory_mcp::server_executable().is_err() {
-                    eprintln!("[memory-mcp] runtime publication failed; existing runtime retained");
+                if let Err(error) = memory_mcp::server_executable() {
+                    eprintln!("[memory-mcp] runtime publication failed; existing runtime retained: {error}");
                 }
             });
+            // Probe maintenance waits for frontend readiness inside its scheduler.
             mcp_probe_updater::start(_app.handle().clone());
             // The frontend acknowledges a painted shell. Heavy maintenance
             // waits for that acknowledgement (with a bounded tray-mode fallback).
@@ -122,7 +127,7 @@ pub fn run() {
                     }
                     {
                         let _phase = startup::phase("maintenance.conversations");
-                        if memory_ingest::telemetry_backfill_conversations().is_err() {
+                        if memory_ingest::backfill_conversations_impl().is_err() {
                             eprintln!("[startup-perf] phase=maintenance.conversations status=failed");
                         }
                     }
@@ -235,6 +240,19 @@ pub fn run() {
             memory_domain::memory_domain_classify_snapshot_ids,
             memory_backend::memory_consolidate,
             memory_backend::memory_consolidation_restore,
+            memory_refinement::memory_refinement_start,
+            memory_refinement::memory_refinement_list,
+            memory_refinement::memory_refinement_forget,
+            memory_refinement::memory_refinement_history_snapshot,
+            memory_refinement::memory_refinement_clear,
+            memory_refinement::memory_refinement_get,
+            memory_refinement::memory_refinement_resume,
+            memory_refinement::memory_refinement_cancel,
+            memory_refinement::memory_refinement_apply,
+            memory_refinement::memory_refinement_suggest,
+            memory_refinement::memory_refinement_skip,
+            memory_refinement::memory_refinement_delete,
+            memory_refinement::memory_refinement_undo,
             memory_backend::memory_importance_refresh,
             memory_backend::memory_importance_list,
             memory_backend::memory_importance_set_pinned,
@@ -254,9 +272,23 @@ pub fn run() {
             memory_ingest::memory_import_folder,
             memory_ingest::local_memory_list,
             memory_ingest::local_memory_list_all,
+            telemetry_store::memory_queries::local_memory_page,
             memory_ingest::local_memory_stats,
             memory_ingest::local_memory_reset_for_reextraction,
             memory_ingest::local_memory_search,
+            memory_retrieval::memory_retrieval_search,
+            telemetry_store::recall_traces::memory_recall_trace_list,
+            telemetry_store::recall_traces::memory_recall_trace_get,
+            memory_evidence::memory_evidence_read,
+            memory_evidence::memory_evidence_cancel,
+            memory_retrieval::benchmark::memory_retrieval_eval_datasets,
+            memory_retrieval::benchmark::memory_retrieval_eval_import,
+            memory_retrieval::benchmark::memory_retrieval_eval_plan,
+            memory_retrieval::benchmark::memory_retrieval_eval_start,
+            memory_retrieval::benchmark::memory_retrieval_eval_status,
+            memory_retrieval::benchmark::memory_retrieval_eval_cancel,
+            memory_retrieval::benchmark::memory_retrieval_eval_report,
+            memory_retrieval::benchmark::memory_retrieval_eval_export,
             memory_ingest::local_memory_update,
             memory_ingest::local_memory_delete,
             memory_ingest::local_memory_add_user,

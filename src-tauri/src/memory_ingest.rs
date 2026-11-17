@@ -21,6 +21,9 @@ use crate::llm;
 use crate::memory_backend::MemoryBackend;
 use crate::thinking::strip_thinking_blocks;
 
+mod automatic;
+use automatic::{AutomaticScheduler, AutomaticWork, PreparedMemories, RetryClass};
+
 /// All harnesses serve the same local user.  Memories must stay portable when
 /// a conversation continues from Codex to Claude or another connected agent.
 const GLOBAL_MEMORY_OWNER: &str = "agent-manager";
@@ -145,12 +148,14 @@ struct SessionBuffer {
     /// Hook 来源标识（如 claude / codex），用于在整理日志中显示所属 Agent。
     source: String,
     messages: Vec<(String, String)>, // (role, content)
+    /// Exact completed receipt; hook-only buffers have no extraction anchor.
+    event_key: Option<String>,
     last_active: Instant,
 }
 
 #[derive(Default)]
 struct IngestInner {
-    sessions: HashMap<String, SessionBuffer>,
+    automatic: AutomaticScheduler,
     /// 最近提取记录（前端展示）
     recent: Vec<IngestLog>,
 }
@@ -171,6 +176,8 @@ pub struct IngestStore {
     /// 会话静默超时（秒），超时自动冲刷
     idle_timeout_secs: u64,
     enabled: Arc<Mutex<bool>>,
+    automatic_wake: Arc<tokio::sync::Notify>,
+    flusher_started: Arc<AtomicBool>,
 }
 
 impl IngestStore {
@@ -179,11 +186,14 @@ impl IngestStore {
             inner: Arc::new(Mutex::new(IngestInner::default())),
             idle_timeout_secs: 180,
             enabled: Arc::new(Mutex::new(true)),
+            automatic_wake: Arc::new(tokio::sync::Notify::new()),
+            flusher_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn set_enabled(&self, on: bool) {
         *self.enabled.lock().unwrap() = on;
+        self.automatic_wake.notify_one();
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -193,7 +203,7 @@ impl IngestStore {
     /// 处理一条 hook 回调（不阻塞；耗时的记忆提取在后台执行）。
     pub fn handle_hook(
         &self,
-        backend: Arc<MemoryBackend>,
+        _backend: Arc<MemoryBackend>,
         body: &str,
         source: &str,
     ) -> Result<Value, String> {
@@ -266,6 +276,16 @@ impl IngestStore {
             }
             // 会话结束 → 冲刷：批量提取记忆。
             "Stop" => {
+                // Detach this turn before transcript/ledger I/O. Hooks arriving
+                // meanwhile belong to the next pending turn and must survive.
+                let mut stopped_hooks = self.inner.lock().unwrap().automatic.take_pending(&session_id)
+                    .unwrap_or_else(|| SessionBuffer {
+                        agent_id: agent_id.clone(),
+                        source: source.to_string(),
+                        messages: Vec::new(),
+                        event_key: None,
+                        last_active: Instant::now(),
+                    });
                 // Agent hooks provide operational events, while their local
                 // transcripts hold the actual user/assistant dialogue.  Read
                 // the one completed turn so tool traffic never becomes memory.
@@ -274,8 +294,7 @@ impl IngestStore {
                 let mut conversation_messages = Vec::new();
                 if let Some(messages) = transcript_replaced {
                     conversation_state = "full";
-                    conversation_messages = messages.clone();
-                    self.replace_session_messages(&session_id, &agent_id, source, messages);
+                    conversation_messages = messages;
                 } else if let Some(reply) = parsed
                     .get("last_assistant_message")
                     .or_else(|| parsed.get("assistant_message"))
@@ -284,11 +303,15 @@ impl IngestStore {
                 {
                     // Adapters without a readable transcript can still supply
                     // a final assistant response as a useful fallback.
-                    self.push_message(&session_id, &agent_id, source, "assistant", reply);
+                    let cleaned = strip_memory_thinking("assistant", reply);
+                    if !cleaned.is_empty() {
+                        stopped_hooks.messages.push(("assistant".into(), truncate_text(&cleaned, 12_000)));
+                    }
                     conversation_state = "partial";
                     conversation_messages.push(("assistant".to_string(), reply.to_string()));
                 }
                 let mut already_captured = false;
+                let mut receipt_key = None;
                 if let Some(store) = crate::telemetry_store::shared_store() {
                     match store.record_conversation(
                         source,
@@ -298,16 +321,26 @@ impl IngestStore {
                     ) {
                         Ok(event_key) => {
                             already_captured = store.conversation_is_covered(&event_key).unwrap_or(false);
+                            receipt_key = Some(event_key);
                         }
                         Err(error) => eprintln!("[memory-ingest] failed to annotate hook receipt: {error}"),
                     }
                 }
                 // Without a complete Hook transcript, the enabled native
                 // reader owns this session's L0 body and later L1 extraction.
-                if already_captured || (conversation_state != "full" && crate::agent_sources::transcript_scan_enabled(source)) {
-                    self.inner.lock().unwrap().sessions.remove(&session_id);
-                } else {
-                    self.flush_session(backend, &session_id);
+                if !already_captured && !(conversation_state != "full" && crate::agent_sources::transcript_scan_enabled(source)) {
+                    if conversation_state == "full" {
+                        if !self.queue_session_messages(&session_id, &agent_id, source, conversation_messages, receipt_key) {
+                            // A replayed Stop may arrive after the next prompt.
+                            // Deduplicating it must not discard those new hooks.
+                            self.inner.lock().unwrap().automatic.restore_pending(&session_id, stopped_hooks);
+                        }
+                    } else {
+                        // No full receipt: keep the hooks without resolving a
+                        // different, possibly newer/older session event later.
+                        self.inner.lock().unwrap().automatic.restore_pending(&session_id, stopped_hooks);
+                    }
+                    self.automatic_wake.notify_one();
                 }
             }
             _ => {}
@@ -329,43 +362,29 @@ impl IngestStore {
             return;
         }
         {
+            let now = Instant::now();
             let mut inner = self.inner.lock().unwrap();
-            let buf = inner
-                .sessions
-                .entry(session_id.to_string())
-                .or_insert_with(|| SessionBuffer {
-                    agent_id: agent_id.to_string(),
-                    source: source.to_string(),
-                    messages: Vec::new(),
-                    last_active: Instant::now(),
-                });
-            buf.messages
-                .push((role.to_string(), truncate_text(&content, 12_000)));
-            buf.last_active = Instant::now();
+            let buf = inner.automatic.buffer(session_id, agent_id, source, now);
+            buf.messages.push((role.to_string(), truncate_text(&content, 12_000)));
+            buf.last_active = now;
         }
+        self.automatic_wake.notify_one();
     }
 
     fn touch_session(&self, session_id: &str, agent_id: &str, source: &str) {
+        let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
-        let buf = inner
-            .sessions
-            .entry(session_id.to_string())
-            .or_insert_with(|| SessionBuffer {
-                agent_id: agent_id.to_string(),
-                source: source.to_string(),
-                messages: Vec::new(),
-                last_active: Instant::now(),
-            });
-        buf.last_active = Instant::now();
+        inner.automatic.buffer(session_id, agent_id, source, now).last_active = now;
     }
 
-    fn replace_session_messages(
+    fn queue_session_messages(
         &self,
         session_id: &str,
         agent_id: &str,
         source: &str,
         messages: Vec<(String, String)>,
-    ) {
+        event_key: Option<String>,
+    ) -> bool {
         let messages = messages
             .into_iter()
             .map(|(role, content)| {
@@ -375,147 +394,109 @@ impl IngestStore {
             .filter(|(_, content)| !content.is_empty())
             .collect();
         let mut inner = self.inner.lock().unwrap();
-        inner.sessions.insert(
-            session_id.to_string(),
+        inner.automatic.enqueue(
+            session_id,
             SessionBuffer {
                 agent_id: agent_id.to_string(),
                 source: source.to_string(),
                 messages,
+                event_key,
                 last_active: Instant::now(),
             },
-        );
+        )
     }
 
-    /// 冲刷一个会话：取出缓冲 → 后台提取记忆 + 沉淀 skill。
-    pub fn flush_session(&self, backend: Arc<MemoryBackend>, session_id: &str) {
-        if !self.is_enabled() {
-            return;
-        }
-        let snapshot = {
-            let mut inner = self.inner.lock().unwrap();
-            inner.sessions.remove(session_id)
-        };
-        let Some(buf) = snapshot else { return };
-        if buf.messages.is_empty() {
-            return;
-        }
-
-        let store = self.clone();
-        let session_id = session_id.to_string();
-        tauri::async_runtime::spawn(async move {
-            store.ingest_memory(&backend, &session_id, &buf).await;
-        });
-    }
-
-    /// One completed hook session is one extraction unit.  The configured LLM
-    /// sees the full buffered transcript only after Stop (or the idle timeout).
-    async fn ingest_memory(&self, _backend: &MemoryBackend, session_id: &str, buf: &SessionBuffer) {
-        if buf.messages.is_empty() {
-            return;
-        }
-        let provider = match llm::memory_extraction_provider() {
-            Ok(provider) => provider,
-            Err(error) => {
-                self.restore_session_for(session_id, buf.clone());
-                self.log(IngestLog {
-                    at: now_str(),
-                    agent_id: buf.agent_id.clone(),
-                    kind: "memory".into(),
-                    state: "retrying".into(),
-                    detail: format!("{error}；已保留完整会话等待配置完成"),
-                });
-                return;
-            }
-        };
-        let transcript = buf
-            .messages
-            .iter()
-            .map(|(role, content)| format!("[{role}]\n{content}"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let extracted = match extract_l1_with_provider(&provider, &transcript).await {
-            Ok(candidates) => candidates,
-            Err(L1ExtractError::Transport(error)) => {
-                self.restore_session_for(session_id, buf.clone());
-                self.log(IngestLog {
-                    at: now_str(),
-                    agent_id: buf.agent_id.clone(),
-                    kind: "memory".into(),
-                    state: "retrying".into(),
-                    detail: format!("{error}；已保留完整会话等待重试"),
-                });
-                return;
-            }
-            Err(L1ExtractError::Contract(error)) => {
-                if let Some(telemetry) = crate::telemetry_store::shared_store() {
-                    let _ = telemetry.set_l1_failure_for_session(session_id, &error);
+    /// One claimed batch is immutable while later hooks accumulate separately.
+    /// Keep successful model output across local write retries.
+    async fn ingest_memory(&self, work: &mut AutomaticWork) -> Option<RetryClass> {
+        let event_key = work.buffer.event_key.as_deref().expect("automatic work has an exact receipt");
+        if work.prepared.is_none() {
+            let provider = match llm::memory_extraction_provider() {
+                Ok(provider) if !provider.model.trim().is_empty() => provider,
+                result => {
+                    let error = result.err().unwrap_or_else(|| "请先为记忆提取模型填写模型名称".into());
+                    self.log_automatic_failure(work, RetryClass::Configuration, &error);
+                    return Some(RetryClass::Configuration);
                 }
-                self.restore_session_for(session_id, buf.clone());
-                self.log(IngestLog {
-                    at: now_str(),
-                    agent_id: buf.agent_id.clone(),
-                    kind: "memory".into(),
-                    state: "failed".into(),
-                    detail: format!(
-                        "L1 标签校验失败：{error}；完整会话已保留，可修正模型输出后重跑"
-                    ),
-                });
-                return;
+            };
+            if !matches!(reqwest::Url::parse(&provider.base_url), Ok(url)
+                if matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+            {
+                self.log_automatic_failure(work, RetryClass::Configuration, "记忆提取模型地址无效，请检查模型连接配置");
+                return Some(RetryClass::Configuration);
             }
-        };
+            let transcript = work.buffer.messages.iter()
+                .map(|(role, content)| format!("[{role}]\n{content}"))
+                .collect::<Vec<_>>().join("\n\n");
+            let candidates = match extract_l1_with_provider(&provider, &transcript).await {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    let class = error.retry_class();
+                    let error = error.into_message();
+                    if class == RetryClass::Contract {
+                        if let Some(telemetry) = crate::telemetry_store::shared_store() {
+                            let _ = telemetry.set_l1_failure(event_key, &error);
+                        }
+                    }
+                    self.log_automatic_failure(work, class, &error);
+                    return Some(class);
+                }
+            };
+            work.prepared = Some(PreparedMemories { candidates, provider_name: provider.name });
+        }
+        let prepared = work.prepared.as_ref().unwrap();
         match crate::telemetry_store::shared_store()
             .ok_or_else(|| "本地记忆账本尚未初始化".to_string())
             .and_then(|telemetry| {
-                telemetry.store_typed_l1_memories_for_session(session_id, &extracted)
+                telemetry.store_typed_l1_memories(event_key, &prepared.candidates)
             }) {
             Ok(n) => {
                 crate::memory_backend::queue_semantic_l1_index(
-                    extracted.iter().map(|item| item.content.clone()).collect(),
+                    prepared.candidates.iter().map(|item| item.content.clone()).collect(),
                 );
                 self.log(IngestLog {
                     at: now_str(),
-                    agent_id: buf.agent_id.clone(),
+                    agent_id: work.buffer.agent_id.clone(),
                     kind: "memory".into(),
                     state: "stored".into(),
-                    detail: if buf.source.is_empty() {
-                        format!(
-                            "{} 已分析完整会话；已写入本地记忆库 {} 条（无需等待记忆服务二次提取）",
-                            provider.name, n
-                        )
+                    detail: if work.buffer.source.is_empty() {
+                        format!("{} 已分析完整会话；已写入本地记忆库 {} 条（无需等待记忆服务二次提取）", prepared.provider_name, n)
                     } else {
-                        format!(
-                            "{} 已分析 {} 的完整会话；已写入本地记忆库 {} 条（无需等待记忆服务二次提取）",
-                            provider.name,
-                            crate::agent_sources::agent_label(&buf.source),
-                            n
-                        )
+                        format!("{} 已分析 {} 的完整会话；已写入本地记忆库 {} 条（无需等待记忆服务二次提取）",
+                            prepared.provider_name, crate::agent_sources::agent_label(&work.buffer.source), n)
                     },
                 });
+                None
             }
-            Err(e) => {
-                eprintln!("[memory-ingest] local L1 write failed: {e}");
-                if let Some(telemetry) = crate::telemetry_store::shared_store() {
-                    let _ = telemetry.set_l1_failure_for_session(session_id, &e);
-                }
-                self.restore_session_for(session_id, buf.clone());
-                self.log(IngestLog {
-                    at: now_str(),
-                    agent_id: buf.agent_id.clone(),
-                    kind: "memory".into(),
-                    state: "failed".into(),
-                    detail: format!("L1 写入校验失败：{e}；完整会话已保留，可重跑"),
-                });
+            Err(error) => {
+                // A local ledger failure says nothing about model quality.
+                // Do not mark it as a model contract failure or discard output.
+                eprintln!("[memory-ingest] local L1 write failed: {error}");
+                self.log_automatic_failure(work, RetryClass::LocalWrite, &error);
+                Some(RetryClass::LocalWrite)
             }
         }
     }
 
-    fn restore_session_for(&self, session_id: &str, mut previous: SessionBuffer) {
-        previous.last_active = Instant::now();
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(current) = inner.sessions.remove(session_id) {
-            previous.messages.extend(current.messages);
-        }
-        inner.sessions.insert(session_id.to_string(), previous);
+    fn log_automatic_failure(&self, work: &AutomaticWork, class: RetryClass, error: &str) {
+        let detail = match class {
+            RetryClass::Configuration => format!("{error}；已保留完整会话，配置变更后立即重试，否则 30 分钟后复查"),
+            RetryClass::Transient => format!("{error}；已保留完整会话，按退避计划自动重试"),
+            RetryClass::Contract => format!("L1 标签校验失败：{error}；完整会话已保留，将延后重试，也可手动重跑"),
+            RetryClass::LocalWrite => if work.prepared.is_some() {
+                format!("本地记忆写入失败：{error}；完整会话及提取结果已保留，将重试本地写入")
+            } else {
+                format!("本地提取任务失败：{error}；完整会话已保留，将延后重试")
+            },
+            RetryClass::UncertainOutcome => format!("{error}；完整会话已保留，请手动确认后重跑"),
+        };
+        self.log(IngestLog {
+            at: now_str(),
+            agent_id: work.buffer.agent_id.clone(),
+            kind: "memory".into(),
+            state: if matches!(class, RetryClass::Contract | RetryClass::LocalWrite | RetryClass::UncertainOutcome) { "failed" } else { "retrying" }.into(),
+            detail,
+        });
     }
 
     fn log(&self, entry: IngestLog) {
@@ -531,25 +512,15 @@ impl IngestStore {
 
     /// 当前缓冲中的会话数。
     pub fn buffered_sessions(&self) -> usize {
-        self.inner.lock().unwrap().sessions.len()
+        self.inner.lock().unwrap().automatic.buffered_sessions()
     }
 
-    pub fn flush_pending(&self, backend: Arc<MemoryBackend>) -> usize {
+    pub fn flush_pending(&self, _backend: Arc<MemoryBackend>) -> usize {
         if !self.is_enabled() {
             return 0;
         }
-        let session_ids = self
-            .inner
-            .lock()
-            .unwrap()
-            .sessions
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        let count = session_ids.len();
-        for session_id in session_ids {
-            self.flush_session(Arc::clone(&backend), &session_id);
-        }
+        let count = self.inner.lock().unwrap().automatic.request_all();
+        self.automatic_wake.notify_one();
         count
     }
 }
@@ -608,18 +579,50 @@ fn strip_memory_thinking(role: &str, content: &str) -> String {
     }
 }
 
-/// L1 提取在请求层与契约层各有失败出口，调用方处置不同：Transport 保留
-/// 会话等待自动重试；Contract 说明模型输出本身不合契约（自修复轮也救不
-/// 回），需要落 l1_state='failed' 供手动重跑。
+/// Keep provider, model-output and local trace/ledger failures separate. The
+/// LLM facade returns strings, so only its known request errors count as model
+/// failures; an unrecognized database/trace error stays a local failure.
 enum L1ExtractError {
-    Transport(String),
+    Request(RetryClass, String),
     Contract(String),
 }
 
 impl L1ExtractError {
+    fn from_request_error(message: String) -> Self {
+        let status = message.strip_prefix("模型返回 HTTP ")
+            .or_else(|| message.strip_prefix("模型响应无法解析（HTTP "))
+            .and_then(|tail| tail.get(..3))
+            .and_then(|status| status.parse::<u16>().ok());
+        let class = if let Some(status) = status {
+            match status {
+                400..=407 | 410 | 422 => RetryClass::Configuration,
+                200..=299 => RetryClass::Contract,
+                _ => RetryClass::Transient,
+            }
+        } else if message.starts_with("模型调用已结束，但请求追踪保存失败") {
+            RetryClass::UncertainOutcome
+        } else if message.starts_with("模型请求失败（") {
+            RetryClass::Transient
+        } else if message.starts_with("无法创建模型连接:") {
+            RetryClass::Configuration
+        } else if message.starts_with("记忆提取模型") || message.starts_with("MiniMax ") {
+            RetryClass::Contract
+        } else {
+            RetryClass::LocalWrite
+        };
+        Self::Request(class, message)
+    }
+
+    fn retry_class(&self) -> RetryClass {
+        match self {
+            Self::Request(class, _) => *class,
+            Self::Contract(_) => RetryClass::Contract,
+        }
+    }
+
     fn into_message(self) -> String {
         match self {
-            Self::Transport(message) | Self::Contract(message) => message,
+            Self::Request(_, message) | Self::Contract(message) => message,
         }
     }
 }
@@ -643,7 +646,7 @@ async fn extract_l1_with_provider(
     let purpose = crate::llm_trace::ModelPurpose::MemoryExtract;
     let text = llm::complete_text_for(provider, &l1_extraction_messages(transcript), None, purpose)
         .await
-        .map_err(L1ExtractError::Transport)?;
+        .map_err(L1ExtractError::from_request_error)?;
     match parse_typed_l1_candidates(&text) {
         Ok(candidates) => Ok(candidates),
         Err(contract_error) => repair_l1_output(provider, &text, purpose, &contract_error).await,
@@ -665,7 +668,10 @@ async fn repair_l1_output(
     };
     let repaired = llm::complete_text_for(provider, &messages, None, purpose)
         .await
-        .map_err(|error| L1ExtractError::Transport(format!("自修复请求失败：{error}")))?;
+        .map_err(|error| {
+            let classified = L1ExtractError::from_request_error(error);
+            L1ExtractError::Request(classified.retry_class(), format!("自修复请求失败：{}", classified.into_message()))
+        })?;
     parse_typed_l1_candidates(&repaired).map_err(|_| {
         L1ExtractError::Contract(format!(
             "{original_error}；自修复轮仍未产出契约 JSON"
@@ -992,7 +998,12 @@ fn read_hook_transcript(source: &str, payload: &Value) -> Option<Vec<(String, St
 /// This never calls the LLM or memory backend; it only reads the original
 /// local transcript and preserves user/assistant messages in the local ledger.
 #[tauri::command]
-pub fn telemetry_backfill_conversations() -> Result<u32, String> {
+pub async fn telemetry_backfill_conversations() -> Result<u32, String> {
+    tauri::async_runtime::spawn_blocking(backfill_conversations_impl)
+        .await.map_err(|error| error.to_string())?
+}
+
+pub(crate) fn backfill_conversations_impl() -> Result<u32, String> {
     let Some(store) = crate::telemetry_store::shared_store() else {
         return Ok(0);
     };
@@ -1037,104 +1048,40 @@ fn scan_native_transcripts(
         store.reset_transcript_scan_states()?;
         store.app_setting_set("transcript_scanner_version", &TRANSCRIPT_SCANNER_VERSION)?;
     }
+    let inventory = crate::telemetry_store::native_transcript_inventory(retry_failed);
+    let candidates = store.transcript_scan_candidates(&inventory, retry_failed)?;
+    let enabled_sources = crate::agent_sources::AGENT_SOURCE_IDS.into_iter()
+        .filter(|source| crate::agent_sources::transcript_scan_enabled(source)).collect::<HashSet<_>>();
     let mut imported = 0u32;
-    // 转录根目录来自统一的 Agent 数据源注册表，支持按设备覆盖。
-    for source in crate::agent_sources::AGENT_SOURCE_IDS {
-        if !crate::agent_sources::transcript_scan_enabled(source) {
+    let mut counts = HashMap::<String, usize>::new();
+    for file in candidates {
+        let source = file.source.as_str();
+        if !enabled_sources.contains(source) { continue; }
+        let count = counts.entry(file.source.clone()).or_default();
+        // Apply the parse budget AFTER checkpoint filtering, so unchanged
+        // recent files cannot starve an older unprocessed conversation.
+        if *count >= NATIVE_SCAN_MAX_FILES_PER_SOURCE { continue; }
+        *count += 1;
+        if store.native_session_recorded_by_other_source(source, &file.session_id)? {
+            store.record_transcript_scan_snapshot(&file, Ok(()));
             continue;
         }
-        for root in crate::agent_sources::transcript_roots(source) {
-            let mut pending = vec![root];
-            let mut visited = 0usize;
-            let mut candidates = Vec::new();
-            while let Some(directory) = pending.pop() {
-                if visited >= NATIVE_SCAN_MAX_ENTRIES {
-                    break;
-                }
-                let Ok(entries) = fs::read_dir(directory) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    visited += 1;
-                    let path = entry.path();
-                    if path.is_dir() {
-                        pending.push(path);
-                        continue;
-                    }
-                    // DeepSeek Harness 的转录是 `session.vN.jsonl.zstd`
-                    // （扩展名 zstd），其余 Agent 均为明文 jsonl。
-                    let is_transcript = matches!(
-                        path.extension().and_then(|extension| extension.to_str()),
-                        Some("jsonl") | Some("zstd")
-                    );
-                    if !is_transcript {
-                        continue;
-                    }
-                    let modified = entry
-                        .metadata()
-                        .ok()
-                        .and_then(|metadata| metadata.modified().ok())
-                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                    candidates.push((modified, path));
-                }
+        let messages = match read_native_session(source, &file.path) {
+            Ok(messages) => messages,
+            Err(error) => {
+                eprintln!("[memory-ingest] {source} transcript read failed ({}): {error}", file.path.display());
+                store.record_transcript_scan_snapshot(&file, Err(&error));
+                continue;
             }
-            candidates.sort_by(|left, right| right.0.cmp(&left.0));
-            for (_, path) in candidates
-                .into_iter()
-                .take(NATIVE_SCAN_MAX_FILES_PER_SOURCE)
-            {
-                if !store.should_scan_transcript(source, &path, retry_failed) {
-                    continue;
-                }
-                let Some(session_id) = native_session_id(source, &path) else {
-                    continue;
-                };
-                // ZCode 与 Claude Code 的会话互为镜像（同一 UUID 出现在两边的
-                // projects 目录）。同一会话只记第一次扫描的来源，后到的镜像
-                // 副本标记已扫但不再入账，避免对话和用量翻倍。
-                if store.native_session_recorded_by_other_source(source, &session_id)? {
-                    store.record_transcript_scan(source, &path, Some(&session_id), Ok(()));
-                    continue;
-                }
-                let messages = match read_native_session(source, &path) {
-                    Ok(messages) => messages,
-                    Err(error) => {
-                        eprintln!(
-                            "[memory-ingest] {source} transcript read failed ({}): {error}",
-                            path.display()
-                        );
-                        store.record_transcript_scan(source, &path, Some(&session_id), Err(&error));
-                        continue;
-                    }
-                };
-                if messages.is_empty() {
-                    store.record_transcript_scan(source, &path, Some(&session_id), Ok(()));
-                    continue;
-                }
-                let occurred_at = fs::metadata(&path)
-                    .ok()
-                    .and_then(|metadata| metadata.modified().ok())
-                    .map(chrono::DateTime::<chrono::Utc>::from)
-                    .map(|time| time.to_rfc3339())
-                    .unwrap_or_else(now_str);
-                if store.record_native_conversation(
-                    source,
-                    &session_id,
-                    &path,
-                    &occurred_at,
-                    &messages,
-                )? {
-                    imported += 1;
-                }
-                store.record_transcript_scan(source, &path, Some(&session_id), Ok(()));
-            }
+        };
+        if !messages.is_empty() && store.record_native_conversation(
+            source, &file.session_id, &file.path, &file.modified_text(), &messages,
+        )? {
+            imported += 1;
         }
+        store.record_transcript_scan_snapshot(&file, Ok(()));
     }
     Ok(imported)
-}
-
-fn native_session_id(source: &str, path: &Path) -> Option<String> {
-    crate::agent_sources::session_id_for_path(source, path)
 }
 
 fn read_native_session(source: &str, path: &Path) -> Result<Vec<(String, String)>, String> {
@@ -3699,22 +3646,62 @@ pub fn local_memory_add_user(
 // ────────────────────────────────────────────────────────────────────────────
 // 节流巡检：定期冲刷静默超时的会话（由 lib.rs 启动的定时任务调用）
 // ────────────────────────────────────────────────────────────────────────────
-pub fn start_idle_flusher(backend: Arc<MemoryBackend>, store: IngestStore) {
+pub fn start_idle_flusher(_backend: Arc<MemoryBackend>, store: IngestStore) {
+    if store.flusher_started.swap(true, Ordering::AcqRel) {
+        return;
+    }
     tauri::async_runtime::spawn(async move {
+        use futures_util::FutureExt;
+        // Local setters wake us immediately. Cloud/external writes bypass
+        // those commands, so observe their revision at most every 30 seconds.
+        // Hook traffic and worker completions do not perform config I/O.
+        let config_poll = Duration::from_secs(30);
+        let idle = Duration::from_secs(store.idle_timeout_secs);
+        let mut fingerprint = None;
+        let mut config_dirty = true;
+        let mut next_config_check = Instant::now();
         loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            let idle = Duration::from_secs(store.idle_timeout_secs);
-            let stale: Vec<String> = {
-                let inner = store.inner.lock().unwrap();
-                inner
-                    .sessions
-                    .iter()
-                    .filter(|(_, b)| b.last_active.elapsed() > idle)
-                    .map(|(k, _)| k.clone())
-                    .collect()
+            if config_dirty || Instant::now() >= next_config_check {
+                if let Ok(current) = llm::memory_extraction_config_fingerprint() {
+                    if fingerprint != Some(current) {
+                        store.inner.lock().unwrap().automatic.configuration_changed(Instant::now());
+                    }
+                    fingerprint = Some(current);
+                }
+                config_dirty = false;
+                next_config_check = Instant::now() + config_poll;
+            }
+            if store.is_enabled() {
+                loop {
+                    let work = store.inner.lock().unwrap().automatic.take_ready(Instant::now(), idle);
+                    let Some(mut work) = work else { break };
+                    let worker_store = store.clone();
+                    tauri::async_runtime::spawn(async move {
+                        // An unexpected worker panic must not consume a slot
+                        // forever or lose the immutable transcript batch.
+                        let outcome = std::panic::AssertUnwindSafe(worker_store.ingest_memory(&mut work))
+                            .catch_unwind().await;
+                        let failure = outcome.unwrap_or_else(|_| {
+                            let class = if work.prepared.is_some() { RetryClass::LocalWrite } else { RetryClass::UncertainOutcome };
+                            worker_store.log_automatic_failure(&work, class, "自动提取任务意外中断");
+                            Some(class)
+                        });
+                        worker_store.inner.lock().unwrap().automatic.finish(work, failure, Instant::now());
+                        worker_store.automatic_wake.notify_one();
+                    });
+                }
+            }
+            let now = Instant::now();
+            let config_delay = next_config_check.saturating_duration_since(now);
+            let delay = if store.is_enabled() {
+                store.inner.lock().unwrap().automatic.next_delay(now, idle, config_delay)
+            } else {
+                config_delay
             };
-            for sid in stale {
-                store.flush_session(Arc::clone(&backend), &sid);
+            tokio::select! {
+                _ = store.automatic_wake.notified() => {},
+                _ = llm::wait_for_memory_extraction_config_change() => { config_dirty = true; },
+                _ = tokio::time::sleep(delay) => {},
             }
         }
     });

@@ -29,11 +29,12 @@ pub struct TelemetryStore {
     pub(crate) conn: Arc<Mutex<Connection>>,
     mcp_dashboard_cache: Arc<Mutex<Option<McpDashboardCache>>>,
     usage_query_cache: Arc<Mutex<Option<UsageQueryCache>>>,
+    read_connections: Arc<read_access::ReadConnections>,
+    usage_refresh_lock: Arc<Mutex<()>>,
 }
 
 struct UsageQueryCache {
-    data_version: i64,
-    total_changes: i64,
+    usage_revision: i64,
 }
 
 struct McpDashboardCache {
@@ -44,10 +45,25 @@ struct McpDashboardCache {
 }
 
 mod cloud_domains;
+mod domain_merge;
 mod cloud_usage;
+mod l1_sync;
+#[cfg(test)]
+mod importance_evidence_tests;
+mod refinement;
+pub(crate) mod recall_traces;
+pub(crate) mod memory_evidence;
+mod read_access;
+mod projections;
+pub(crate) mod memory_queries;
 mod schema;
 mod transcripts;
+mod transcript_inventory;
+mod transcript_checkpoints;
 mod types;
+
+pub(crate) use l1_sync::ExtractedL1Snapshot;
+pub(crate) use transcript_inventory::{native_transcript_inventory, TranscriptFile};
 
 pub use transcripts::discover_all_native_transcripts;
 pub(crate) use transcripts::{discover_native_transcripts, hex};
@@ -101,17 +117,28 @@ fn insert_memory_domain_assignments(
         }
         return Ok(());
     }
-    for assignment in assignments.iter().take(3) {
+    let mut accepted = HashSet::new();
+    for assignment in assignments {
+        let domain_id = match domain_merge::resolve(transaction, &assignment.domain_id)? {
+            Some(id) => id,
+            None => {
+                if domain_merge::explicitly_deleted(transaction,&assignment.domain_id)? { continue; }
+                return Err("标签不存在，分类结果未保存".into());
+            }
+        };
+        if !accepted.contains(&domain_id) && accepted.len()>=3 { continue; }
+        accepted.insert(domain_id.clone());
         let weight = if assignment.weight.is_finite() {
             assignment.weight.clamp(0.0, 1.0)
         } else {
             0.0
         };
         transaction.execute(
-            "INSERT OR REPLACE INTO local_memory_domains
+            "INSERT INTO local_memory_domains
              (memory_id, domain_id, weight, source, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![memory_id, assignment.domain_id, weight, source, now],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(memory_id,domain_id,source) DO UPDATE SET weight=MAX(weight,excluded.weight),updated_at=excluded.updated_at",
+            params![memory_id, domain_id, weight, source, now],
         ).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -124,11 +151,26 @@ impl TelemetryStore {
         Ok(Self::from_connection(conn))
     }
 
+    /// The caller supplies a fresh evaluation path. Never copies the live ledger
+    /// or starts its schedulers; all migrations and settings remain isolated.
+    pub(crate) fn isolated_for_retrieval_evaluation(path: &Path) -> Result<Self, String> {
+        let conn = Connection::open(path).map_err(|_| "evaluation database unavailable".to_string())?;
+        let conn = schema::initialize_database(conn)?;
+        Ok(Self::from_connection(conn))
+    }
+
+    pub(crate) fn existing_for_evidence(budget: &crate::memory_retrieval::RecallBudget) -> Result<Self, String> {
+        schema::open_existing_for_evidence(budget).map(Self::from_connection)
+    }
+
     pub(crate) fn from_connection(conn: Connection) -> Self {
+        let readers = read_access::ReadConnections::new(&conn);
         Self {
             conn: Arc::new(Mutex::new(conn)),
             mcp_dashboard_cache: Default::default(),
             usage_query_cache: Default::default(),
+            read_connections: Arc::new(readers),
+            usage_refresh_lock: Default::default(),
         }
     }
 
@@ -177,29 +219,9 @@ impl TelemetryStore {
     /// mtime changes. Failed reads are retained separately and retried only by
     /// an explicit user scan (unless the file itself has changed).
     pub fn should_scan_transcript(&self, source: &str, path: &Path, retry_failed: bool) -> bool {
-        let Ok(metadata) = std::fs::metadata(path) else {
-            return true;
-        };
-        let size = metadata.len() as i64;
-        let modified = metadata
-            .modified()
-            .ok()
-            .map(chrono::DateTime::<chrono::Utc>::from)
-            .map(|time| time.to_rfc3339())
-            .unwrap_or_default();
-        let prior: Option<(i64, String, String)> = self.conn.lock().ok().and_then(|conn| conn.query_row(
-            "SELECT file_size, modified_at, state FROM transcript_scan_states WHERE source = ?1 AND transcript_path = ?2",
-            params![source, path.display().to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).optional().ok().flatten());
-        match prior {
-            None => true,
-            Some((old_size, old_modified, _state))
-                if old_size != size || old_modified != modified =>
-            {
-                true
-            }
-            Some((_, _, state)) => state == "failed" && retry_failed,
-        }
+        TranscriptFile::inspect(source, path)
+            .map(|file| !self.conversation_checkpoint_matches(&file, retry_failed))
+            .unwrap_or(true)
     }
 
     /// 读取器清洗规则升级后，旧扫描状态会让已污染的 L0 行永远不被重读；
@@ -220,27 +242,9 @@ impl TelemetryStore {
         session_id: Option<&str>,
         result: Result<(), &str>,
     ) {
-        let Ok(metadata) = std::fs::metadata(path) else {
-            return;
-        };
-        let modified = metadata
-            .modified()
-            .ok()
-            .map(chrono::DateTime::<chrono::Utc>::from)
-            .map(|time| time.to_rfc3339())
-            .unwrap_or_default();
-        let (state, error) = match result {
-            Ok(()) => ("stored", None),
-            Err(detail) => ("failed", Some(detail)),
-        };
-        if let Ok(conn) = self.conn.lock() {
-            let _ = conn.execute(
-                "INSERT INTO transcript_scan_states (source, transcript_path, file_size, modified_at, state, error_detail, session_id, last_scanned_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT(source, transcript_path) DO UPDATE SET file_size=excluded.file_size, modified_at=excluded.modified_at,
-                   state=excluded.state, error_detail=excluded.error_detail, session_id=excluded.session_id, last_scanned_at=excluded.last_scanned_at",
-                params![source, path.display().to_string(), metadata.len() as i64, modified, state, error, session_id, chrono::Utc::now().to_rfc3339()],
-            );
+        if let Some(mut file) = TranscriptFile::inspect(source, path) {
+            if let Some(session_id) = session_id { file.session_id = session_id.to_string(); }
+            self.record_transcript_scan_snapshot(&file, result);
         }
     }
 
@@ -508,7 +512,8 @@ impl TelemetryStore {
         let transaction = conn.transaction().map_err(|e| e.to_string())?;
         transaction
             .execute(
-                "DELETE FROM local_memory_items WHERE source_event_key = ?1 AND user_defined = 0",
+                "DELETE FROM local_memory_items WHERE source_event_key = ?1 AND user_defined = 0
+                   AND NOT EXISTS (SELECT 1 FROM memory_refinement_edits e WHERE e.memory_id = local_memory_items.id)",
                 [&event_key],
             )
             .map_err(|e| e.to_string())?;
@@ -834,11 +839,13 @@ impl TelemetryStore {
         // prevents stale trailing items if a later extraction is shorter.
         transaction
             .execute(
-                "DELETE FROM local_memory_items WHERE source_event_key = ?1",
+                "DELETE FROM local_memory_items WHERE source_event_key = ?1
+                   AND NOT EXISTS (SELECT 1 FROM memory_refinement_edits e WHERE e.memory_id = local_memory_items.id)",
                 [event_key],
             )
             .map_err(|e| e.to_string())?;
         let mut written = 0usize;
+        let mut next_ordinal = 0usize;
         // 用户已删除的 id（l1-auto 墓碑）不随重新提取复活——同一转录重扫
         // 会算出同样的确定性 id，不挡的话删掉的条目每轮提取都长回来。
         let tombstoned: std::collections::HashSet<String> = {
@@ -857,10 +864,20 @@ impl TelemetryStore {
             if content.is_empty() {
                 continue;
             }
-            let ordinal = written;
+            let ordinal = next_ordinal;
+            next_ordinal += 1;
             let digest = Sha256::digest(format!("{event_key}:{ordinal}").as_bytes());
             let id = format!("local-l1:{}", hex(&digest)[..24].to_string());
+            let preserved: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_memory_items m JOIN memory_refinement_edits e ON e.memory_id = m.id WHERE m.id = ?1)",
+                [&id], |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+            if preserved {
+                written += 1;
+                continue;
+            }
             if tombstoned.contains(&id) {
+                // A deleted item still consumes its stable source ordinal.
                 continue;
             }
             let memory_type = normalize_l1_memory_type(&candidate.memory_type);
@@ -933,10 +950,12 @@ impl TelemetryStore {
         let transaction = conn.transaction().map_err(|e| e.to_string())?;
         transaction
             .execute(
-                "DELETE FROM local_memory_items WHERE source_event_key = ?1",
+                "DELETE FROM local_memory_items WHERE source_event_key = ?1
+                   AND NOT EXISTS (SELECT 1 FROM memory_refinement_edits e WHERE e.memory_id = local_memory_items.id)",
                 [import_key],
             )
             .map_err(|e| e.to_string())?;
+        let mut written = 0usize;
         for (ordinal, candidate) in candidates.iter().enumerate() {
             let content = candidate.content.trim();
             let memory_type = normalize_l1_memory_type(&candidate.memory_type);
@@ -949,6 +968,12 @@ impl TelemetryStore {
             }
             let digest = Sha256::digest(format!("{import_key}:{ordinal}").as_bytes());
             let id = format!("local-import:{}", hex(&digest)[..24].to_string());
+            let preserved: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM l1_deletion_tombstones WHERE memory_id = ?1)
+                     OR EXISTS(SELECT 1 FROM local_memory_items m JOIN memory_refinement_edits e ON e.memory_id = m.id WHERE m.id = ?1)",
+                [&id], |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+            if preserved { continue; }
             transaction.execute(
                 "INSERT INTO local_memory_items
                     (id, source_event_key, ordinal, memory, memory_type, durability, source, session_id, event_time, created_at, updated_at)
@@ -962,13 +987,14 @@ impl TelemetryStore {
                 "auto",
                 &now,
             )?;
+            written += 1;
         }
         transaction.commit().map_err(|e| e.to_string())?;
-        Ok(candidates.len())
+        Ok(written)
     }
 
     pub fn memory_domains(&self) -> Result<Vec<MemoryDomain>, String> {
-        let conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned")?;
+        self.with_read_connection(|conn| {
         let mut statement = conn.prepare(
             "SELECT d.id, d.name, d.kind, d.description, d.aliases_json, d.enabled,
                     COUNT(DISTINCT md.memory_id) AS memory_count
@@ -992,6 +1018,7 @@ impl TelemetryStore {
             })
         }).map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        })
     }
 
     pub fn save_memory_domain(
@@ -1002,13 +1029,17 @@ impl TelemetryStore {
         aliases: &[String],
         enabled: bool,
     ) -> Result<MemoryDomain, String> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count()>80 { return Err("标签名称需为 1–80 个字符".into()); }
         let now = chrono::Utc::now().to_rfc3339();
         let aliases_json = serde_json::to_string(aliases).map_err(|e| e.to_string())?;
         let domain_id = id.map(str::to_string)
             .unwrap_or_else(|| format!("custom:{}", uuid::Uuid::new_v4()));
-        let conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned")?;
+        let mut conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned")?;
+        let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
+        domain_merge::ensure_unique_name(&transaction, &domain_id, name)?;
         if id.is_some() {
-            let changed = conn.execute(
+            let changed = transaction.execute(
                 "UPDATE memory_domains
                     SET name = ?2, description = ?3, aliases_json = ?4, enabled = ?5, updated_at = ?6
                   WHERE id = ?1",
@@ -1018,13 +1049,14 @@ impl TelemetryStore {
                 return Err("主题不存在，可能已被删除".into());
             }
         } else {
-            conn.execute(
+            transaction.execute(
                 "INSERT INTO memory_domains
                  (id, name, kind, description, aliases_json, enabled, created_at, updated_at)
                  VALUES (?1, ?2, 'custom', ?3, ?4, ?5, ?6, ?6)",
                 params![domain_id, name, description, aliases_json, enabled, now],
             ).map_err(|e| e.to_string())?;
         }
+        transaction.commit().map_err(|error| error.to_string())?;
         drop(conn);
         self.memory_domains()?.into_iter().find(|domain| domain.id == domain_id)
             .ok_or_else(|| "主题保存后读取失败".into())
@@ -1129,14 +1161,14 @@ impl TelemetryStore {
     }
 
     /// Commit labels and the completion checkpoint together, once per response.
-    /// A failed insert rolls back the old labels too. If an edit/deletion happened
-    /// while the model was running, leave that memory pending instead of marking
-    /// a stale response as complete.
+    /// A failed insert rolls back the old labels too. Return false without writing
+    /// if an edit/deletion made this response stale while the model was running;
+    /// an edited memory stays pending and does not interrupt the rest of the batch.
     pub fn save_memory_domain_classification(
         &self,
         item: &LocalMemorySnapshot,
         assignments: &[MemoryDomainAssignment],
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let content_hash = memory_domain_content_hash(&item.memory, &item.memory_type, &item.durability);
         let now = chrono::Utc::now().to_rfc3339();
         const MAX_ATTEMPTS: u32 = 3;
@@ -1174,10 +1206,10 @@ impl TelemetryStore {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
             ).optional().map_err(|e| e.to_string())?;
             let Some((memory, memory_type, durability)) = current else {
-                return Err(format!("记忆已删除或不再可分类：{}", item.id));
+                return Ok(false);
             };
             if content_hash != memory_domain_content_hash(&memory, &memory_type, &durability) {
-                return Err(format!("记忆在分类期间已修改，已保留待分类状态：{}", item.id));
+                return Ok(false);
             }
             transaction.execute(
                 "DELETE FROM local_memory_domains WHERE memory_id = ?1 AND source IN ('auto', 'backfill')",
@@ -1203,7 +1235,7 @@ impl TelemetryStore {
                     params![item.id, now],
                 ).map_err(|e| e.to_string())?;
             }
-            return transaction.commit().map_err(|e| e.to_string());
+            return transaction.commit().map(|()| true).map_err(|e| e.to_string());
         }
         let detail = last_lock_error.map(|error| format!("{error} ({error:?})")).unwrap_or_default();
         Err(format!("分类保存经过 {MAX_ATTEMPTS} 次写锁尝试后数据库仍被占用；已保存进度不受影响：{detail}"))
@@ -1295,7 +1327,7 @@ impl TelemetryStore {
     }
 
     pub fn local_l1_memory_stats(&self) -> Result<LocalMemoryStats, String> {
-        self.conn.lock().map_err(|_| "telemetry store lock poisoned".to_string())?.query_row(
+        self.with_read_connection(|conn| conn.query_row(
             "SELECT COUNT(*),
                     SUM(CASE WHEN lower(memory_type) IN ('preference', 'profile', 'constraint') THEN 0 ELSE 1 END),
                     SUM(CASE WHEN lower(memory_type) IN ('preference', 'profile', 'constraint') THEN 1 ELSE 0 END),
@@ -1312,7 +1344,7 @@ impl TelemetryStore {
                 short_term: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
                 long_term: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
             }),
-        ).map_err(|error| error.to_string())
+        ).map_err(|error| error.to_string()))
     }
 
     /// Reset only the derived memory layers for a deliberate re-extraction.
@@ -2074,15 +2106,17 @@ impl TelemetryStore {
         // The SQL prefilter must see the same vocabulary the scorer can match:
         // keyword_score returns a positive alias-only score, so alias terms
         // join the prefilter or those rows would become unreachable.
+        let normalized_query = query.to_lowercase();
+        let aliases = local_search_aliases(query);
         let mut filter_terms = terms.clone();
-        filter_terms.extend(local_search_aliases(query));
+        filter_terms.extend(aliases.iter().cloned());
         filter_terms.sort();
         filter_terms.dedup();
         let mut memories = self
             .keyword_prefilter_l1_memories(&filter_terms, domains)?
             .into_iter()
             .filter_map(|mut memory| {
-                let score = keyword_score(&memory.memory, query, &terms);
+                let score = keyword_score_prepared(&memory.memory, &normalized_query, &terms, &aliases);
                 (score > 0.0).then(|| {
                     memory.score = Some(score);
                     memory
@@ -2115,6 +2149,7 @@ impl TelemetryStore {
                 .score
                 .unwrap_or_default()
                 .total_cmp(&left.score.unwrap_or_default())
+                .then_with(|| left.id.cmp(&right.id))
         });
         memories.truncate(limit.min(100) as usize);
         Ok(memories)
@@ -2142,10 +2177,6 @@ impl TelemetryStore {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| "telemetry store lock poisoned".to_string())?;
         let mut conditions = String::new();
         let mut patterns: Vec<String> = Vec::new();
         for term in terms {
@@ -2176,7 +2207,7 @@ impl TelemetryStore {
             "SELECT id, memory, memory_type, durability, user_defined, updated_at, event_time
                FROM local_memory_items
               WHERE (user_defined = 1 OR ({conditions})){domain_filter}
-              ORDER BY user_defined DESC, updated_at DESC
+              ORDER BY user_defined DESC, updated_at DESC, id ASC
               LIMIT {cap}",
             conditions = conditions,
             domain_filter = domain_filter,
@@ -2185,12 +2216,11 @@ impl TelemetryStore {
         let parameters = patterns.iter().cloned()
             .chain(domains.into_iter().flatten().cloned())
             .collect::<Vec<_>>();
-        let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
-        let rows = statement
-            .query_map(
+        self.with_read_connection(|conn| {
+            let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = statement.query_map(
                 rusqlite::params_from_iter(parameters.iter()),
-                |row| {
-                Ok(LocalMemory {
+                |row| Ok(LocalMemory {
                     id: row.get(0)?,
                     memory: row.get(1)?,
                     memory_type: row.get(2)?,
@@ -2199,35 +2229,28 @@ impl TelemetryStore {
                     last_update_at: row.get(5)?,
                     event_time: row.get(6)?,
                     score: None,
-                })
-            })
-            .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())
+                }),
+            ).map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        })
     }
 
     pub fn update_local_l1_memory(&self, id: &str, content: &str) -> Result<(), String> {
         if content.trim().is_empty() {
             return Err("记忆内容不能为空".into());
         }
-        let changed = self
-            .conn
-            .lock()
-            .map_err(|_| "telemetry store lock poisoned".to_string())?
-            .execute(
-                // 编辑同时「晋升」镜像行为本机行（origin_device 置 NULL）：
-                // 用户或清洗改写了内容，本机即接管这条记忆；否则源设备
-                // 下一轮聚合会把旧文本刷回来，改写被静默回滚。
-                "UPDATE local_memory_items
-                    SET memory = ?1, updated_at = ?2, origin_device = NULL
-                  WHERE id = ?3",
-                params![content.trim(), chrono::Utc::now().to_rfc3339(), id],
-            )
-            .map_err(|e| e.to_string())?;
-        if changed == 0 {
-            return Err("未找到本地记忆".into());
-        }
-        Ok(())
+        let mut conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned".to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let changed = tx.execute(
+            "UPDATE local_memory_items SET memory = ?1, updated_at = ?2, origin_device = NULL WHERE id = ?3",
+            params![content.trim(), now, id],
+        ).map_err(|error| error.to_string())?;
+        if changed == 0 { return Err("未找到本地记忆".into()); }
+        // Content and its preservation intent must become visible together:
+        // background transcript refreshes may otherwise replace an unmarked edit.
+        refinement::mark_edited(&tx, id, &now)?;
+        tx.commit().map_err(|error| error.to_string())
     }
 
     /// 删除一条 L1 记忆。自定义记忆（user_defined=1）仅本地删除——跨设备
@@ -2238,46 +2261,21 @@ impl TelemetryStore {
     /// 行不存在时若 id 属于提取线（local-l1: / local-import: / 镜像）仍落
     /// 墓碑（删除意图对即将到来的镜像同样有效）。
     pub fn delete_local_l1_memory(&self, id: &str) -> Result<(), String> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| "telemetry store lock poisoned".to_string())?;
-        let user_defined: Option<i64> = conn
-            .query_row(
-                "SELECT user_defined FROM local_memory_items WHERE id = ?1",
-                [id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        let deleted = conn
-            .execute("DELETE FROM local_memory_items WHERE id = ?1", [id])
-            .map_err(|e| e.to_string())?;
-        if deleted == 0 && user_defined.is_none() {
-            let extracted_line = !id.starts_with("local-user");
-            if extracted_line {
-                let inserted = conn
-                    .execute(
-                        "INSERT OR IGNORE INTO l1_deletion_tombstones (memory_id, deleted_at)
-                         VALUES (?1, ?2)",
-                        params![id, chrono::Utc::now().to_rfc3339()],
-                    )
-                    .map_err(|e| e.to_string())?;
-                if inserted > 0 {
-                    return Ok(());
-                }
-            }
+        let mut conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned".to_string())?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
+        let user_defined: Option<i64> = tx.query_row(
+            "SELECT user_defined FROM local_memory_items WHERE id = ?1", [id], |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        if user_defined == Some(1) {
+            tx.execute("DELETE FROM local_memory_items WHERE id = ?1", [id]).map_err(|error| error.to_string())?;
+        } else if user_defined == Some(0) || !id.starts_with("local-user") {
+            // Deletion intent and removal become visible together. Repeating an
+            // already-applied auto-memory deletion is an idempotent success.
+            l1_sync::mark_deleted(&tx, id, &chrono::Utc::now().to_rfc3339())?;
+        } else {
             return Err("未找到本地记忆".into());
         }
-        if user_defined == Some(0) {
-            conn.execute(
-                "INSERT OR IGNORE INTO l1_deletion_tombstones (memory_id, deleted_at)
-                 VALUES (?1, ?2)",
-                params![id, chrono::Utc::now().to_rfc3339()],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        Ok(())
+        tx.commit().map_err(|error| error.to_string())
     }
 
     /// 已墓碑（用户决策删除）的 L1 记忆 id 集合：提取写入与镜像应用都
@@ -2287,39 +2285,13 @@ impl TelemetryStore {
             .conn
             .lock()
             .map_err(|_| "telemetry store lock poisoned".to_string())?;
-        let mut statement = conn
-            .prepare("SELECT memory_id FROM l1_deletion_tombstones")
-            .map_err(|e| e.to_string())?;
-        let ids = statement
-            .query_map([], |row| row.get(0))
-            .map_err(|e| e.to_string())?;
-        ids.collect::<Result<std::collections::HashSet<_>, _>>()
-            .map_err(|e| e.to_string())
+        l1_sync::tombstoned_ids(&conn)
     }
 
-    /// 应用一条远端 `l1-auto:` 墓碑：删本地行并记入本地墓碑表。已在
-    /// 墓碑表（此前已应用过，或本机就是发起方）则跳过。返回是否首次应用。
+    /// 原子地应用远端自动记忆删除：首次登记或清理旧残留时返回 true。
+    /// 已存在的标记也重新检查删行，修复旧版本中断后留下的活动记录。
     pub fn apply_l1_deletion_tombstone(&self, memory_id: &str) -> Result<bool, String> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| "telemetry store lock poisoned".to_string())?;
-        let inserted = conn
-            .execute(
-                "INSERT OR IGNORE INTO l1_deletion_tombstones (memory_id, deleted_at)
-                 VALUES (?1, ?2)",
-                params![memory_id, chrono::Utc::now().to_rfc3339()],
-            )
-            .map_err(|e| e.to_string())?;
-        if inserted == 0 {
-            return Ok(false);
-        }
-        conn.execute(
-            "DELETE FROM local_memory_items WHERE id = ?1 AND user_defined = 0",
-            [memory_id],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(true)
+        Ok(self.apply_l1_deletion_tombstones(&[memory_id.to_string()])? > 0)
     }
 
     /// 用户手动添加的自定义 L1 记忆：固定 long_term，标记 user_defined，
@@ -2505,40 +2477,7 @@ impl TelemetryStore {
     pub fn exportable_extracted_l1_memories(
         &self,
     ) -> Result<Vec<CloudL1Memory>, String> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| "telemetry store lock poisoned".to_string())?;
-        let mut statement = conn
-            .prepare(
-                "SELECT id, source_event_key, ordinal, memory, memory_type, durability, source, session_id, user_defined, event_time, created_at, updated_at
-                   FROM local_memory_items
-                  WHERE user_defined = 0
-                    AND origin_device IS NULL
-                  ORDER BY id",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok(LocalMemorySnapshot {
-                    id: row.get(0)?,
-                    source_event_key: row.get(1)?,
-                    ordinal: row.get(2)?,
-                    memory: row.get(3)?,
-                    memory_type: row.get(4)?,
-                    durability: row.get(5)?,
-                    source: row.get(6)?,
-                    session_id: row.get(7)?,
-                    user_defined: row.get::<_, i64>(8)? != 0,
-                    event_time: row.get(9)?,
-                    created_at: row.get(10)?,
-                    updated_at: row.get(11)?,
-                })
-            })
-            .map_err(|e| e.to_string())?;
-        let items = rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        cloud_domains::with_cloud_domains(&conn, items)
+        Ok(self.extracted_l1_sync_snapshot()?.memories)
     }
 
     /// 云端记忆库：把某台设备的提取记忆聚合镜像到本地（只读对端数据）。
@@ -2552,18 +2491,15 @@ impl TelemetryStore {
         origin_device: &str,
         rows: &[CloudL1Memory],
     ) -> Result<(usize, usize), String> {
-        // 用户已删除的 id（l1-auto 墓碑）不随镜像复活；也不算修剪保护对象。
-        let tombstoned = self.tombstoned_l1_ids()?;
-        let rows: Vec<CloudL1Memory> = rows
-            .iter()
-            .filter(|row| !tombstoned.contains(&row.id))
-            .cloned()
-            .collect();
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| "telemetry store lock poisoned".to_string())?;
-        let transaction = conn.transaction().map_err(|e| e.to_string())?;
+        let mut conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned".to_string())?;
+        // Acquire the writer before reading deletion intent. A concurrent
+        // archive either finishes before this filter or runs after this import.
+        let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let tombstoned = l1_sync::tombstoned_ids(&transaction)?;
+        let repaired = l1_sync::prune_deleted_rows(&transaction)?;
+        let rows: Vec<CloudL1Memory> = rows.iter()
+            .filter(|row| !tombstoned.contains(&row.id)).cloned().collect();
         let mut landed = 0usize;
         for row in &rows {
             // INSERT OR IGNORE 同时兜底 id 主键与 UNIQUE(source_event_key,
@@ -2663,7 +2599,7 @@ impl TelemetryStore {
         };
         let incoming: std::collections::HashSet<&str> =
             rows.iter().map(|row| row.id.as_str()).collect();
-        let mut pruned = 0usize;
+        let mut pruned = repaired;
         for id in mirrored {
             if !incoming.contains(id.as_str()) {
                 pruned += transaction
@@ -2853,70 +2789,13 @@ impl TelemetryStore {
         &self,
         memory_ids: &[String],
     ) -> Result<Vec<MemoryImportance>, String> {
-        if memory_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| "telemetry store lock poisoned".to_string())?;
-        let mut statement = conn.prepare(
-            "SELECT memory_id, score, supporting_sessions, supporting_agents, duplicate_count, recall_count, pinned, updated_at, pinned_updated_at
-               FROM memory_importance WHERE memory_id = ?1",
-        ).map_err(|e| e.to_string())?;
-        let mut records: Vec<MemoryImportance> = memory_ids
-            .iter()
-            .filter_map(|id| {
-                statement
-                    .query_row([id], |row| {
-                        Ok(MemoryImportance {
-                            memory_id: row.get(0)?,
-                            score: row.get(1)?,
-                            supporting_sessions: row.get(2)?,
-                            supporting_agents: row.get(3)?,
-                            duplicate_count: row.get(4)?,
-                            recall_count: row.get(5)?,
-                            pinned: row.get::<_, i64>(6)? != 0,
-                            updated_at: row.get(7)?,
-                            pinned_updated_at: row.get(8)?,
-                        })
-                    })
-                    .optional()
-                    .ok()
-                    .flatten()
-            })
-            .collect();
-        // 显式用户状态跨设备合并：置顶取时间戳最新的一票，召回按设备累加。
-        let mut peer_statement = conn.prepare(
-            "SELECT memory_id, pinned, pinned_updated_at, recall_count, recall_updated_at
-               FROM memory_user_state_peer WHERE memory_id = ?1",
-        ).map_err(|e| e.to_string())?;
-        for record in &mut records {
-            let rows = peer_statement.query_map([&record.memory_id], |row| {
-                Ok((
-                    row.get::<_, i64>(1)? != 0,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                ))
-            }).map_err(|e| e.to_string())?;
-            for row in rows {
-                let (peer_pinned, peer_pinned_at, peer_recall, _) = row.map_err(|e| e.to_string())?;
-                record.recall_count += peer_recall;
-                // 没做过置顶决策的设备（无时间戳）不参与置顶合并。
-                if let Some(peer_at) = peer_pinned_at.as_deref() {
-                    let local_newer = record
-                        .pinned_updated_at
-                        .as_deref()
-                        .is_some_and(|local_at| local_at >= peer_at);
-                    if !local_newer {
-                        record.pinned = peer_pinned;
-                        record.pinned_updated_at = peer_pinned_at.clone();
-                    }
-                }
-            }
-        }
-        Ok(records)
+        if memory_ids.is_empty() { return Ok(Vec::new()); }
+        self.with_read_connection(|conn| {
+            let tx = conn.transaction().map_err(|error| error.to_string())?;
+            let records = memory_queries::importance_records_on(&tx, memory_ids)?;
+            tx.commit().map_err(|error| error.to_string())?;
+            Ok(records)
+        })
     }
 
     pub fn save_importance_records(&self, records: &[MemoryImportance]) -> Result<(), String> {
@@ -2974,8 +2853,8 @@ impl TelemetryStore {
     pub fn try_record_memory_recall(&self, memory_ids: &[String]) -> Result<(), String> {
         let conn = self
             .conn
-            .lock()
-            .map_err(|_| "telemetry store lock poisoned".to_string())?;
+            .try_lock()
+            .map_err(|_| "recall counter writer is busy".to_string())?;
         conn.busy_timeout(std::time::Duration::from_millis(50))
             .map_err(|e| e.to_string())?;
         let result = (|| {
@@ -3666,6 +3545,11 @@ impl TelemetryStore {
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
+        // Database ownership ends with the snapshot, not with the CPU scan.
+        drop(statement);
+        drop(conn);
+        let rows: Vec<_> = rows.into_iter()
+            .map(|(source, session_id, conversation)| (source, session_id, conversation.to_lowercase())).collect();
         let mut matches: HashMap<
             String,
             (
@@ -3679,17 +3563,24 @@ impl TelemetryStore {
                 continue;
             }
             for (source, session_id, conversation) in &rows {
-                let hit_count = terms
-                    .iter()
-                    .filter(|term| conversation.to_lowercase().contains(term.as_str()))
-                    .count();
                 let required = if terms.len() >= 8 { 3 } else { 2 };
-                if hit_count >= required {
+                let hit_count = terms.iter().filter(|term| conversation.contains(term.as_str()))
+                    .take(required).count();
+                if hit_count == required {
                     let entry = matches.entry(candidate.memory_id.clone()).or_default();
                     entry.0.insert(format!("{source}:{session_id}"));
                     entry.1.insert(source.clone());
                 }
             }
+        }
+        // A merged sentence may no longer appear verbatim in any transcript.
+        // Preserve independent source support from the refinement provenance.
+        for (id, (sessions, agents)) in self.refinement_support(
+            &candidates.iter().map(|candidate| candidate.memory_id.clone()).collect::<Vec<_>>(),
+        )? {
+            let entry = matches.entry(id).or_default();
+            entry.0.extend(sessions);
+            entry.1.extend(agents);
         }
         Ok(matches
             .into_iter()
@@ -3706,14 +3597,14 @@ impl TelemetryStore {
     }
 
     fn summary(&self) -> Result<TelemetrySummary, String> {
-        let mut conn = self.conn.lock().map_err(|_| "telemetry store lock poisoned".to_string())?;
-        self.prepare_usage_query_feed(&mut conn)?;
+        self.with_usage_connection(|conn| {
+        self.prepare_usage_query_feed(conn)?;
         conn.query_row(
                 // Totals come from the same detail-first feed as the usage
                 // dashboard, so the Memory Center panel and the analytics
                 // page can never show different numbers for one ledger.
                 &format!("{}, sessions AS (
-                   SELECT DISTINCT source, session_id FROM agent_events WHERE session_id != 'unknown'
+                   SELECT source, session_id FROM session_latest_events WHERE session_id != 'unknown'
                    UNION
                    SELECT source, session_id FROM session_token_usage
                  ), usage AS (
@@ -3726,7 +3617,7 @@ impl TelemetryStore {
                      FROM usage_feed
                  )
                  SELECT
-                   (SELECT COUNT(*) FROM agent_events),
+                   (SELECT total_events FROM event_counts WHERE singleton = 1),
                    (SELECT COUNT(*) FROM sessions),
                    (SELECT input_tokens FROM feed_totals),
                    (SELECT output_tokens FROM feed_totals),
@@ -3763,6 +3654,7 @@ impl TelemetryStore {
                 },
             )
             .map_err(|e| e.to_string())
+        })
     }
 
     pub fn refresh_mcp_calls(&self) -> Result<McpCallRefresh, String> {
@@ -3890,7 +3782,17 @@ impl TelemetryStore {
     /// Content is read only for files that are new or whose mtime is newer than
     /// their durable SQLite usage projection.
     pub fn refresh_transcript_usage(&self) -> Result<TelemetryUsageRefresh, String> {
+        self.refresh_transcript_usage_with_inventory(false)
+    }
+
+    fn refresh_transcript_usage_with_inventory(&self, force_reconcile: bool) -> Result<TelemetryUsageRefresh, String> {
+        // Serialize manual and scheduled scans without holding the ledger's
+        // writer mutex during file discovery/parsing.
+        let _scan = self.usage_refresh_lock.lock().map_err(|_| "usage refresh lock poisoned".to_string())?;
         self.migrate_usage_estimate_version()?;
+        let scanned_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let inventory = native_transcript_inventory(force_reconcile);
+        let checkpoints = self.usage_scan_checkpoints()?;
         // Hook receipts are useful hints, but must never be the sole source of
         // truth: historical Codex sessions (especially archived ones) have no
         // Hook row to enqueue them.  Merge Hook hints with a lightweight
@@ -3902,20 +3804,18 @@ impl TelemetryStore {
             .into_iter()
             .map(|(source, session_id, path)| ((source, session_id), path))
             .collect::<HashMap<_, _>>();
-        for (source, session_id, path) in discover_all_native_transcripts() {
-            let key = (source.clone(), session_id.clone());
+        let mut seen = HashSet::new();
+        for file in inventory.iter() {
+            let key = (file.source.clone(), file.session_id.clone());
+            if !seen.insert(key.clone()) { continue; }
             match candidates.get_mut(&key) {
                 Some(hinted_path) => {
-                    if hinted_path
-                        .as_ref()
-                        .map(|value| !value.is_file())
-                        .unwrap_or(true)
-                    {
-                        *hinted_path = Some(path);
+                    if !hinted_path.as_ref().is_some_and(|path| path.is_file()) {
+                        *hinted_path = Some(file.path.clone());
                     }
                 }
-                None if self.transcript_changed_since_usage(&source, &session_id, &path) => {
-                    candidates.insert(key, Some(path));
+                None if checkpoints.get(&key).is_none_or(|refreshed| chrono::DateTime::<chrono::Utc>::from(file.modified) > *refreshed) => {
+                    candidates.insert(key, Some(file.path.clone()));
                 }
                 None => {}
             }
@@ -3934,7 +3834,8 @@ impl TelemetryStore {
             });
         }
 
-        let discovered = discover_native_transcripts(&sessions);
+        let unresolved = sessions.iter().filter(|(_, _, path)| !path.as_ref().is_some_and(|path| path.is_file())).cloned().collect::<Vec<_>>();
+        let discovered = discover_native_transcripts(&unresolved);
         let mut updates = Vec::new();
         let mut unavailable_sessions = 0;
         for (source, session_id, hinted_path) in sessions {
@@ -4024,7 +3925,7 @@ impl TelemetryStore {
             let transaction = conn.transaction().map_err(|e| e.to_string())?;
             for (source, session_id, usage, origin, records) in &updates {
                 Self::upsert_session_usage_total(
-                    &transaction, source, session_id, usage, origin, &now,
+                    &transaction, source, session_id, usage, origin, &scanned_at,
                 )?;
                 transaction
                     .execute(
@@ -4325,26 +4226,6 @@ impl TelemetryStore {
             .collect())
     }
 
-    fn transcript_changed_since_usage(&self, source: &str, session_id: &str, path: &Path) -> bool {
-        let modified = match std::fs::metadata(path).and_then(|metadata| metadata.modified()) {
-            Ok(value) => chrono::DateTime::<chrono::Utc>::from(value),
-            // A vanished transcript is not a change.  Report false so the
-            // session is not rescanned (and its durable projection not
-            // overwritten) on every single boot.
-            Err(_) => return false,
-        };
-        let refreshed: Option<String> = self.conn.lock().ok().and_then(|conn| {
-            conn.query_row(
-            "SELECT refreshed_at FROM session_token_usage WHERE source = ?1 AND session_id = ?2",
-            params![source, session_id], |row| row.get(0),
-        ).optional().ok().flatten()
-        });
-        refreshed
-            .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
-            .map(|value| modified > value.with_timezone(&chrono::Utc))
-            .unwrap_or(true)
-    }
-
     /// True when the ledger already holds a transcript-derived projection
     /// for this session (native counters or a transcript estimate).  Such
     /// rows outlive the transcript file; coarser estimates must never
@@ -4410,60 +4291,12 @@ impl TelemetryStore {
     fn live_status(&self) -> Result<TelemetryLiveStatus, String> {
         let recent_cutoff = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
         let now = chrono::Utc::now().to_rfc3339();
-        // Same latest-event window as the `active_sessions` counter below, so
-        // the reported sources always match the reported session count.
-        const ACTIVE_SESSION_FILTER: &str = "(
-                  SELECT source, session_id, event_type, occurred_at,
-                         ROW_NUMBER() OVER (PARTITION BY source, session_id ORDER BY id DESC) AS rank
-                    FROM agent_events WHERE session_id != 'unknown'
-                ) latest WHERE rank = 1
-                    AND occurred_at >= ?1 AND occurred_at <= ?2
-                    AND event_type NOT IN ('Stop', 'TranscriptSync', 'session_end', 'session_usage')";
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| "telemetry store lock poisoned".to_string())?;
-        let mut status = conn.query_row(
-            &format!(
-                "WITH sessions AS (
-                     SELECT DISTINCT source, session_id FROM agent_events WHERE session_id != 'unknown'
-                     UNION
-                     SELECT source, session_id FROM session_token_usage
-                 )
-                 SELECT
-                   (SELECT COUNT(*) FROM sessions),
-                   (SELECT COUNT(*) FROM {ACTIVE_SESSION_FILTER}),
-                   (SELECT COUNT(*) FROM agent_events WHERE conversation_state = 'full'),
-                   (SELECT COUNT(*) FROM agent_events WHERE conversation_state = 'full' AND l1_state = 'stored' AND conversation_text IS NOT NULL AND conversation_text != ''),
-                   (SELECT COUNT(*) FROM agent_events WHERE conversation_state = 'full' AND l1_state = 'pending' AND conversation_text IS NOT NULL AND conversation_text != ''),
-                   (SELECT COUNT(*) FROM agent_events WHERE conversation_state = 'full' AND l1_state = 'retrying' AND conversation_text IS NOT NULL AND conversation_text != ''),
-                   (SELECT COUNT(*) FROM agent_events WHERE conversation_state = 'full' AND l1_state = 'failed' AND conversation_text IS NOT NULL AND conversation_text != ''),
-                   (SELECT COUNT(*) FROM sessions LEFT JOIN session_token_usage usage ON usage.source=sessions.source AND usage.session_id=sessions.session_id WHERE usage.session_id IS NULL),
-                   (SELECT COUNT(*) FROM transcript_scan_states WHERE state = 'failed'),
-                   (SELECT MAX(occurred_at) FROM agent_events)"
-            ),
-            [&recent_cutoff, &now],
-            |row| Ok(TelemetryLiveStatus {
-                captured_sessions: row.get(0)?, active_sessions: row.get(1)?, active_sources: Vec::new(),
-                completed_conversations: row.get(2)?,
-                organized_memory_conversations: row.get(3)?, pending_memory_sessions: row.get(4)?,
-                retrying_memory_sessions: row.get(5)?, failed_memory_sessions: row.get(6)?, pending_usage_sessions: row.get(7)?,
-                failed_transcript_scans: row.get(8)?, last_event_at: row.get(9)?,
-            }),
-        ).map_err(|e| e.to_string())?;
-        if status.active_sessions > 0 {
-            let mut statement = conn
-                .prepare(&format!(
-                    "SELECT DISTINCT source FROM {ACTIVE_SESSION_FILTER} ORDER BY source"
-                ))
-                .map_err(|e| e.to_string())?;
-            status.active_sources = statement
-                .query_map([&recent_cutoff, &now], |row| row.get::<_, String>(0))
-                .map_err(|e| e.to_string())?
-                .filter_map(|source| source.ok())
-                .collect();
-        }
-        Ok(status)
+        self.with_read_connection(|conn| {
+            let tx = conn.transaction().map_err(|error| error.to_string())?;
+            let status = projections::live_status(&tx, &recent_cutoff, &now)?;
+            tx.commit().map_err(|error| error.to_string())?;
+            Ok(status)
+        })
     }
 
     fn recent_events(&self, limit: u32) -> Result<Vec<TelemetryEvent>, String> {
@@ -4505,11 +4338,8 @@ impl TelemetryStore {
     /// without request-level provider counters are exposed as one explicit
     /// session-total fallback instead of zero-valued Hook rows.
     fn usage_records(&self, limit: u32) -> Result<Vec<TelemetryUsageRecord>, String> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| "telemetry store lock poisoned".to_string())?;
-        self.prepare_usage_query_feed(&mut conn)?;
+        self.with_usage_connection(|conn| {
+        self.prepare_usage_query_feed(conn)?;
         let mut statement = conn.prepare(&format!(
             "{} SELECT record_id, source, session_id, occurred_at, model, record_kind,
                     input_tokens, output_tokens, cached_tokens, origin
@@ -4534,6 +4364,7 @@ impl TelemetryStore {
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
+        })
     }
 
     fn usage_analytics(
@@ -4544,11 +4375,8 @@ impl TelemetryStore {
         bucket: &str,
         record_limit: u32,
     ) -> Result<TelemetryUsageAnalytics, String> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| "telemetry store lock poisoned".to_string())?;
-        self.prepare_usage_query_feed(&mut conn)?;
+        self.with_usage_connection(|conn| {
+        self.prepare_usage_query_feed(conn)?;
         // Reuse the same indexed snapshot for totals, details and every chart.
         let feed = cloud_usage::QUERY_FEED;
         let filter = cloud_usage::FILTER;
@@ -4594,7 +4422,7 @@ impl TelemetryStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
 
-        let buckets = cloud_usage::read_usage_buckets(&conn, start_at, end_at, source, bucket)?;
+        let buckets = cloud_usage::read_usage_buckets(conn, start_at, end_at, source, bucket)?;
 
         let heatmap_sql = format!(
             "{feed} SELECT CAST(strftime('%w', occurred_at, 'localtime') AS INTEGER), \
@@ -4664,6 +4492,7 @@ impl TelemetryStore {
             heatmap,
             cost_groups,
             sources,
+        })
         })
     }
 
@@ -4999,37 +4828,19 @@ fn keyword_terms(query: &str) -> Vec<String> {
 }
 
 fn keyword_score(text: &str, query: &str, terms: &[String]) -> f64 {
+    keyword_score_prepared(text, &query.to_lowercase(), terms, &local_search_aliases(query))
+}
+
+/// Reuse query normalization and aliases across the bounded candidate set.
+fn keyword_score_prepared(text: &str, normalized_query: &str, terms: &[String], aliases: &[String]) -> f64 {
     let haystack = text.to_lowercase();
-    let matches = terms
-        .iter()
-        .filter(|term| haystack.contains(term.as_str()))
-        .count();
-    let coverage = if terms.is_empty() {
-        0.0
-    } else {
-        matches as f64 / terms.len() as f64
-    };
-    let exact_bonus = haystack
-        .contains(&query.to_lowercase())
-        .then_some(0.35)
-        .unwrap_or(0.0);
-    // Keep the direct phrase match dominant, then add a bounded semantic-alias
-    // signal.  This stays entirely offline while allowing natural switches
-    // between common Vibe Assistant terms such as "偏好" / "约束" or "MCP" /
-    // "共享记忆".
-    let aliases = local_search_aliases(query);
-    let alias_matches = aliases
-        .iter()
-        .filter(|term| haystack.contains(term.as_str()))
-        .count();
-    let alias_score = if aliases.is_empty() {
-        0.0
-    } else {
-        alias_matches as f64 / aliases.len() as f64 * 0.42
-    };
-    if matches == 0 && alias_matches == 0 {
-        return 0.0;
-    }
+    let matches = terms.iter().filter(|term| haystack.contains(term.as_str())).count();
+    let coverage = if terms.is_empty() { 0.0 } else { matches as f64 / terms.len() as f64 };
+    let exact_bonus = haystack.contains(normalized_query).then_some(0.35).unwrap_or(0.0);
+    // Keep phrase matches dominant, with the same bounded offline alias boost.
+    let alias_matches = aliases.iter().filter(|term| haystack.contains(term.as_str())).count();
+    let alias_score = if aliases.is_empty() { 0.0 } else { alias_matches as f64 / aliases.len() as f64 * 0.42 };
+    if matches == 0 && alias_matches == 0 { return 0.0; }
     coverage + exact_bonus + alias_score
 }
 
@@ -5143,11 +4954,13 @@ pub async fn telemetry_summary(
 }
 
 #[tauri::command]
-pub fn telemetry_refresh_usage(
+pub async fn telemetry_refresh_usage(
     app: tauri::AppHandle,
     state: tauri::State<'_, TelemetryStore>,
 ) -> Result<TelemetryUsageRefresh, String> {
-    let result = state.refresh_transcript_usage();
+    let store = state.inner().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || store.refresh_transcript_usage_with_inventory(true))
+        .await.map_err(|error| error.to_string())?;
     // Notify open dashboards even when the scan reports failures: the
     // ledger may still have been partially refreshed.
     let _ = app.emit("telemetry-updated", ());
@@ -5170,13 +4983,20 @@ pub fn start_usage_refresh_scheduler(app: tauri::AppHandle) {
             };
             let handle = app.clone();
             let refreshed = tauri::async_runtime::spawn_blocking(move || {
+                // Both consumers reuse the same incremental metadata inventory;
+                // non-Hook agents also continue staging conversations while open.
+                let conversations = crate::memory_ingest::backfill_conversations_impl()
+                    .unwrap_or_else(|error| {
+                        eprintln!("[memory-ingest] background transcript refresh failed: {error}");
+                        0
+                    });
                 let usage = store
                     .refresh_transcript_usage()
                     .map(|result| result.updated_sessions)
                     .unwrap_or(0);
                 // 定价回填断点续跑：全部完成后是零成本空查询。
                 let _ = store.recalculate_costs(false);
-                usage
+                usage + i64::from(conversations)
             })
             .await
             .unwrap_or(0);

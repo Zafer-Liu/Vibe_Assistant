@@ -3,17 +3,21 @@ import { useTranslation } from 'react-i18next'
 import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import {
-  Brain, Search, Trash2, Pencil, MoonStar, CheckCircle2, XCircle, Loader2, X,
-  PowerOff, Webhook, History, RefreshCw, ChevronDown, ChevronUp, FileText, Star, Database, FolderOpen,
+  Brain, Search, Trash2, Pencil, CheckCircle2, XCircle, Loader2, X,
+  PowerOff, Webhook, RefreshCw, ChevronDown, ChevronUp, FileText, Star, Database, FolderOpen,
   ChevronRight, Plus,
 } from 'lucide-react'
 import { useMemoryFields, type MemoryLoadStatus } from '../store/memoryStore'
 import { useTelemetryFields } from '../store/telemetryStore'
 import { useVisiblePolling } from '../hooks/useVisiblePolling'
 import { ErrorRecovery } from '../components/ErrorRecovery'
-import type { ConsolidationResult, HookStatus, MemoryDomainItem, MemoryImportance, MemoryImportResult, MemoryItem, MemoryLayerDocument } from '../types/memory'
+import type { HookStatus, MemoryDomainItem, MemoryImportance, MemoryImportResult, MemoryItem, MemoryLayerDocument, MemoryRetrievalResponse } from '../types/memory'
 import { normalizeL2Document } from '../lib/thinking'
 import { MemoryMarkdown } from '../components/MemoryMarkdown'
+import { MemoryRefinementPanel } from '../components/MemoryRefinementPanel'
+import { MemoryRecallInspector } from '../components/MemoryRecallInspector'
+import { CurrentMemoryEvidence } from '../components/MemoryEvidencePanel'
+import { VirtualList } from '../components/VirtualList'
 import { CloudVaultCard } from '../components/CloudVaultCard'
 import { Modal } from '../components/Modal'
 import { useConfirmDialog } from '../components/ConfirmDialog'
@@ -22,6 +26,8 @@ import { intlLocale } from '../i18n'
 import { compactTokenCount } from '../lib/compactNumber'
 import { isInjectionReady } from '../lib/memoryAgentStatus'
 import { afterNextPaint, recordStartupPhase } from '../lib/startupPerformance'
+
+const memoryKey = (memory: MemoryItem) => memory.id
 
 function localTime(value: string) {
   // Rust serializes UTC timestamps with nanosecond precision. Normalise to
@@ -142,12 +148,20 @@ const MemoryCard = memo(function MemoryCard({ memory: m, ranking, pinDisabled, o
 
 export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGraph, onOpenPending, onOpenOrganized, onOpenCapture, onOpenInjection, active = true }: { onOpenUsage?: () => void; onOpenGraph?: () => void; onOpenPending?: () => void; onOpenOrganized?: () => void; onOpenCapture?: () => void; onOpenInjection?: () => void; active?: boolean }) {
   const { t } = useTranslation()
-  const { engineOnline, memories, memoryDomains, selectedMemoryDomainId, importance, loading, lastSearchResults, lastSearchQuery, memoryCacheReady, localMemoryStats, ingestStatus, l2Documents, l3Documents, checkIngest, loadMemoryLayers, consolidateShortTermMemory, draftLongTermProfile, publishLongTermProfile, updatePublishedMemoryDocument, deleteLongTermProfileDraft, organizeConversations, cancelOrganize, importMemoryFolder, checkEngine, stopEngine, search, listMemories, loadMemoryDomains, setSelectedMemoryDomain, resetL1ForReextraction, updateMemory, deleteMemory, addUserMemory, dreaming, restoreConsolidation, refreshImportance, setMemoryPinned, hookStatus, qoderHookStatus, codexHookStatus, workbuddyHookStatus, geminiHookStatus, antigravityHookStatus, agentSources, loadAgentSources } = useMemoryFields('engineOnline', 'memories', 'memoryDomains', 'selectedMemoryDomainId', 'importance', 'loading', 'lastSearchResults', 'lastSearchQuery', 'memoryCacheReady', 'localMemoryStats', 'ingestStatus', 'l2Documents', 'l3Documents', 'checkIngest', 'loadMemoryLayers', 'consolidateShortTermMemory', 'draftLongTermProfile', 'publishLongTermProfile', 'updatePublishedMemoryDocument', 'deleteLongTermProfileDraft', 'organizeConversations', 'cancelOrganize', 'importMemoryFolder', 'checkEngine', 'stopEngine', 'search', 'listMemories', 'loadMemoryDomains', 'setSelectedMemoryDomain', 'resetL1ForReextraction', 'updateMemory', 'deleteMemory', 'addUserMemory', 'dreaming', 'restoreConsolidation', 'refreshImportance', 'setMemoryPinned', 'hookStatus', 'qoderHookStatus', 'codexHookStatus', 'workbuddyHookStatus', 'geminiHookStatus', 'antigravityHookStatus', 'agentSources', 'loadAgentSources')
-  const { memoryLoadState } = useMemoryFields('memoryLoadState')
+  const { engineOnline, memories, memoryDomains, selectedMemoryDomainId, importance, loading, lastSearchResults, lastSearchQuery, lastSearchRetrieval, memoryCacheReady, localMemoryStats, ingestStatus, l2Documents, l3Documents, checkIngest, loadMemoryLayers, consolidateShortTermMemory, draftLongTermProfile, publishLongTermProfile, updatePublishedMemoryDocument, deleteLongTermProfileDraft, organizeConversations, cancelOrganize, importMemoryFolder, checkEngine, stopEngine, search, listMemories, loadMemoryDomains, setSelectedMemoryDomain, resetL1ForReextraction, updateMemory, deleteMemory, addUserMemory, refreshImportance, setMemoryPinned, hookStatus, qoderHookStatus, codexHookStatus, workbuddyHookStatus, dshHookStatus, geminiHookStatus, antigravityHookStatus, agentSources, loadAgentSources } = useMemoryFields('engineOnline', 'memories', 'memoryDomains', 'selectedMemoryDomainId', 'importance', 'loading', 'lastSearchResults', 'lastSearchQuery', 'lastSearchRetrieval', 'memoryCacheReady', 'localMemoryStats', 'ingestStatus', 'l2Documents', 'l3Documents', 'checkIngest', 'loadMemoryLayers', 'consolidateShortTermMemory', 'draftLongTermProfile', 'publishLongTermProfile', 'updatePublishedMemoryDocument', 'deleteLongTermProfileDraft', 'organizeConversations', 'cancelOrganize', 'importMemoryFolder', 'checkEngine', 'stopEngine', 'search', 'listMemories', 'loadMemoryDomains', 'setSelectedMemoryDomain', 'resetL1ForReextraction', 'updateMemory', 'deleteMemory', 'addUserMemory', 'refreshImportance', 'setMemoryPinned', 'hookStatus', 'qoderHookStatus', 'codexHookStatus', 'workbuddyHookStatus', 'dshHookStatus', 'geminiHookStatus', 'antigravityHookStatus', 'agentSources', 'loadAgentSources')
+  const { memoryLoadState, applyRecallResponse, lastSearchEvidenceAccess } = useMemoryFields('memoryLoadState', 'applyRecallResponse', 'lastSearchEvidenceAccess')
   const { telemetrySummary, telemetryLiveStatus, checkTelemetry } = useTelemetryFields('telemetrySummary', 'telemetryLiveStatus', 'checkTelemetry')
 
   const [query, setQuery] = useState('')
   const [topK, setTopK] = useState(10)
+  const [recallInspector, setRecallInspector] = useState<{ requestId?: string } | null>(null)
+  useEffect(() => { if (!active) setRecallInspector(null) }, [active])
+  const handleTraceRerun = useCallback((response: MemoryRetrievalResponse) => {
+    applyRecallResponse(response)
+    setQuery(response.query ?? '')
+    const limit = response.retrieval?.result_limit
+    if (typeof limit === 'number' && Number.isFinite(limit)) setTopK(Math.max(1, Math.min(50, Math.trunc(limit))))
+  }, [applyRecallResponse])
   const [notice, setNotice] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
   const [editing, setEditing] = useState<MemoryItem | null>(null)
   const [editContent, setEditContent] = useState('')
@@ -166,13 +180,8 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
   const [organizingConversations, setOrganizingConversations] = useState(false)
   const [importingMemories, setImportingMemories] = useState(false)
   const [memoryImportResult, setMemoryImportResult] = useState<MemoryImportResult | null>(null)
-  const [consolidating, setConsolidating] = useState(false)
-  const [consolidationResult, setConsolidationResult] = useState<{ kind: 'ok' | 'err'; text: string; result?: ConsolidationResult } | null>(null)
-  const [restoringConsolidation, setRestoringConsolidation] = useState(false)
   const [refreshingImportance, setRefreshingImportance] = useState(false)
   const [ingestOpen, setIngestOpen] = useState(false)
-  const [consolidationOpen, setConsolidationOpen] = useState(false)
-  const [consolidationProgress, setConsolidationProgress] = useState<string | null>(null)
   const [consolidatingL2, setConsolidatingL2] = useState(false)
   const [l2ConsolidationError, setL2ConsolidationError] = useState<string | null>(null)
   const [l2ConsolidationSuccess, setL2ConsolidationSuccess] = useState<string | null>(null)
@@ -203,6 +212,12 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
   // Cached sections and local editor state stay visible during background reads.
   const domainFilterReady = selectedMemoryDomainId === 'all' || memoryLoadState.domains === 'ready'
   const inventoryReady = memoryCacheReady && domainFilterReady
+  const retrievalMode = lastSearchRetrieval?.mode ?? ''
+  const retrievalStatusKey = retrievalMode === 'semantic_partial_index' ? 'retrievalPartial'
+    : retrievalMode.startsWith('semantic') ? ((lastSearchRetrieval?.local_keyword_candidates ?? 0) > 0 ? 'retrievalReady' : 'retrievalSemanticReady')
+      : retrievalMode === 'local_fallback_cold_index' ? 'retrievalCold'
+        : retrievalMode === 'local_fallback_busy' ? 'retrievalBusy'
+          : retrievalMode === 'local_fallback_budget' ? 'retrievalTimeout' : 'retrievalUnavailable'
   // Native L1 extraction stores conversation summaries as `conversation`.
   // They are factual, searchable records—not user preferences. Only the
   // profile-oriented kinds belong to the preference total.
@@ -244,15 +259,6 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  useEffect(() => {
-    let unlisten: (() => void) | undefined
-    void listen<{ detail?: string }>('memory-consolidation-progress', (event) => {
-      setConsolidationProgress(event.payload.detail ?? t('memory.consolidateJudging'))
-    }).then((dispose) => { unlisten = dispose }).catch(() => {})
-    return () => unlisten?.()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
   // L2/L3 后台自动重算：重算完成事件到达时刷新已挂载页的文档（开关与
   // 间隔在设置页）。
   useEffect(() => {
@@ -282,8 +288,8 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
 
   const handleDelete = useCallback((item: MemoryItem) => {
     // 「不再提醒」后直接执行：删除会经云保险库墓碑同步到所有设备。
+    // 不先 setDeleteTarget，避免确认弹窗闪开并抢走焦点。
     if (localStorage.getItem('memory.deleteSkipConfirm') === '1') {
-      setDeleteTarget(item)
       void confirmDeleteRef.current?.(item)
       return
     }
@@ -319,7 +325,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
   }
 
   async function handleSearch() {
-    if (!query.trim() || !memoryCacheReady) return
+    if (!query.trim() || loading || !domainFilterReady) return
     try {
       await search(query.trim(), topK)
     } catch (e) {
@@ -528,46 +534,11 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
     }
   }
 
-  async function handleDreaming() {
-    if (consolidating) return
-    setConsolidating(true)
-    setConsolidationResult(null)
-    setConsolidationProgress(t('memory.consolidatePreparing'))
-    try {
-      const result = await dreaming((processed, total) => {
-        setConsolidationProgress(t('memory.consolidateGenerating', { processed, total }))
-      })
-      await listMemories(true)
-      const text = result.message || t('memory.dreamDone')
-      setConsolidationResult({ kind: 'ok', text, result })
-      flash('ok', t('memory.dreamDone'))
-    } catch (e) {
-      const text = `${t('common.failed')}: ${String(e)}`
-      setConsolidationResult({ kind: 'err', text })
-      flash('err', text)
-    } finally {
-      setConsolidating(false)
-      setConsolidationProgress(null)
-    }
-  }
-
-  async function handleRestoreConsolidation() {
-    const snapshotId = consolidationResult?.result?.snapshot_id
-    if (!snapshotId || restoringConsolidation) return
-    setRestoringConsolidation(true)
-    try {
-      const result = await restoreConsolidation(snapshotId)
-      await listMemories(true)
-      setConsolidationResult({ kind: 'ok', text: t('memory.dreamRestoreDone'), result })
-      flash('ok', t('memory.dreamRestoreDone'))
-    } catch (error) {
-      const text = `${t('common.failed')}: ${String(error)}`
-      setConsolidationResult({ kind: 'err', text })
-      flash('err', text)
-    } finally {
-      setRestoringConsolidation(false)
-    }
-  }
+  const handleRefinementChanged = useCallback(async () => {
+    // This traversal already refreshes tags, stats and saved importance. Full
+    // evidence scoring stays behind its explicit action, never a per-item write.
+    await listMemories(true)
+  }, [listMemories])
 
   const engineState = engineOnline === null ? 'unknown' : engineOnline ? 'online' : 'offline'
 
@@ -575,7 +546,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
   // 判定与「记忆注入」页共用（见 memoryAgentStatus）。
   const hookStatusByAgent: Record<string, HookStatus | null> = {
     codex: codexHookStatus, claude: hookStatus, qoder: qoderHookStatus, workbuddy: workbuddyHookStatus,
-    gemini: geminiHookStatus, antigravity: antigravityHookStatus,
+    dsh: dshHookStatus, gemini: geminiHookStatus, antigravity: antigravityHookStatus,
   }
   const injectionReadyCount = agentSources
     .filter((source) => source.supports_hooks && isInjectionReady(hookStatusByAgent[source.id] ?? null))
@@ -755,6 +726,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
                 />
                 <div className="flex items-center gap-2">
                   <select
+                    aria-label={t('memory.userDefinedTypeLabel')}
                     value={userMemoryType}
                     onChange={(e) => setUserMemoryType(e.target.value)}
                     className="rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-2 py-1.5 text-sm text-gray-800 dark:text-gray-100 focus:outline-none"
@@ -851,6 +823,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
                 />
                 <div className="flex items-center gap-2">
                   <select
+                    aria-label={t('memory.userDefinedTypeLabel')}
                     value={userMemoryType}
                     onChange={(e) => setUserMemoryType(e.target.value)}
                     className="rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-2 py-1.5 text-sm text-gray-800 dark:text-gray-100 focus:outline-none"
@@ -917,6 +890,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
         <div className="flex flex-wrap items-center gap-2">
           <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-200">{t('memory.storageTitle')}</h2>
           <select
+            aria-label={t('memory.domainFilterTitle')}
             value={selectedMemoryDomainId}
             disabled={memoryLoadState.domains !== 'ready'}
             onChange={(event) => { void setSelectedMemoryDomain(event.target.value) }}
@@ -979,21 +953,47 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
             className="flex-1 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-2.5 py-1.5 text-sm text-gray-800 dark:text-gray-100 focus:outline-none focus:ring-1 focus:ring-violet-500"
           />
           <select
+            aria-label={t('memory.searchResultLimit')}
             value={topK}
             onChange={(e) => setTopK(Number(e.target.value))}
             className="rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-2 py-1.5 text-sm text-gray-800 dark:text-gray-100 focus:outline-none"
           >
-            {[5, 10, 20].map((n) => <option key={n} value={n}>{n}</option>)}
+            {[...new Set([5, 10, 20, topK])].sort((a, b) => a - b).map((n) => <option key={n} value={n}>{n}</option>)}
           </select>
           <button
             onClick={handleSearch}
-            disabled={loading || !memoryCacheReady || !query.trim()}
+            disabled={loading || !domainFilterReady || !query.trim()}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white text-sm font-medium"
           >
             {loading ? <Loader2 size={15} className="animate-spin" /> : <Search size={15} />}
             {t('memory.search')}
           </button>
+          <button type="button" onClick={() => setRecallInspector({})}
+            className="inline-flex items-center rounded-md border border-gray-300 bg-white px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-200 dark:hover:bg-gray-600">
+            {t('memory.recallTrace.history')}
+          </button>
         </div>
+        {lastSearchRetrieval && !loading && (
+          <div className="space-y-1 text-xs text-gray-600 dark:text-gray-300">
+            <p role="status" aria-live="polite">{t(`memory.${retrievalStatusKey}`)}</p>
+            <details>
+              <summary className="w-fit cursor-pointer rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2">{t('memory.retrievalDetails')}</summary>
+              <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1">
+                <span>{t('memory.retrievalCandidates', { semantic: lastSearchRetrieval.semantic_candidates ?? 0, keyword: lastSearchRetrieval.local_keyword_candidates ?? 0, selected: visibleSearchResults.length })}</span>
+                {lastSearchRetrieval.timings_ms && <span>{t('memory.retrievalElapsed', { ms: lastSearchRetrieval.timings_ms.total })}</span>}
+                {lastSearchRetrieval.index?.total != null && <span>{t('memory.retrievalIndex', { cached: lastSearchRetrieval.index.cached ?? 0, total: lastSearchRetrieval.index.total })}</span>}
+              </div>
+            </details>
+            {lastSearchRetrieval.trace_status === 'saved' && lastSearchRetrieval.request_id
+              ? <button type="button" onClick={() => setRecallInspector({ requestId: lastSearchRetrieval.request_id })}
+                  className="rounded font-medium text-blue-700 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 dark:text-sky-300">
+                  {t('memory.recallTrace.open')}
+                </button>
+              : lastSearchRetrieval.trace_status === 'unavailable' && <p>{t('memory.recallTrace.unavailable')}</p>}
+          </div>
+        )}
+        {!loading && <CurrentMemoryEvidence access={lastSearchEvidenceAccess} requestId={lastSearchRetrieval?.request_id}
+          memories={visibleSearchResults} query={lastSearchQuery} active={active} />}
         {visibleSearchResults.length > 0 && (
           <div className="space-y-1.5">
             <p className="text-xs text-gray-500 dark:text-gray-400">
@@ -1018,43 +1018,31 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
             ))}
           </div>
         )}
-        {visibleSearchResults.length === 0 && lastSearchQuery && !loading && inventoryReady && memoryLoadState.inventory === 'ready' && (
+        {visibleSearchResults.length === 0 && lastSearchQuery && lastSearchRetrieval && !loading && (
           <p className="text-sm text-gray-500 text-center py-4">{t('memory.noResults')}</p>
         )}
 
         {visibleMemories.length > 0 ? (
-          <div className="space-y-1.5 max-h-[420px] overflow-y-auto pr-1">
-            {visibleMemories.map((m) => (
-              <MemoryCard key={m.id} memory={m} ranking={importance[m.id]} pinDisabled={memoryLoadState.importance !== 'ready'} onPin={handlePinMemory} onEdit={openEdit} onDelete={handleDelete} />
-            ))}
-          </div>
+          <VirtualList items={visibleMemories} getKey={memoryKey} active={active}
+            className="max-h-[420px] pr-1" estimateHeight={140} gap={6}
+            resetKey={selectedMemoryDomainId} aria-label={t('memory.storageTitle')}
+            renderItem={(m) => <MemoryCard memory={m} ranking={importance[m.id]} pinDisabled={memoryLoadState.importance !== 'ready'} onPin={handlePinMemory} onEdit={openEdit} onDelete={handleDelete} />} />
         ) : inventoryReady && memoryLoadState.inventory === 'ready' && (
           <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-6">{selectedMemoryDomainId === 'all' ? t('memory.empty') : t('memory.domainEmpty')}</p>
         )}
 
-        {/* L1 清洗与去重：作为可检索记忆的子项；不是 L2/L3 的层级巩固。 */}
-        <div className="border-t border-gray-100 pt-3 dark:border-gray-700">
-          <div className="flex flex-wrap items-center gap-4">
-            <div className="flex-1">
-            <h3 className="text-xs font-semibold text-gray-700 dark:text-gray-200">{t('memory.consolidateTitle')}</h3>
-            <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{t('memory.consolidateHint')}</p>
-            </div>
-            <button type="button" onClick={() => setConsolidationOpen((open) => !open)} aria-expanded={consolidationOpen} className="inline-flex items-center gap-1 rounded-md border border-gray-300 px-2.5 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700">{consolidationOpen ? t('memory.ingestCollapse') : t('memory.consolidateView')}{consolidationOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}</button>
-            {consolidationOpen &&
-            <button
-            onClick={handleDreaming}
-            disabled={consolidating}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white text-sm font-medium"
-            >
-            {consolidating ? <Loader2 size={15} className="animate-spin" /> : <MoonStar size={15} />}
-            {consolidating ? t('memory.consolidateWorking') : t('memory.consolidateStart')}
-            </button>
-            }
-          </div>
-          {consolidationOpen && <>{consolidating && <p className="mt-3 rounded-md bg-violet-500/10 px-2.5 py-2 text-xs text-violet-800 dark:text-violet-200">{consolidationProgress ?? t('memory.dreamInProgress')}<span className="ml-1.5 inline-block animate-pulse">…</span></p>}
-          {consolidationResult && <div className={`mt-3 rounded-md px-2.5 py-2.5 text-xs ${consolidationResult.kind === 'ok' ? 'bg-green-500/10 text-green-800 dark:text-green-200' : 'bg-red-500/10 text-red-800 dark:text-red-200'}`}><p>{consolidationResult.text}</p>{consolidationResult.result && <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-green-700 dark:text-green-300"><span>{t('memory.dreamSummaryScanned', { count: consolidationResult.result.scopes })}</span><span>{t('memory.dreamSummaryClusters', { count: consolidationResult.result.clusters })}</span><span>{t('memory.dreamSummaryActions', { count: consolidationResult.result.actions })}</span><span>{t('memory.dreamSummaryCount', { before: consolidationResult.result.before_count, after: consolidationResult.result.after_count })}</span></div>}{consolidationResult.kind === 'ok' && consolidationResult.result?.snapshot_id && <button onClick={() => { void handleRestoreConsolidation() }} disabled={restoringConsolidation} className="mt-2 inline-flex items-center gap-1 rounded border border-green-700/30 px-2 py-1 font-medium text-green-800 hover:bg-green-500/10 disabled:opacity-50 dark:text-green-200">{restoringConsolidation ? <Loader2 size={12} className="animate-spin" /> : <History size={12} />}{restoringConsolidation ? t('memory.dreamRestoring') : t('memory.dreamRestore')}</button>}</div>}</>}
-        </div>
+        <MemoryRefinementPanel
+          domains={memoryDomains}
+          onChanged={handleRefinementChanged}
+        />
       </section>
+
+      {recallInspector && <MemoryRecallInspector
+        initialRequestId={recallInspector.requestId}
+        evidenceAccess={lastSearchEvidenceAccess}
+        onClose={() => setRecallInspector(null)}
+        onRerun={handleTraceRerun}
+      />}
 
       {/* 编辑弹窗 */}
       {editing && (

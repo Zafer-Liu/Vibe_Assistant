@@ -142,8 +142,8 @@ fn normalize_config(mut config: MemoryDomainConfig) -> Result<MemoryDomainConfig
     Ok(config)
 }
 
-fn load_config(store: &TelemetryStore) -> Result<MemoryDomainConfig, String> {
-    let saved = store.app_setting_get::<MemoryDomainConfig>(JEV_CONFIG_SETTING_KEY);
+pub(crate) fn load_config(store: &TelemetryStore) -> Result<MemoryDomainConfig, String> {
+    let saved = store.app_setting_get_readonly::<MemoryDomainConfig>(JEV_CONFIG_SETTING_KEY);
     let mut config = saved.unwrap_or_default();
     let stored_key_present = !config.api_key.trim().is_empty();
     if config.provider == "jev" && !stored_key_present {
@@ -239,43 +239,45 @@ impl DecisionClient {
         Ok(Self { config })
     }
 
+    fn http_client(&self, timeout_override: Option<Duration>) -> Result<reqwest::Client, String> {
+        let configured = Duration::from_millis(self.config.timeout_ms);
+        let timeout = timeout_override.unwrap_or(configured).min(configured);
+        let mut builder = reqwest::Client::builder().timeout(timeout);
+        // Local model traffic must stay local; cloud decisions retain the
+        // user's proxy settings, which can be required for provider access.
+        let loopback = reqwest::Url::parse(&self.config.endpoint).ok().is_some_and(|url| {
+            url.host_str().is_some_and(|host| host.eq_ignore_ascii_case("localhost")
+                || host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()))
+        });
+        if loopback { builder = builder.no_proxy(); }
+        builder.build().map_err(|error| error.to_string())
+    }
+
     async fn system_one_async(
         &self,
         state: String,
         questions: Map<String, Value>,
         timeout_override: Option<Duration>,
     ) -> Result<Value, String> {
-        let config = self.config.clone();
-        tokio::task::spawn_blocking(move || {
-            let timeout = timeout_override
-                .unwrap_or_else(|| Duration::from_millis(config.timeout_ms))
-                .min(Duration::from_millis(config.timeout_ms));
-            let client = reqwest::blocking::Client::builder()
-                .timeout(timeout)
-                .build()
-                .map_err(|e| e.to_string())?;
-            let response = client.post(&config.endpoint)
-                .bearer_auth(&config.api_key)
-                .json(&json!({
-                    "state": state,
-                    "model": config.model,
-                    "questions": Value::Object(questions),
-                }))
-                .send()
-                .map_err(|e| {
-                    if e.is_timeout() { "JEV 请求超时".into() } else { e.to_string() }
-                })?;
-            let status = response.status();
-            let text = response.text().map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                let excerpt = text.chars().take(500).collect::<String>()
-                    .replace(&config.api_key, "[key]");
-                return Err(format!("JEV HTTP {status}: {excerpt}"));
-            }
-            serde_json::from_str(&text).map_err(|e| format!("JEV 响应不是有效 JSON: {e}"))
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        let config = &self.config;
+        let client = self.http_client(timeout_override)?;
+        // Native async I/O is cancelled when the routing deadline drops this
+        // future; dropping a spawn_blocking handle cannot stop its HTTP job.
+        let response = client.post(&config.endpoint)
+            .bearer_auth(&config.api_key)
+            .json(&json!({ "state": state, "model": config.model, "questions": Value::Object(questions) }))
+            .send().await.map_err(|error| {
+                if error.is_timeout() { "JEV 请求超时".into() } else { error.to_string() }
+            })?;
+        let status = response.status();
+        let text = response.text().await.map_err(|error| {
+            if error.is_timeout() { "JEV 请求超时".into() } else { error.to_string() }
+        })?;
+        if !status.is_success() {
+            let excerpt = text.chars().take(500).collect::<String>().replace(&config.api_key, "[key]");
+            return Err(format!("JEV HTTP {status}: {excerpt}"));
+        }
+        serde_json::from_str(&text).map_err(|error| format!("JEV 响应不是有效 JSON: {error}"))
     }
 
     /// Ollama adapts the same decision contracts through constrained JSON chat.
@@ -287,57 +289,41 @@ impl DecisionClient {
         instructions: String,
         timeout_override: Option<Duration>,
     ) -> Result<Value, String> {
-        let config = self.config.clone();
-        tokio::task::spawn_blocking(move || {
-            let timeout = timeout_override
-                .unwrap_or_else(|| Duration::from_millis(config.timeout_ms))
-                .min(Duration::from_millis(config.timeout_ms));
-            let client = reqwest::blocking::Client::builder()
-                .timeout(timeout)
-                .build()
-                .map_err(|e| e.to_string())?;
-            let request = client.post(format!("{}/api/chat", config.endpoint))
-                .json(&json!({
-                    "model": config.model,
-                    "messages": [
-                        { "role": "system", "content": instructions },
-                        { "role": "user", "content": state },
-                    ],
-                    "stream": false,
-                    "format": "json",
-                    "options": { "temperature": 0 },
-                }));
-            // A preserved TypeSafe credential is never an Ollama credential.
-            // Ollama authentication, if needed later, must use a separate secret.
-            let response = request.send().map_err(|e| {
-                if e.is_timeout() { "Ollama 请求超时".into() } else { e.to_string() }
-            })?;
-            let status = response.status();
-            let text = response.text().map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                let excerpt = text.chars().take(500).collect::<String>();
-                let excerpt = if config.api_key.is_empty() {
-                    excerpt
-                } else {
-                    excerpt.replace(&config.api_key, "[key]")
-                };
-                return Err(format!("Ollama HTTP {status}: {excerpt}"));
-            }
-            let envelope: Value = serde_json::from_str(&text)
-                .map_err(|e| format!("Ollama 响应不是有效 JSON: {e}"))?;
-            if let Some(error) = envelope.get("error").and_then(Value::as_str) {
-                return Err(format!("Ollama: {error}"));
-            }
-            let content = envelope.pointer("/message/content").and_then(Value::as_str)
-                .ok_or_else(|| "Ollama 响应缺少 message.content".to_string())?;
-            let normalized = content.trim()
-                .trim_start_matches("```json").trim_start_matches("```")
-                .trim_end_matches("```").trim();
-            serde_json::from_str(normalized)
-                .map_err(|e| format!("Ollama 决策内容不是有效 JSON: {e}"))
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        let config = &self.config;
+        let client = self.http_client(timeout_override)?;
+        let request = client.post(format!("{}/api/chat", config.endpoint))
+            .json(&json!({
+                "model": config.model,
+                "messages": [
+                    { "role": "system", "content": instructions },
+                    { "role": "user", "content": state },
+                ],
+                "stream": false,
+                "format": "json",
+                "options": { "temperature": 0 },
+            }));
+        // A preserved TypeSafe credential is never an Ollama credential.
+        // Ollama authentication, if needed later, must use a separate secret.
+        let response = request.send().await.map_err(|error| {
+            if error.is_timeout() { "Ollama 请求超时".into() } else { error.to_string() }
+        })?;
+        let status = response.status();
+        let text = response.text().await.map_err(|error| {
+            if error.is_timeout() { "Ollama 请求超时".into() } else { error.to_string() }
+        })?;
+        if !status.is_success() {
+            let excerpt = text.chars().take(500).collect::<String>();
+            let excerpt = if config.api_key.is_empty() { excerpt } else { excerpt.replace(&config.api_key, "[key]") };
+            return Err(format!("Ollama HTTP {status}: {excerpt}"));
+        }
+        let envelope: Value = serde_json::from_str(&text)
+            .map_err(|error| format!("Ollama 响应不是有效 JSON: {error}"))?;
+        if let Some(error) = envelope.get("error").and_then(Value::as_str) { return Err(format!("Ollama: {error}")); }
+        let content = envelope.pointer("/message/content").and_then(Value::as_str)
+            .ok_or_else(|| "Ollama 响应缺少 message.content".to_string())?;
+        let normalized = content.trim().trim_start_matches("```json").trim_start_matches("```")
+            .trim_end_matches("```").trim();
+        serde_json::from_str(normalized).map_err(|error| format!("Ollama 决策内容不是有效 JSON: {error}"))
     }
 
 }
@@ -596,6 +582,13 @@ pub(crate) async fn route_query_async(
     mode: &str,
     timeout_ms: Option<u64>,
 ) -> Result<DomainRoute, String> {
+    route_query_with_config_async(store, query, explicit_domains, mode, timeout_ms, None).await
+}
+
+pub(crate) async fn route_query_with_config_async(
+    store: &TelemetryStore, query: &str, explicit_domains: Option<&[String]>, mode: &str,
+    timeout_ms: Option<u64>, evaluation_config: Option<MemoryDomainConfig>,
+) -> Result<DomainRoute, String> {
     if !matches!(mode, "auto" | "manual" | "off") {
         return Err("domain_mode 只能是 auto / manual / off".into());
     }
@@ -621,7 +614,7 @@ pub(crate) async fn route_query_async(
             probabilities: HashMap::new(), confidence: Some(1.0), fallback: None,
         });
     }
-    let config = load_config(store)?;
+    let config = match evaluation_config { Some(config) => config, None => load_config(store)? };
     let client = match DecisionClient::new(config.clone()) {
         Ok(client) => client,
         Err(error) => {
@@ -752,9 +745,10 @@ async fn memory_domain_backfill_inner(max_items: u32, retag: bool) -> Result<Mem
     for item in &items {
         let mut batch = classify_memory_batch_async(&store, std::slice::from_ref(item)).await?;
         let domains = batch.pop().ok_or("分类结果缺少当前记忆")?;
-        save_classification_async(&store, item, &domains).await?;
-        tagged += if domains.is_empty() { 0 } else { 1 };
-        processed += 1;
+        if save_classification_async(&store, item, &domains).await? {
+            tagged += if domains.is_empty() { 0 } else { 1 };
+            processed += 1;
+        }
     }
     let remaining = if retag {
         total_candidates.saturating_sub(processed)
@@ -862,7 +856,7 @@ async fn save_classification_async(
     store: &TelemetryStore,
     item: &LocalMemorySnapshot,
     assignments: &[MemoryDomainAssignment],
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let store = store.clone();
     let item = item.clone();
     let assignments = assignments.to_vec();
@@ -880,18 +874,26 @@ async fn tag_one_batch_with_store(store: &TelemetryStore, items: &[LocalMemorySn
         }
         let mut batch = classify_memory_batch_async(store, std::slice::from_ref(item)).await?;
         let assignments = batch.pop().ok_or("分类结果缺少当前记忆")?;
-        save_classification_async(store, item, &assignments).await?;
-        processed += 1;
+        if save_classification_async(store, item, &assignments).await? {
+            processed += 1;
+        }
     }
     Ok(processed)
 }
 
-/// Classify exactly one bounded set of L1 memories. The caller owns batching
-/// and progress reporting; this command is retryable and idempotent for the
-/// provided ids.
+/// Classify one bounded set of L1 memories. Queue ids may have disappeared or
+/// become ineligible since the caller read progress; skip those and keep working.
+/// Saved checkpoints make retries idempotent for unchanged memories.
 #[tauri::command]
 pub async fn memory_domain_classify_batch(
     memory_ids: Vec<String>,
+) -> Result<MemoryDomainClassifyBatchResult, String> {
+    classify_batch_with_store(&domain_store()?, &memory_ids).await
+}
+
+async fn classify_batch_with_store(
+    store: &TelemetryStore,
+    memory_ids: &[String],
 ) -> Result<MemoryDomainClassifyBatchResult, String> {
     if memory_ids.is_empty() {
         return Err("memory_ids 不能为空".into());
@@ -899,29 +901,23 @@ pub async fn memory_domain_classify_batch(
     if memory_ids.len() > 200 {
         return Err("memory_ids 最多一次处理 200 条".into());
     }
-    let store = domain_store()?;
-    let durable = store.local_l1_memory_snapshot()?.into_iter()
-        .filter(|item| !item.user_defined)
-        .collect::<Vec<_>>();
     let mut seen = HashSet::new();
-    for id in &memory_ids {
+    for id in memory_ids {
         if !seen.insert(id.as_str()) {
             return Err("memory_ids 存在重复项".into());
         }
     }
+    let durable = store.local_l1_memory_snapshot()?.into_iter()
+        .filter(|item| !item.user_defined)
+        .collect::<Vec<_>>();
     let by_id = durable.iter()
         .map(|item| (item.id.as_str(), item))
         .collect::<HashMap<_, _>>();
-    for id in &memory_ids {
-        if by_id.get(id.as_str()).is_none() {
-            return Err(format!("memory_id 不存在或属于用户手动添加记忆: {id}"));
-        }
-    }
     let items = memory_ids.iter()
         .filter_map(|id| by_id.get(id.as_str()))
         .map(|item| (*item).clone())
         .collect::<Vec<_>>();
-    let processed = tag_one_batch_with_store(&store, &items).await? as u32;
+    let processed = tag_one_batch_with_store(store, &items).await? as u32;
     Ok(MemoryDomainClassifyBatchResult { total: items.len() as u32, processed })
 }
 
@@ -966,10 +962,11 @@ pub fn memory_domain_links(
 }
 
 #[tauri::command]
-pub fn memory_domain_links_map(
+pub async fn memory_domain_links_map(
     store: tauri::State<'_, crate::telemetry_store::TelemetryStore>,
 ) -> Result<HashMap<String, Vec<String>>, String> {
-    let conn = store.conn.lock().map_err(|_| "telemetry store lock poisoned".to_string())?;
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.with_read_connection(|conn| {
     let mut statement = conn.prepare(
         "SELECT memory_id, domain_id FROM local_memory_domains ORDER BY memory_id, weight DESC",
     ).map_err(|e| e.to_string())?;
@@ -985,16 +982,146 @@ pub fn memory_domain_links_map(
         }
     }
     Ok(map)
+    })).await.map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn memory_domain_list() -> Result<Vec<crate::telemetry_store::MemoryDomain>, String> {
-    domain_store()?.memory_domains()
+pub async fn memory_domain_list() -> Result<Vec<crate::telemetry_store::MemoryDomain>, String> {
+    tauri::async_runtime::spawn_blocking(|| domain_store()?.memory_domains())
+        .await.map_err(|error| error.to_string())?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One bounded local HTTP request; None waits for client cancellation.
+    fn decision_server(reply: Option<(Duration, Value)>) -> (
+        String, std::sync::mpsc::Receiver<String>, std::thread::JoinHandle<bool>,
+    ) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let (sender, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline { return false; }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return false,
+                }
+            };
+            // Accepted sockets inherit nonblocking mode on Windows.
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0; 4096];
+            let header_end = loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => return false,
+                    Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                }
+                if bytes.len() > 64 * 1024 { return false; }
+                if let Some(index) = bytes.windows(4).position(|chunk| chunk == b"\r\n\r\n") { break index + 4; }
+            };
+            let length = String::from_utf8_lossy(&bytes[..header_end]).lines().find_map(|line| {
+                line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|value| value.trim().parse::<usize>().ok())
+            }).unwrap_or(0);
+            if length > 64 * 1024 { return false; }
+            while bytes.len() < header_end + length {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => return false,
+                    Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                }
+            }
+            let _ = sender.send(String::from_utf8_lossy(&bytes).into_owned());
+            if let Some((delay, body)) = reply {
+                std::thread::sleep(delay);
+                let body = body.to_string();
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(response.as_bytes()).is_ok()
+            } else {
+                // A cancelled async request must release its socket rather
+                // than retaining a blocking HTTP job for the full timeout.
+                match stream.read(&mut buffer) {
+                    Ok(0) => true,
+                    Err(error) => matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted),
+                    _ => false,
+                }
+            }
+        });
+        (endpoint, received, worker)
+    }
+
+    fn decision_config(provider: &str, endpoint: String) -> MemoryDomainConfig {
+        MemoryDomainConfig { enabled: true, provider: provider.into(), endpoint,
+            api_key: "test-jev-secret".into(), timeout_ms: 5_000, ..Default::default() }
+    }
+
+    #[test]
+    fn routing_accepts_a_valid_decision_that_takes_more_than_one_second() {
+        let (endpoint, _, worker) = decision_server(Some((Duration::from_millis(1_150), json!({
+            "answers": { "domain_route": { "choice": "work", "probabilities": { "work": 0.99 }, "confidence": 0.99 } }
+        }))));
+        let store = TelemetryStore::in_memory();
+        store.app_setting_set(JEV_CONFIG_SETTING_KEY, &decision_config("jev", endpoint)).unwrap();
+        let route = tauri::async_runtime::block_on(route_query_async(
+            &store, "Organize reusable project workflows", None, "auto", Some(2_500),
+        )).unwrap();
+        assert_eq!(route.active_domains, ["work"]);
+        assert!(route.fallback.is_none());
+        assert!(worker.join().unwrap());
+    }
+
+    #[test]
+    fn routing_cancellation_closes_the_in_flight_http_request() {
+        let (endpoint, received, worker) = decision_server(None);
+        let client = DecisionClient::new(decision_config("jev", endpoint)).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let task = runtime.spawn(async move {
+            client.system_one_async("test routing".into(), Map::new(), None).await
+        });
+        received.recv_timeout(Duration::from_secs(3)).unwrap();
+        task.abort();
+        assert!(runtime.block_on(task).unwrap_err().is_cancelled());
+        assert!(worker.join().unwrap(), "cancelled routing must not leave blocking HTTP work running");
+    }
+
+    #[test]
+    fn routing_timeout_falls_back_globally_within_the_override_budget() {
+        let (endpoint, _, worker) = decision_server(None);
+        let store = TelemetryStore::in_memory();
+        store.app_setting_set(JEV_CONFIG_SETTING_KEY, &decision_config("jev", endpoint)).unwrap();
+        let started = std::time::Instant::now();
+        let route = tauri::async_runtime::block_on(route_query_async(
+            &store, "test query", None, "auto", Some(100),
+        )).unwrap();
+        assert!(route.active_domains.is_empty());
+        assert!(route.fallback.is_some());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(worker.join().unwrap());
+    }
+
+    #[test]
+    fn routing_ollama_preserves_the_json_contract_without_sending_a_jev_key() {
+        let (endpoint, received, worker) = decision_server(Some((Duration::ZERO, json!({
+            "message": { "content": "{\"domains\":[{\"id\":\"work\",\"probability\":0.9}],\"confidence\":0.9}" }
+        }))));
+        let client = DecisionClient::new(decision_config("ollama", endpoint)).unwrap();
+        let response = tauri::async_runtime::block_on(client.ollama_chat_async(
+            "query".into(), "Return JSON".into(), Some(Duration::from_secs(2)),
+        )).unwrap();
+        assert_eq!(response["domains"][0]["id"], "work");
+        let request = received.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!request.contains("test-jev-secret"));
+        assert!(!request.to_ascii_lowercase().contains("\r\nauthorization:"));
+        assert!(worker.join().unwrap());
+    }
 
     #[test]
     fn tagging_keeps_at_most_three_domains_above_threshold() {
@@ -1117,9 +1244,70 @@ mod tests {
         assert!(store.completed_memory_domain_classification_ids().unwrap().contains("first"));
         store.update_local_l1_memory("first", "Edited while classification was in flight").unwrap();
         assert!(!store.completed_memory_domain_classification_ids().unwrap().contains("first"));
-        // The old response cannot mark the new text as complete.
-        assert!(store.save_memory_domain_classification(&item, &[]).is_err());
+        // The old response is skipped without interrupting the batch or marking
+        // the new text as complete.
+        assert!(!store.save_memory_domain_classification(&item, &[]).unwrap());
         assert!(!store.completed_memory_domain_classification_ids().unwrap().contains("first"));
+    }
+
+    #[test]
+    fn classification_batch_continues_past_deleted_and_manual_ids() {
+        let store = classification_test_store();
+        store.delete_local_l1_memory("second").unwrap();
+        store.conn.lock().unwrap().execute(
+            "UPDATE local_memory_items SET user_defined = 1 WHERE id = 'third'", [],
+        ).unwrap();
+        let (endpoint, received, worker) = decision_server(Some((Duration::ZERO, json!({
+            "message": { "content": "{\"domains\":[]}" }
+        }))));
+        store.app_setting_set(JEV_CONFIG_SETTING_KEY, &decision_config("ollama", endpoint)).unwrap();
+        let result = tauri::async_runtime::block_on(classify_batch_with_store(
+            &store, &["missing".into(), "second".into(), "third".into(), "first".into()],
+        )).unwrap();
+        assert_eq!((result.total, result.processed), (1, 1));
+        assert!(received.recv_timeout(Duration::from_secs(1)).unwrap().contains("first"));
+        assert!(worker.join().unwrap());
+        let status = classification_status_with_store(&store).unwrap();
+        assert_eq!((status.total, status.processed), (1, 1));
+        assert!(status.pending_ids.is_empty());
+    }
+
+    #[test]
+    fn classification_batch_with_only_missing_ids_does_not_call_the_model() {
+        let store = classification_test_store();
+        store.delete_local_l1_memory("first").unwrap();
+        // Model configuration is disabled. A stale-only queue must still succeed.
+        let result = tauri::async_runtime::block_on(classify_batch_with_store(
+            &store, &["first".into(), "missing".into()],
+        )).unwrap();
+        assert_eq!((result.total, result.processed), (0, 0));
+        let status = classification_status_with_store(&store).unwrap();
+        assert_eq!((status.total, status.processed), (2, 0));
+    }
+
+    #[test]
+    fn classification_save_skips_memories_deleted_or_made_manual_in_flight() {
+        let store = classification_test_store();
+        let deleted = classification_test_item(&store, "first");
+        let manual = classification_test_item(&store, "second");
+        store.delete_local_l1_memory("first").unwrap();
+        store.conn.lock().unwrap().execute(
+            "UPDATE local_memory_items SET user_defined = 1 WHERE id = 'second'", [],
+        ).unwrap();
+        for item in [deleted, manual] {
+            assert!(!store.save_memory_domain_classification(&item, &[MemoryDomainAssignment {
+                domain_id: "study".into(), weight: 0.9,
+            }]).unwrap());
+        }
+        assert!(store.memory_ids_for_domains(&["study".into()]).unwrap().is_empty());
+        let checkpoint_count: i64 = store.conn.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM memory_domain_classification_state", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(checkpoint_count, 0);
+        let third = classification_test_item(&store, "third");
+        assert!(store.save_memory_domain_classification(&third, &[]).unwrap());
+        let status = classification_status_with_store(&store).unwrap();
+        assert_eq!((status.total, status.processed), (1, 1));
     }
 
     #[test]

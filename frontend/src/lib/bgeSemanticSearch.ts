@@ -7,7 +7,6 @@ const ZH_MODEL = 'Xenova/bge-small-zh-v1.5'
 const EN_MODEL = 'Xenova/bge-small-en-v1.5'
 
 const extractors = new Map<string, Promise<Extractor>>()
-const vectors = new Map<string, { content: string, vector: Float32Array }>()
 
 function hasChinese(text: string) {
   return /[一-鿿]/.test(text)
@@ -39,7 +38,8 @@ function cosine(left: Float32Array, right: Float32Array) {
   let dot = 0
   let leftNorm = 0
   let rightNorm = 0
-  const size = Math.min(left.length, right.length)
+  if (left.length !== right.length) throw new Error('BGE 向量维度不一致')
+  const size = left.length
   for (let index = 0; index < size; index += 1) {
     dot += left[index] * right[index]
     leftNorm += left[index] * left[index]
@@ -58,7 +58,7 @@ function yieldToUi(): Promise<void> {
 // responsive at the cost of a few more extractor calls.
 const EMBED_CHUNK_SIZE = 16
 
-type RemoteEmbedResult = { vectors: number[][], dimension: number, model: string, latency_ms: number }
+type RemoteEmbedResult = { vectors: number[][], dimension: number, model: string, embedding_space: string, latency_ms: number }
 
 // Tracks the last known availability of the native embedding command. When
 // the backend reports the command as missing or the configured service as
@@ -71,24 +71,31 @@ let remoteEmbeddingDisabled = false
  * falling back to the in-WebView BGE-small models when the command is absent
  * or fails. The fallback keeps older configurations usable.
  */
-async function embedTexts(texts: string[]): Promise<Float32Array[]> {
-  if (texts.length === 0) return []
-  if (!remoteEmbeddingDisabled) {
+type EmbeddingBatch = { vectors: Float32Array[], dimension: number, model: string }
+
+async function embedTexts(texts: string[], fallbackModel?: string): Promise<EmbeddingBatch> {
+  if (texts.length === 0) return { vectors: [], dimension: 0, model: fallbackModel ?? '' }
+  if (!fallbackModel && !remoteEmbeddingDisabled) {
     try {
       const result = await invoke<RemoteEmbedResult>('memory_semantic_embed_texts', { texts })
-      if (Array.isArray(result?.vectors) && result.vectors.length === texts.length) {
-        return result.vectors.map((row) => Float32Array.from(row))
+      if (!result.model || !result.embedding_space || !Number.isInteger(result.dimension) || result.dimension <= 0
+        || !Array.isArray(result.vectors) || result.vectors.length !== texts.length
+        || result.vectors.some((row) => !Array.isArray(row) || row.length !== result.dimension || row.some((value) => !Number.isFinite(value)))) {
+        throw new Error('原生嵌入返回无效模型或维度')
       }
-      // Malformed payload: treat as unavailable for this session.
-      remoteEmbeddingDisabled = true
+      return { vectors: result.vectors.map((row) => Float32Array.from(row)), dimension: result.dimension, model: `native:${result.embedding_space}:${result.dimension}` }
     } catch {
       remoteEmbeddingDisabled = true
     }
   }
-  // Local fallback: pick the model from the first text (callers group by
-  // language, so a batch is effectively single-language).
-  const extractor = await extractorFor(texts[0])
-  return toVectors(await extractor(texts, { pooling: 'mean', normalize: true }))
+  const model = fallbackModel ?? (hasChinese(texts[0]) ? ZH_MODEL : EN_MODEL)
+  const extractor = await extractorFor(model === ZH_MODEL ? '中' : 'en')
+  const vectors = toVectors(await extractor(texts, { pooling: 'mean', normalize: true }))
+  const dimension = vectors[0]?.length ?? 0
+  if (!dimension || vectors.length !== texts.length || vectors.some((vector) => vector.length !== dimension)) {
+    throw new Error('BGE-small 向量数量或维度异常')
+  }
+  return { vectors, dimension, model }
 }
 
 /**
@@ -121,15 +128,33 @@ export async function createBgeConsolidationCandidateBatches(
       processed += group.length
       continue
     }
-    // Embed in small chunks, yielding between them so the UI stays alive.
+    // A native failure or a model change restarts the entire language group
+    // with one fixed fallback model, including chunks already embedded.
     const embedded: Float32Array[] = []
-    for (let start = 0; start < group.length; start += EMBED_CHUNK_SIZE) {
+    const groupStart = processed
+    let identity: Pick<EmbeddingBatch, 'model' | 'dimension'> | undefined
+    let fallbackModel: string | undefined
+    for (let start = 0; start < group.length;) {
       const slice = group.slice(start, start + EMBED_CHUNK_SIZE)
-      embedded.push(...await embedTexts(slice.map((memory) => memory.memory)))
-      processed += slice.length
-      onProgress?.(Math.min(processed, total), total)
-      if (start + EMBED_CHUNK_SIZE < group.length) await yieldToUi()
+      const batch = await embedTexts(slice.map((memory) => memory.memory), fallbackModel)
+      if (identity && (identity.model !== batch.model || identity.dimension !== batch.dimension)) {
+        if (fallbackModel) throw new Error('BGE fallback 模型或维度在组内发生变化')
+        fallbackModel = hasChinese(group[0].memory) ? ZH_MODEL : EN_MODEL
+        embedded.length = 0
+        identity = undefined
+        start = 0
+        await yieldToUi()
+        continue
+      }
+      identity = batch
+      // Keep every later fallback batch pinned to the first fallback model.
+      if (!batch.model.startsWith('native:')) fallbackModel = batch.model
+      embedded.push(...batch.vectors)
+      start += slice.length
+      onProgress?.(Math.min(groupStart + start, total), total)
+      if (start < group.length) await yieldToUi()
     }
+    processed += group.length
     const neighbours = group.map(() => [] as Array<{ index: number, score: number }>)
     let pairChecks = 0
     for (let left = 0; left < group.length; left += 1) {
@@ -173,25 +198,4 @@ export async function createBgeConsolidationCandidateBatches(
     if (unique.size >= 2) batches.push([...unique.values()])
   }
   return batches
-}
-
-/**
- * Semantic recall for the memory library. Prefers the configured embedding
- * service via `memory_semantic_embed_texts`; falls back to fully local
- * BGE-small inference in the WebView (model fetched on first use and retained
- * by the WebView cache) so older configurations keep working.
- */
-export async function searchMemoriesWithBge(query: string, memories: MemoryItem[], limit: number): Promise<MemoryItem[]> {
-  const trimmed = query.trim()
-  if (!trimmed || memories.length === 0) return []
-  const missing = memories.filter((memory) => vectors.get(memory.id)?.content !== memory.memory)
-  if (missing.length) {
-    const embedded = await embedTexts(missing.map((memory) => memory.memory))
-    missing.forEach((memory, index) => vectors.set(memory.id, { content: memory.memory, vector: embedded[index] }))
-  }
-  const [queryVector] = await embedTexts([trimmed])
-  return memories
-    .map((memory) => ({ ...memory, score: cosine(queryVector, vectors.get(memory.id)!.vector), retrieval_source: 'local' as const, retrieval_method: 'semantic' as const }))
-    .sort((left, right) => (right.score ?? 0) - (left.score ?? 0))
-    .slice(0, limit)
 }

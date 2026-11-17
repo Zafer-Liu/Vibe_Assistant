@@ -7,11 +7,12 @@ import type { SkillAdoptResult, SkillDocument, SkillDriftFile, SkillItem, SkillP
 interface SkillStore {
   skills: SkillItem[]
   skillCacheReady: boolean
+  skillRevision: number
   scanSkills: () => Promise<SkillItem[]>
   loadSkills: (force?: boolean) => Promise<SkillItem[]>
   readSkill: (source: string, name: string) => Promise<SkillDocument>
   skillDriftDetail: (target: string, source: string, name: string) => Promise<SkillDriftFile[]>
-  publishedDrift: () => Promise<SkillPublishedDrift[]>
+  publishedDrift: (signal?: AbortSignal) => Promise<SkillPublishedDrift[]>
   adoptLocalSkill: (target: string, source: string, name: string) => Promise<SkillAdoptResult>
   applySkillSyncOne: (target: string, source: string, name: string) => Promise<SkillItem>
   previewSkillSync: (target: string) => Promise<SkillSyncPreview>
@@ -25,100 +26,164 @@ interface SkillStore {
   deleteSkill: (source: string, name: string) => Promise<void>
 }
 
-export const useSkillStore = create<SkillStore>((set, get) => ({
-  skills: [],
+export const useSkillStore = create<SkillStore>((set, get) => {
+  let revision = 0
+  let cachedRevision = -1
+  let pendingMutations = 0
+  let mutationsSettled = Promise.resolve()
+  let finishMutations: (() => void) | undefined
+  let listRequest: Promise<SkillItem[]> | undefined
+  let driftRequest: { revision: number; promise: Promise<SkillPublishedDrift[]> } | undefined
 
-  skillCacheReady: false,
+  // Reads spanning a write are retried after all writes settle. Per-item responses
+  // still reach the visible catalog immediately, before a full-list refresh.
+  async function mutate<T>(run: () => Promise<T>, apply?: (result: T) => void): Promise<T> {
+    if (pendingMutations === 0) mutationsSettled = new Promise<void>((resolve) => { finishMutations = resolve })
+    pendingMutations += 1
+    revision += 1
+    try {
+      const result = await run()
+      apply?.(result)
+      return result
+    } finally {
+      revision += 1
+      pendingMutations -= 1
+      set({ skillRevision: revision })
+      if (pendingMutations === 0) {
+        finishMutations?.()
+        finishMutations = undefined
+      }
+    }
+  }
 
-  async scanSkills() {
-    const imported = await skillApi.skillScan()
-    // 扫描返回值仅用于提示数量；列表数据以共享库缓存为准重新加载，
-    // 与其他变更操作保持一致，避免把中间态直接当成目录状态。
-    await get().loadSkills(true)
-    return imported
-  },
+  function updateItems(items: SkillItem[]) {
+    const updated = new Map(items.map((item) => [`${item.source}:${item.name}`, item]))
+    set({ skills: get().skills.map((item) => updated.get(`${item.source}:${item.name}`) ?? item) })
+  }
 
-  async loadSkills(force = false) {
-    if (!force && get().skillCacheReady) return get().skills
-    const skills = await skillApi.skillList()
-    set({ skills, skillCacheReady: true })
-    return skills
-  },
+  function checkAborted(signal?: AbortSignal) {
+    if (signal?.aborted) throw new DOMException('Skill read cancelled', 'AbortError')
+  }
 
-  async readSkill(source, name) {
-    return skillApi.skillRead({ source, name })
-  },
+  async function readCurrent<T>(read: () => Promise<T>, signal?: AbortSignal, apply?: (result: T) => void): Promise<T> {
+    for (;;) {
+      await mutationsSettled
+      checkAborted(signal)
+      if (pendingMutations > 0) continue
+      const startedAt = revision
+      try {
+        const result = await read()
+        checkAborted(signal)
+        if (pendingMutations === 0 && startedAt === revision) {
+          apply?.(result)
+          return result
+        }
+      } catch (error) {
+        checkAborted(signal)
+        if (pendingMutations === 0 && startedAt === revision) throw error
+      }
+    }
+  }
 
-  async skillDriftDetail(target, source, name) {
-    return skillApi.skillDriftDetail({ target, source, name })
-  },
+  return {
+    skills: [],
+    skillCacheReady: false,
+    skillRevision: 0,
 
-  async publishedDrift() {
-    return skillApi.skillPublishedDrift()
-  },
+    async scanSkills() {
+      const imported = await mutate(() => skillApi.skillScan())
+      // 扫描返回值仅用于提示数量；完整目录仍以共享库重新读取为准。
+      await get().loadSkills(true)
+      return imported
+    },
 
-  async adoptLocalSkill(target, source, name) {
-    const result = await skillApi.skillAdoptLocal({ target, source, name })
-    set({ skills: get().skills.map(s => s.source === result.item.source && s.name === result.item.name ? result.item : s) })
-    return result
-  },
+    async loadSkills(force = false) {
+      // Force bypasses the settled cache, but joins any live full-list read.
+      // Pages force one revalidation per activation; no TTL masks external edits.
+      if (listRequest) return listRequest
+      if (!force && pendingMutations === 0 && cachedRevision === revision && get().skillCacheReady) return get().skills
+      const request = readCurrent(() => skillApi.skillList(), undefined, (skills) => {
+        cachedRevision = revision
+        set({ skills, skillCacheReady: true })
+      })
+      listRequest = request
+      const clear = () => { if (listRequest === request) listRequest = undefined }
+      void request.then(clear, clear)
+      return request
+    },
 
-  async applySkillSyncOne(target, source, name) {
-    const item = await skillApi.skillSyncApplyOne({ target, source, name })
-    set({ skills: get().skills.map(s => s.source === item.source && s.name === item.name ? item : s) })
-    return item
-  },
+    async readSkill(source, name) {
+      return skillApi.skillRead({ source, name })
+    },
 
-  async previewSkillSync(target) {
-    return skillApi.skillSyncPreview({ target })
-  },
+    async skillDriftDetail(target, source, name) {
+      return skillApi.skillDriftDetail({ target, source, name })
+    },
 
-  async applySkillSync(target, overwrite) {
-    const result = await skillApi.skillSyncApply({ target, overwrite })
-    return result
-  },
+    async publishedDrift(signal) {
+      // Only concurrent reads share results. An aborted hidden-page consumer
+      // cannot start another IPC read after a mutation invalidates its response.
+      return readCurrent(() => {
+        if (driftRequest?.revision === revision) return driftRequest.promise
+        const request = { revision, promise: skillApi.skillPublishedDrift() }
+        driftRequest = request
+        const clear = () => { if (driftRequest === request) driftRequest = undefined }
+        void request.promise.then(clear, clear)
+        return request.promise
+      }, signal)
+    },
 
-  async setSkillStatus(source, name, status) {
-   const item = await skillApi.skillSetStatus({ source, name, status })
-   set({ skills: get().skills.map(s => s.source === item.source && s.name === item.name ? item : s) })
-   return item
- },
+    async adoptLocalSkill(target, source, name) {
+      return mutate(() => skillApi.skillAdoptLocal({ target, source, name }), (result) => updateItems([result.item]))
+    },
 
-  async setSkillAssignment(source, name, target, equipped) {
-   const item = await skillApi.skillSetAssignment({ source, name, target, equipped })
-   set({ skills: get().skills.map(s => s.source === item.source && s.name === item.name ? item : s) })
-   return item
- },
+    async applySkillSyncOne(target, source, name) {
+      return mutate(() => skillApi.skillSyncApplyOne({ target, source, name }), (item) => updateItems([item]))
+    },
 
-  async setSkillStatusBulk(items, status) {
-   const updated = await skillApi.skillSetStatusBulk({ items, status })
-   await get().loadSkills(true)
-   return updated
- },
+    async previewSkillSync(target) {
+      return skillApi.skillSyncPreview({ target })
+    },
 
-  async setSkillAssignmentBulk(items, target, equipped) {
-   const updated = await skillApi.skillSetAssignmentBulk({ items, target, equipped })
-   await get().loadSkills(true)
-   return updated
- },
+    async applySkillSync(target, overwrite) {
+      return mutate(() => skillApi.skillSyncApply({ target, overwrite }))
+    },
 
-  async publishSkill(source, name, assignedAgents) {
-   const item = await skillApi.skillPublish({ source, name, assignedAgents })
-   set({ skills: get().skills.map(s => s.source === item.source && s.name === item.name ? item : s) })
-   return item
- },
+    async setSkillStatus(source, name, status) {
+      return mutate(() => skillApi.skillSetStatus({ source, name, status }), (item) => updateItems([item]))
+    },
 
-  async rollbackSkillLatest(source, name) {
-   const item = await skillApi.skillRollbackLatest({ source, name })
-   set({ skills: get().skills.map(s => s.source === item.source && s.name === item.name ? item : s) })
-   return item
- },
+    async setSkillAssignment(source, name, target, equipped) {
+      return mutate(() => skillApi.skillSetAssignment({ source, name, target, equipped }), (item) => updateItems([item]))
+    },
 
-  async deleteSkill(source, name) {
-   await skillApi.skillDelete({ source, name })
-   set({ skills: get().skills.filter(s => !(s.source === source && s.name === name)) })
- }
-}))
+    async setSkillStatusBulk(items, status) {
+      const updated = await mutate(() => skillApi.skillSetStatusBulk({ items, status }), updateItems)
+      await get().loadSkills(true)
+      return updated
+    },
+
+    async setSkillAssignmentBulk(items, target, equipped) {
+      const updated = await mutate(() => skillApi.skillSetAssignmentBulk({ items, target, equipped }), updateItems)
+      await get().loadSkills(true)
+      return updated
+    },
+
+    async publishSkill(source, name, assignedAgents) {
+      return mutate(() => skillApi.skillPublish({ source, name, assignedAgents }), (item) => updateItems([item]))
+    },
+
+    async rollbackSkillLatest(source, name) {
+      return mutate(() => skillApi.skillRollbackLatest({ source, name }), (item) => updateItems([item]))
+    },
+
+    async deleteSkill(source, name) {
+      await mutate(() => skillApi.skillDelete({ source, name }), () => {
+        set({ skills: get().skills.filter((item) => !(item.source === source && item.name === name)) })
+      })
+    },
+  }
+})
 
 /** Subscribe only to fields owned by this feature. */
 export function useSkillFields<const K extends keyof SkillStore>(...keys: K[]): Pick<SkillStore, K> {

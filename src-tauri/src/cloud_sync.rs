@@ -1111,6 +1111,10 @@ fn pull(
     }
 }
 
+fn automatic_deletion_ids(tombstones: &[RemoteTombstone]) -> Vec<String> {
+    tombstones.iter().filter_map(|tomb| tomb.key.strip_prefix("l1-auto:").map(str::to_string)).collect()
+}
+
 /// 把一批远端对象落地到本地，与传输方式无关：自建服务端、WebDAV、S3 共用同一套
 /// 解密 → 验哈希 → 与本地水位比对 → 落地或记冲突的流程。
 ///
@@ -1184,6 +1188,18 @@ fn apply_remote_objects(
             return false;
         }
         report.pulled += 1;
+    }
+    // Retire old identities before importing any aggregate. Otherwise a stale
+    // source object can briefly reinsert an ID this same envelope has deleted.
+    let deleted_l1_ids = automatic_deletion_ids(tombstones);
+    if !deleted_l1_ids.is_empty() {
+        match store.apply_l1_deletion_tombstones(&deleted_l1_ids) {
+            Ok(applied) => report.pulled += applied as u32,
+            Err(error) => {
+                report.errors.push(format!("l1-auto 删除标记落地失败：{error}"));
+                return false;
+            }
+        }
     }
     // Retags reference L1 IDs: land memories first, regardless of server order.
     let mut ordered_objects: Vec<_> = objects.iter().filter(|obj| obj.key != DOMAIN_CATALOG_KEY).collect();
@@ -1276,16 +1292,7 @@ fn apply_remote_objects(
     // `l1-auto:` 墓碑是用户对提取记忆的删除决策：对所有设备生效——本地行
     // （无论本机提取还是他机镜像）删除并记入本地墓碑表，防重新提取/镜像。
     for tomb in tombstones.iter().cloned() {
-        if let Some(memory_id) = tomb.key.strip_prefix("l1-auto:") {
-            match store.apply_l1_deletion_tombstone(memory_id) {
-                Ok(true) => report.pulled += 1,
-                Ok(false) => {}
-                Err(e) => report
-                    .errors
-                    .push(format!("l1-auto 墓碑落地失败 {e}（{memory_id}）")),
-            }
-            continue;
-        }
+        if tomb.key.starts_with("l1-auto:") { continue; } // Applied atomically before aggregates.
         let Some(id) = tomb.key.strip_prefix("l1-user:") else {
             continue;
         };
@@ -2061,6 +2068,11 @@ fn build_envelope(
         // 见过的最高值也算数，否则别的设备会把新内容当成旧版本。
         .max(store.cloud_sync_max_revision().unwrap_or(0));
     let now = chrono::Utc::now().to_rfc3339();
+    let snapshot: crate::telemetry_store::ExtractedL1Snapshot = store.extracted_l1_sync_snapshot()
+        .map_err(|error| format!("读取 L1 一致性快照失败：{error}"))?;
+    let extracted = snapshot.memories;
+    let mut deleted_l1_ids: Vec<_> = snapshot.deleted_ids.into_iter().collect();
+    deleted_l1_ids.sort();
     // 本地副作用（水位、冲突快照、删除 meta）一律**挂账**，等远端真的写成功才落地。
     // 否则一次网络中断就把本地标记成「已同步」，下一轮会拿云端的旧版本静默回滚刚改的内容。
     let mut pending: Vec<PendingWrite> = Vec::new();
@@ -2215,10 +2227,7 @@ fn build_envelope(
     // 本机记录的 `l1-auto:` 墓碑（用户删除决策）上云：远端还没有的补进
     // 信封，让所有设备在下一轮应用。墓碑只增不减——删除的最终一致性
     // 优先于信封体积；删除是低频操作，量级可控。
-    for memory_id in store
-        .tombstoned_l1_ids()
-        .map_err(|e| format!("读取 L1 删除墓碑失败 {e}"))?
-    {
+    for memory_id in deleted_l1_ids {
         let tomb_key = format!("l1-auto:{memory_id}");
         if tombstones.contains_key(&tomb_key) {
             continue;
@@ -2288,9 +2297,8 @@ fn build_envelope(
     // 全部提取记忆（含 session）：每台设备只写自己的聚合，保留原作用域。
     // 其他设备镜像不重复上报。升级后的完整集合改变内容哈希，使旧镜像自动补齐。
     let agg_key = format!("l1-auto-agg:{}", device.replace(':', "-"));
-    let extracted = store
-        .exportable_extracted_l1_memories()
-        .map_err(|e| format!("{agg_key}: 读取提取记忆失败 {e}"))?;
+    // Reuse the same snapshot as deletion markers, even if a user applies or
+    // undoes another refinement while the rest of this envelope is prepared.
     let agg_plain =
         serde_json::to_vec(&extracted).map_err(|e| format!("{agg_key}: 序列化失败 {e}"))?;
     // 移除旧的本地 4MiB 跳过阈值，避免完整 L1 集合一直停留在旧版本。
@@ -2513,6 +2521,9 @@ fn run_sync_envelope(
             Some((bytes, etag)) => (decode_envelope(&key, &bytes)?, etag),
             None => (VaultEnvelope::default(), None),
         };
+        // Upgrade legacy applied refinements only after the remote envelope
+        // was read successfully, but before its old-ID deletions are applied.
+        store.prepare_refinements_for_cloud_sync(&automatic_deletion_ids(&current.tombstones))?;
         let clean =
             apply_remote_objects(store, &current.objects, &current.tombstones, &key, &mut report);
         if !clean {
@@ -2592,6 +2603,7 @@ fn run_pull_envelope(
     };
     if let Some((bytes, _)) = remote.get()? {
         let envelope = decode_envelope(&key, &bytes)?;
+        store.prepare_refinements_for_cloud_sync(&automatic_deletion_ids(&envelope.tombstones))?;
         if !apply_remote_objects(
             store,
             &envelope.objects,
@@ -3223,6 +3235,24 @@ mod tests {
             rusqlite::params![id, format!("event-{id}"), memory, durability],
         )
         .expect("写入提取记忆");
+    }
+
+    fn refine_extracted(store: &TelemetryStore, ids: &[&str], kind: &str, content: &str) -> (String, Option<String>) {
+        let mut run = store.refinement_prepare(None, false).unwrap();
+        let action_id = uuid::Uuid::new_v4().to_string();
+        let originals = ids.iter().map(|id| run.inventory.iter().find(|memory| memory.view.id == *id).unwrap().view.clone()).collect();
+        run.view.actions.push(crate::memory_refinement::RefinementAction {
+            id: action_id.clone(), kind: kind.into(), originals, content: content.into(),
+            memory_type: "fact".into(), durability: "short_term".into(), reason: "Reviewed fixture".into(),
+            evidence: vec!["Original source facts".into()], status: "pending".into(), message: None, recommended_source_id: None,
+        });
+        store.refinement_save(&run).unwrap();
+        let applied = store.refinement_apply(&run.view.id, vec![crate::memory_refinement::RefinementSelection {
+            action_id, content: None, domain_ids: None, conflict_source_id: None,
+        }]).unwrap();
+        assert_eq!(applied.view.actions[0].status, "applied");
+        let keeper = applied.changes[0].after.first().map(|memory| memory.view.id.clone());
+        (run.view.id, keeper)
     }
 
     /// (id, memory, origin_device) 全量清单：断言镜像状态的依据。
@@ -4034,6 +4064,163 @@ mod tests {
         run_sync(&b).expect("B 再同步：收敛后的聚合不应覆盖 B 的重分类");
         let b_tags = b.cloud_l1_domains("local-l1:state").unwrap();
         assert_eq!(b_tags[0].domain.id, target, "B 的重分类不应被 A 覆盖");
+    }
+
+    #[test]
+    fn refinement_replaces_same_local_ids_on_every_device_and_undo_converges() {
+        let server = fake_dav::Server::start();
+        let a = paired(&server.url);
+        let b = paired(&server.url);
+        let c = paired(&server.url);
+        for store in [&a, &b] {
+            add_extracted(store, "local-l1:shared-a", "Original fact A", "short_term");
+            add_extracted(store, "local-l1:shared-b", "Original fact B", "short_term");
+        }
+        assert!(run_sync(&a).unwrap().errors.is_empty());
+        assert!(run_sync(&b).unwrap().errors.is_empty());
+        let stale = b.exportable_extracted_l1_memories().unwrap();
+        let (run, keeper) = refine_extracted(&a, &["local-l1:shared-a", "local-l1:shared-b"], "merge", "Combined facts A and B");
+        let keeper = keeper.unwrap();
+        assert!(keeper.starts_with("local-l1:refined:"));
+        for store in [&a, &b, &c] { assert!(run_sync(store).unwrap().errors.is_empty()); }
+        for store in [&a, &b, &c] {
+            let rows = extracted_inventory(store);
+            assert_eq!(rows.len(), 1, "old locally-owned copies must be retired");
+            assert_eq!(rows[0].0, keeper);
+            assert_eq!(rows[0].1, "Combined facts A and B");
+            assert!(store.tombstoned_l1_ids().unwrap().contains("local-l1:shared-a"));
+            assert!(store.tombstoned_l1_ids().unwrap().contains("local-l1:shared-b"));
+        }
+        assert_eq!(c.sync_peer_extracted_l1("offline-old-device", &stale).unwrap(), (0, 0));
+        assert_eq!(extracted_inventory(&c).len(), 1);
+        a.refinement_undo(&run).unwrap();
+        for store in [&a, &b, &c] { assert!(run_sync(store).unwrap().errors.is_empty()); }
+        let expected: Vec<_> = extracted_inventory(&a).into_iter().map(|(id, text, _)| (id, text)).collect();
+        assert_eq!(expected.len(), 2);
+        assert!(expected.iter().all(|(id, _)| id.starts_with("local-l1:restored:")));
+        for store in [&a, &b, &c] {
+            assert_eq!(extracted_inventory(store).into_iter().map(|(id, text, _)| (id, text)).collect::<Vec<_>>(), expected);
+            assert!(store.tombstoned_l1_ids().unwrap().contains(&keeper));
+            assert!(run_sync(store).unwrap().errors.is_empty());
+            assert_eq!(extracted_inventory(store).len(), 2, "repeat sync must not duplicate restored facts");
+        }
+    }
+
+    #[test]
+    fn rewriting_a_peer_mirror_replaces_the_source_version_and_can_be_archived() {
+        let server = fake_dav::Server::start();
+        let a = paired(&server.url);
+        let b = paired(&server.url);
+        add_extracted(&a, "local-l1:source", "Original source fact", "short_term");
+        run_sync(&a).unwrap(); run_sync(&b).unwrap();
+        let (_, keeper) = refine_extracted(&b, &["local-l1:source"], "rewrite", "Reviewed source fact");
+        let keeper = keeper.unwrap();
+        assert!(run_sync(&b).unwrap().errors.is_empty());
+        assert!(run_sync(&a).unwrap().errors.is_empty());
+        assert_eq!(extracted_inventory(&a)[0].0, keeper);
+        assert_eq!(extracted_inventory(&a)[0].1, "Reviewed source fact");
+        b.delete_local_l1_memory(&keeper).unwrap();
+        assert!(run_sync(&b).unwrap().errors.is_empty());
+        assert!(run_sync(&a).unwrap().errors.is_empty());
+        assert!(extracted_inventory(&a).is_empty());
+        assert!(extracted_inventory(&b).is_empty());
+    }
+
+    #[test]
+    fn deleting_a_recognized_applied_group_removes_its_result_from_all_peers() {
+        let server = fake_dav::Server::start();
+        let a = paired(&server.url);
+        let b = paired(&server.url);
+        let c = paired(&server.url);
+        add_extracted(&a, "local-l1:delete-a", "Obsolete fact A", "short_term");
+        add_extracted(&a, "local-l1:delete-b", "Obsolete fact B", "short_term");
+        let (run, keeper) = refine_extracted(&a, &["local-l1:delete-a", "local-l1:delete-b"], "merge", "An obsolete combined fact");
+        let keeper = keeper.unwrap();
+        assert!(run_sync(&a).unwrap().errors.is_empty());
+        assert!(run_sync(&b).unwrap().errors.is_empty());
+        let stale_result = a.exportable_extracted_l1_memories().unwrap();
+        let action_id = a.refinement_load(&run).unwrap().view.actions[0].id.clone();
+        a.refinement_delete(&run, vec![crate::memory_refinement::RefinementDeleteSelection {
+            action_id, expected_status: "applied".into(),
+        }]).unwrap();
+        a.refinement_undo(&run).unwrap();
+        for store in [&a, &b, &c] {
+            assert!(run_sync(store).unwrap().errors.is_empty());
+            assert!(extracted_inventory(store).is_empty());
+            assert!(store.tombstoned_l1_ids().unwrap().contains(&keeper));
+            assert!(store.tombstoned_l1_ids().unwrap().contains("local-l1:delete-a"));
+            assert!(store.tombstoned_l1_ids().unwrap().contains("local-l1:delete-b"));
+        }
+        assert_eq!(c.sync_peer_extracted_l1("offline-source", &stale_result).unwrap(), (0, 0));
+        assert!(extracted_inventory(&c).is_empty());
+    }
+
+    #[test]
+    fn archived_local_copies_disappear_everywhere_and_restore_with_one_new_id() {
+        let server = fake_dav::Server::start();
+        let a = paired(&server.url);
+        let b = paired(&server.url);
+        for store in [&a, &b] { add_extracted(store, "local-l1:archive", "An archived fact", "short_term"); }
+        run_sync(&a).unwrap(); run_sync(&b).unwrap();
+        let (run, keeper) = refine_extracted(&a, &["local-l1:archive"], "archive", "An archived fact");
+        assert!(keeper.is_none());
+        assert!(run_sync(&a).unwrap().errors.is_empty());
+        assert!(run_sync(&b).unwrap().errors.is_empty());
+        assert!(extracted_inventory(&a).is_empty());
+        assert!(extracted_inventory(&b).is_empty());
+        a.refinement_undo(&run).unwrap();
+        assert!(run_sync(&a).unwrap().errors.is_empty());
+        assert!(run_sync(&b).unwrap().errors.is_empty());
+        let restored = extracted_inventory(&a);
+        assert_eq!(restored.len(), 1);
+        assert!(restored[0].0.starts_with("local-l1:restored:"));
+        assert_eq!(extracted_inventory(&b)[0].0, restored[0].0);
+        assert_eq!(extracted_inventory(&b)[0].1, "An archived fact");
+    }
+
+    #[test]
+    fn failed_refinement_upload_retains_the_local_version_until_retry() {
+        let server = fake_dav::Server::start();
+        let a = paired(&server.url);
+        let b = paired(&server.url);
+        add_extracted(&a, "local-l1:old", "Before refinement", "short_term");
+        run_sync(&a).unwrap(); run_sync(&b).unwrap();
+        let (_, keeper) = refine_extracted(&a, &["local-l1:old"], "rewrite", "After refinement");
+        let keeper = keeper.unwrap();
+        server.fail_puts();
+        let failed = run_sync(&a).unwrap();
+        assert!(!failed.errors.is_empty());
+        assert_eq!(failed.pushed, 0);
+        assert_eq!(extracted_inventory(&a)[0].0, keeper);
+        assert_eq!(extracted_inventory(&a)[0].1, "After refinement");
+        assert!(a.tombstoned_l1_ids().unwrap().contains("local-l1:old"));
+        server.allow_puts();
+        assert!(run_sync(&a).unwrap().errors.is_empty());
+        assert!(run_sync(&b).unwrap().errors.is_empty());
+        assert_eq!(extracted_inventory(&b).len(), 1);
+        assert_eq!(extracted_inventory(&b)[0].0, keeper);
+        assert_eq!(extracted_inventory(&b)[0].1, "After refinement");
+    }
+
+    #[test]
+    fn remote_deletions_are_applied_before_stale_aggregate_rows_can_land() {
+        let source = new_store();
+        let receiver = new_store();
+        add_extracted(&source, "local-l1:retired", "Stale cloud fact", "short_term");
+        let mut report = CloudSyncReport { pushed: 0, pulled: 0, skipped: 0, conflicts: 0, usage_imported: 0, errors: Vec::new() };
+        let (mut envelope, _) = build_envelope(&source, &VaultEnvelope::default(), &key(), "source-device", &mut report).unwrap();
+        envelope.tombstones.push(RemoteTombstone {
+            key: "l1-auto:local-l1:retired".into(), revision: envelope.revision + 1,
+            deleted_at: chrono::Utc::now().to_rfc3339(),
+        });
+        receiver.conn.lock().unwrap().execute_batch(
+            "CREATE TRIGGER reject_old_insert BEFORE INSERT ON local_memory_items WHEN NEW.id = 'local-l1:retired'
+             BEGIN SELECT RAISE(ABORT, 'retired row became active'); END;",
+        ).unwrap();
+        assert!(apply_remote_objects(&receiver, &envelope.objects, &envelope.tombstones, &key(), &mut report));
+        assert!(report.errors.is_empty());
+        assert!(extracted_inventory(&receiver).is_empty());
+        assert!(receiver.tombstoned_l1_ids().unwrap().contains("local-l1:retired"));
     }
 
     /// 对端删除（或重整理后聚合变短）通过整体替换传播：B 修剪掉不再
