@@ -4,8 +4,8 @@
 //!
 //! 两种传输形态：
 //!   - `server`：自建 REST 服务端，逐对象 CAS PUT（`If-Match` 修订号）。
-//!   - `webdav` / `s3`：整库打成一个加密信封文件（见 `vault_remote`），
-//!     一轮同步一次读 + 一次条件写，冲突仍在本地按对象裁决。
+//!   - `webdav` / `s3` / `baidu`：整库打成一个加密信封文件（见 `vault_remote`），
+//!     条件写回，冲突仍在本地按对象裁决。
 
 use aes_gcm::aead::{Aead, AeadCore, Key, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -21,7 +21,7 @@ use crate::vault_remote::{RemoteConfig, RemoteKind};
 
 const SETTING_URL: &str = "cloud_vault.url";
 const SETTING_PAT: &str = "cloud_vault.pat";
-/// 同步目标：`server` / `webdav` / `s3`。缺省按 `server` 处理，老配置无需改动。
+/// 同步目标：`server` / `webdav` / `s3` / `baidu`。缺省按 `server` 处理。
 const SETTING_KIND: &str = "cloud_vault.kind";
 /// WebDAV 用户名 / S3 Access Key ID。
 const SETTING_USER: &str = "cloud_vault.user";
@@ -152,7 +152,7 @@ pub struct CloudSyncReport {
 
 #[derive(Serialize)]
 pub struct CloudVaultSettingsView {
-    /// `server` / `webdav` / `s3`。
+    /// `server` / `webdav` / `s3` / `baidu`。
     pub kind: String,
     pub url: String,
     pub user: String,
@@ -325,50 +325,43 @@ struct VaultConfig {
 }
 
 fn vault_config(store: &TelemetryStore) -> Result<VaultConfig, String> {
-    let decrypt = |key: &str| -> String {
-        store
-            .app_setting_get::<String>(key)
-            .map(|value| crate::llm::decrypt_api_key(&value))
-            .unwrap_or_default()
+    // Take one snapshot. A scheduled run must not pair an old destination with
+    // credentials from settings saved by the UI between two separate reads.
+    let values = {
+        let conn = store.conn.lock().map_err(|_| "云端同步设置已锁定")?;
+        let mut stmt = conn.prepare_cached("SELECT setting_key, value_json FROM app_settings
+            WHERE setting_key IN (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)").map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(rusqlite::params![SETTING_KIND, SETTING_CRED_KIND, SETTING_URL,
+            SETTING_USER, SETTING_PAT, SETTING_ENDPOINT, SETTING_REGION, SETTING_PATH_STYLE,
+            SETTING_ENABLED, SETTING_PASSWORD, SETTING_SYNC_MODELS], |row| {
+                let raw: String = row.get(1)?;
+                Ok((row.get::<_, String>(0)?, serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_default()))
+            }).map_err(|e| e.to_string())?;
+        rows.collect::<Result<std::collections::HashMap<_, _>, _>>().map_err(|e| e.to_string())?
     };
-    let kind = RemoteKind::parse(
-        &store
-            .app_setting_get::<String>(SETTING_KIND)
-            .unwrap_or_default(),
-    );
-    // 老配置没有 cred_kind，那种情况下只可能是自建服务端。
-    let saved_for = store
-        .app_setting_get::<String>(SETTING_CRED_KIND)
-        .unwrap_or_default();
-    let saved_for = if saved_for.is_empty() {
-        RemoteKind::Server
+    let text = |key: &str| values.get(key).and_then(|v| v.as_str()).unwrap_or_default();
+    let flag = |key: &str| values.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    let kind = RemoteKind::parse(text(SETTING_KIND));
+    // Missing cred_kind in older installations means a self-hosted server.
+    let saved_for = RemoteKind::parse(text(SETTING_CRED_KIND));
+    let remote = if kind == RemoteKind::Baidu {
+        RemoteConfig { kind, ..Default::default() }
     } else {
-        RemoteKind::parse(&saved_for)
-    };
-    let credential = if saved_for == kind {
-        decrypt(SETTING_PAT)
-    } else {
-        String::new()
+        RemoteConfig {
+            kind,
+            url: text(SETTING_URL).into(),
+            user: crate::llm::decrypt_api_key(text(SETTING_USER)),
+            credential: if saved_for == kind { crate::llm::decrypt_api_key(text(SETTING_PAT)) } else { String::new() },
+            endpoint: text(SETTING_ENDPOINT).into(),
+            region: text(SETTING_REGION).into(),
+            path_style: flag(SETTING_PATH_STYLE),
+        }
     };
     Ok(VaultConfig {
-        remote: RemoteConfig {
-            kind,
-            url: store.app_setting_get::<String>(SETTING_URL).unwrap_or_default(),
-            user: decrypt(SETTING_USER),
-            credential,
-            endpoint: store
-                .app_setting_get::<String>(SETTING_ENDPOINT)
-                .unwrap_or_default(),
-            region: store
-                .app_setting_get::<String>(SETTING_REGION)
-                .unwrap_or_default(),
-            path_style: store
-                .app_setting_get::<bool>(SETTING_PATH_STYLE)
-                .unwrap_or(false),
-        },
-        enabled: store.app_setting_get::<bool>(SETTING_ENABLED).unwrap_or(false),
-        password: decrypt(SETTING_PASSWORD),
-        sync_models: store.app_setting_get::<bool>(SETTING_SYNC_MODELS).unwrap_or(false),
+        remote,
+        enabled: flag(SETTING_ENABLED),
+        password: crate::llm::decrypt_api_key(text(SETTING_PASSWORD)),
+        sync_models: flag(SETTING_SYNC_MODELS),
     })
 }
 
@@ -2481,7 +2474,7 @@ fn run_sync_envelope(
 ) -> Result<CloudSyncReport, String> {
     use crate::vault_remote::PutOutcome;
 
-    if config.remote.url.trim().is_empty() {
+    if config.remote.kind != RemoteKind::Baidu && config.remote.url.trim().is_empty() {
         return Err("云端记忆库未配置地址".into());
     }
     let remote = crate::vault_remote::open(&config.remote)?;
@@ -2588,7 +2581,7 @@ fn run_pull_envelope(
     store: &TelemetryStore,
     config: &VaultConfig,
 ) -> Result<CloudSyncReport, String> {
-    if config.remote.url.trim().is_empty() {
+    if config.remote.kind != RemoteKind::Baidu && config.remote.url.trim().is_empty() {
         return Err("云端记忆库未配置地址".into());
     }
     let remote = crate::vault_remote::open(&config.remote)?;
@@ -2669,68 +2662,57 @@ pub fn cloud_vault_save_settings(
     enabled: bool,
     sync_models: Option<bool>,
 ) -> Result<(), String> {
-    // 地址带 s3:// 前缀时自动判为 S3，与 Magpie 的做法一致。
-    let kind = match kind {
-        Some(value) if !value.trim().is_empty() => crate::vault_remote::RemoteKind::parse(&value),
-        _ => {
-            if url.trim().to_ascii_lowercase().starts_with("s3://") {
-                crate::vault_remote::RemoteKind::S3
-            } else {
-                crate::vault_remote::RemoteKind::Server
-            }
+    let kind = resolve_kind(kind, &url, RemoteKind::Server);
+    let stored = vault_config(&telemetry)?.remote;
+    let mut fields = vec![
+        (SETTING_KIND, serde_json::json!(kind.as_str())),
+        (SETTING_ENABLED, serde_json::json!(enabled)),
+        (SETTING_AUTO_INTERVAL_MIN, serde_json::json!(auto_interval_min.clamp(0, 1440))),
+    ];
+    if kind == RemoteKind::Baidu {
+        if enabled && !crate::baidu_gateway::setup()?.ready {
+            return Err("请先在本机完成百度网盘部署".into());
         }
-    };
-    let url = url.trim().trim_end_matches('/').to_string();
-    telemetry.app_setting_set(SETTING_KIND, &kind.as_str())?;
-    telemetry.app_setting_set(SETTING_URL, &url)?;
-    if let Some(user) = user {
-        let enc = if user.is_empty() {
-            String::new()
-        } else {
-            crate::llm::encrypt_api_key(&user)?
-        };
-        telemetry.app_setting_set(SETTING_USER, &enc)?;
+    } else {
+        let allow_reuse = same_destination(&stored, kind, &url, user.as_deref(), endpoint.as_deref());
+        if !allow_reuse && kind == stored.kind && !stored.credential.is_empty() && pat.is_none() {
+            return Err("地址或账号已更换，请重新填写该目标的访问凭据后保存".into());
+        }
+        let fallback = || (!allow_reuse).then(String::new);
+        fields.push((SETTING_URL, serde_json::json!(url.trim().trim_end_matches('/'))));
+        if let Some(value) = user.or_else(fallback) {
+            fields.push((SETTING_USER, serde_json::json!(crate::llm::encrypt_api_key(&value)?)));
+        }
+        if let Some(value) = pat.or_else(fallback) {
+            fields.push((SETTING_PAT, serde_json::json!(crate::llm::encrypt_api_key(&value)?)));
+            fields.push((SETTING_CRED_KIND, serde_json::json!(kind.as_str())));
+        }
+        if let Some(value) = endpoint.or_else(fallback) {
+            fields.push((SETTING_ENDPOINT, serde_json::json!(value.trim())));
+        }
+        if let Some(value) = region.or_else(fallback) {
+            fields.push((SETTING_REGION, serde_json::json!(value.trim())));
+        }
+        if let Some(value) = path_style.or_else(|| (!allow_reuse).then_some(false)) {
+            fields.push((SETTING_PATH_STYLE, serde_json::json!(value)));
+        }
     }
-    if let Some(pat) = pat {
-        let enc = if pat.is_empty() {
-            String::new()
-        } else {
-            crate::llm::encrypt_api_key(&pat)?
-        };
-        telemetry.app_setting_set(SETTING_PAT, &enc)?;
-        // 凭据归属当前目标：留空表示「没有凭据」，而不是「沿用别的目标的凭据」。
-        telemetry.app_setting_set(
-            SETTING_CRED_KIND,
-            &if pat.is_empty() {
-                String::new()
-            } else {
-                kind.as_str().to_string()
-            },
-        )?;
+    if let Some(value) = password {
+        fields.push((SETTING_PASSWORD, serde_json::json!(crate::llm::encrypt_api_key(&value)?)));
     }
-    if let Some(password) = password {
-        let enc = if password.is_empty() {
-            String::new()
-        } else {
-            crate::llm::encrypt_api_key(&password)?
-        };
-        telemetry.app_setting_set(SETTING_PASSWORD, &enc)?;
+    if let Some(value) = sync_models {
+        fields.push((SETTING_SYNC_MODELS, serde_json::json!(value)));
     }
-    if let Some(endpoint) = endpoint {
-        telemetry.app_setting_set(SETTING_ENDPOINT, &endpoint.trim().to_string())?;
+    // Publish the selected target and its credentials together to the scheduler.
+    let mut conn = telemetry.conn.lock().map_err(|_| "云端同步设置已锁定")?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let now = chrono::Utc::now().to_rfc3339();
+    for (key, value) in fields {
+        tx.execute("INSERT INTO app_settings(setting_key, value_json, updated_at) VALUES (?1, ?2, ?3)
+            ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+            rusqlite::params![key, value.to_string(), now]).map_err(|e| e.to_string())?;
     }
-    if let Some(region) = region {
-        telemetry.app_setting_set(SETTING_REGION, &region.trim().to_string())?;
-    }
-    if let Some(path_style) = path_style {
-        telemetry.app_setting_set(SETTING_PATH_STYLE, &path_style)?;
-    }
-    telemetry.app_setting_set(SETTING_AUTO_INTERVAL_MIN, &auto_interval_min.clamp(0, 1440))?;
-    telemetry.app_setting_set(SETTING_ENABLED, &enabled)?;
-    if let Some(sync_models) = sync_models {
-        telemetry.app_setting_set(SETTING_SYNC_MODELS, &sync_models)?;
-    }
-    Ok(())
+    tx.commit().map_err(|e| e.to_string())
 }
 
 /// 表单没给 kind 时按地址前缀推断：`s3://` 是 S3，其余沿用已保存的类型。
@@ -2745,6 +2727,15 @@ fn resolve_kind(kind: Option<String>, url: &str, fallback: RemoteKind) -> Remote
             }
         }
     }
+}
+
+// A blank password may only be reused for the same service, address and account.
+fn same_destination(stored: &RemoteConfig, kind: RemoteKind, url: &str, user: Option<&str>, endpoint: Option<&str>) -> bool {
+    kind == stored.kind && kind != RemoteKind::Baidu
+        && url.trim().trim_end_matches('/') == stored.url.trim().trim_end_matches('/')
+        && user.is_none_or(|v| v.trim() == stored.user.trim())
+        && (kind != RemoteKind::S3 || endpoint.is_none_or(|v|
+            v.trim().trim_end_matches('/') == stored.endpoint.trim().trim_end_matches('/')))
 }
 
 /// 表单里留空的字段沿用已保存的值，避免每次保存都要重填密码。
@@ -2774,9 +2765,21 @@ pub async fn cloud_vault_test_connection(
     path_style: Option<bool>,
 ) -> Result<String, String> {
     let stored = vault_config(&telemetry)?.remote;
+    let kind = resolve_kind(kind, &url, stored.kind);
+    if kind == RemoteKind::Baidu {
+        return tauri::async_runtime::spawn_blocking(move || {
+            crate::vault_remote::open(&RemoteConfig { kind, ..Default::default() })?.probe()
+        }).await.map_err(|e| e.to_string())?;
+    }
+    let url = if url.trim().is_empty() && stored.kind == kind { stored.url.clone() } else { url };
+    let stored = if same_destination(&stored, kind, &url, user.as_deref(), endpoint.as_deref()) {
+        stored
+    } else {
+        RemoteConfig::default()
+    };
     let config = RemoteConfig {
-        kind: resolve_kind(kind, &url, stored.kind),
-        url: merge_field(Some(url), stored.url.clone()),
+        kind,
+        url,
         user: merge_field(user, stored.user.clone()),
         credential: merge_field(pat, stored.credential.clone()),
         endpoint: merge_field(endpoint, stored.endpoint.clone()),
@@ -2998,9 +3001,12 @@ pub fn cloud_vault_status(
 ) -> Result<CloudVaultStatus, String> {
     let config = vault_config(&telemetry)?;
     let enabled = config.enabled;
-    let configured = !config.remote.url.trim().is_empty()
-        && !config.remote.credential.is_empty()
-        && !config.password.is_empty();
+    let target_ready = if config.remote.kind == RemoteKind::Baidu {
+        crate::baidu_gateway::setup()?.ready
+    } else {
+        !config.remote.url.trim().is_empty() && !config.remote.credential.is_empty()
+    };
+    let configured = target_ready && !config.password.is_empty();
     let dirty = telemetry
         .cloud_sync_meta_rows()?
         .iter()
@@ -3176,6 +3182,26 @@ mod tests {
                 .expect("保存凭据");
         }
         store
+    }
+
+    #[test]
+    fn baidu_uses_only_device_gateway_credentials() {
+        let store = paired("https://previous.example/dav");
+        store.app_setting_set(SETTING_KIND, &"baidu").unwrap();
+        let config = vault_config(&store).unwrap();
+        assert_eq!(config.remote.kind, RemoteKind::Baidu);
+        assert_eq!(config.remote.kind.as_str(), "baidu");
+        assert!(config.remote.url.is_empty() && config.remote.user.is_empty() && config.remote.credential.is_empty());
+        assert_eq!(config.password, SYNC_PASSWORD);
+    }
+
+    #[test]
+    fn probe_reuses_password_only_for_the_same_destination() {
+        let config = vault_config(&paired("https://drive.example/dav")).unwrap().remote;
+        assert!(same_destination(&config, RemoteKind::WebDav, "https://drive.example/dav/", None, None));
+        assert!(!same_destination(&config, RemoteKind::Baidu, &config.url, None, None));
+        assert!(!same_destination(&config, RemoteKind::WebDav, "https://other.example", None, None));
+        assert!(!same_destination(&config, RemoteKind::WebDav, &config.url, Some("other"), None));
     }
 
     fn open_remote(url: &str) -> Box<dyn crate::vault_remote::Remote> {

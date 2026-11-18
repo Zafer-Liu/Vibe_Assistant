@@ -65,13 +65,13 @@ export function UpdateChecker({ autoCheck = false, compact = false, sidebar = fa
     check(true)
   }, [autoCheck, check])
 
-  // window.open() is silently blocked inside the Tauri WebView (WebView2),
-  // so delegate to the shell plugin via a Rust command to use the system browser.
+  // Native activation can request a manual handoff to preserve existing browser windows.
   async function openUrl(url: string) {
     setOpenError('')
     if (!url) return
     try {
-      await invoke('open_external_url', { url })
+      const action = await invoke<'opened' | 'openManually'>('open_external_url', { url })
+      if (action === 'openManually') setOpenError(t('common.manualBrowserLink', { url }))
     } catch (e) {
       setOpenError(String(e))
     }
@@ -82,10 +82,12 @@ export function UpdateChecker({ autoCheck = false, compact = false, sidebar = fa
     openUrl(info?.download_url || info?.release_url || '')
   }
 
+  const openFeedback = openError && <p role="status" className="select-text break-all text-xs">{openError}</p>
+
   // ── Compact badge mode (used in sidebar / title area) ────────────────
   if (compact) {
     if (state === 'done' && info?.has_update) {
-      return (
+      return (<>
         <button
           onClick={openDownload}
           className="flex items-center gap-1 rounded-full bg-blue-100 px-2 py-0.5 text-[11px] font-medium text-blue-700 hover:bg-blue-200 dark:bg-blue-900/40 dark:text-blue-300 dark:hover:bg-blue-800/60"
@@ -94,7 +96,8 @@ export function UpdateChecker({ autoCheck = false, compact = false, sidebar = fa
           <ArrowUpCircle className="h-3 w-3" />
           {info.latest}
         </button>
-      )
+        {openFeedback}
+      </>)
     }
     return null
   }
@@ -126,6 +129,7 @@ export function UpdateChecker({ autoCheck = false, compact = false, sidebar = fa
         {state === 'error' && error && (
           <p className="text-xs font-bold text-red-500 dark:text-red-400">{error}</p>
         )}
+        {openFeedback}
       </div>
     )
   }
@@ -204,9 +208,7 @@ export function UpdateChecker({ autoCheck = false, compact = false, sidebar = fa
                 <Download className="h-3.5 w-3.5" />
                 {t('updater.downloadNow')}
               </button>
-              {openError && (
-                <p className="text-xs text-red-500 dark:text-red-400">{openError}</p>
-              )}
+              {openFeedback}
             </div>
           ) : (
             <div className="flex items-center gap-2">

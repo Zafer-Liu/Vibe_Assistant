@@ -1,7 +1,7 @@
 //! 云端记忆库的远端存储后端。
 //!
-//! 同步目标有三种，共用同一套「整库信封」语义（信封的加解密与合并
-//! 在 `cloud_sync` 里）：
+//! 文件型目标共用一套「整库信封」语义（加解密与合并在 `cloud_sync` 里）。
+//!   - `Baidu`：通过本机托管的 OpenList 读写百度网盘上的信封。
 //!   - `Server`：自建 REST 服务端，逐对象 CAS（`If-Match` 修订号）。
 //!   - `WebDAV`：`{地址}/{目录}/{文件}`，Basic 认证，`If-Match: ETag` 条件写。
 //!   - `S3`：`s3://{bucket}/{前缀}/{文件}`，AWS Signature V4 签名。
@@ -31,6 +31,8 @@ pub enum RemoteKind {
     WebDav,
     /// S3 兼容对象存储（AWS / R2 / COS / OSS / MinIO）。
     S3,
+    /// 百度网盘。每台设备独立授权，本机 OpenList 提供 WebDAV。
+    Baidu,
 }
 
 impl RemoteKind {
@@ -38,6 +40,7 @@ impl RemoteKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "webdav" => RemoteKind::WebDav,
             "s3" => RemoteKind::S3,
+            "baidu" => RemoteKind::Baidu,
             _ => RemoteKind::Server,
         }
     }
@@ -47,6 +50,7 @@ impl RemoteKind {
             RemoteKind::Server => "server",
             RemoteKind::WebDav => "webdav",
             RemoteKind::S3 => "s3",
+            RemoteKind::Baidu => "baidu",
         }
     }
 
@@ -55,6 +59,7 @@ impl RemoteKind {
             RemoteKind::Server => "自建服务端",
             RemoteKind::WebDav => "WebDAV",
             RemoteKind::S3 => "S3",
+            RemoteKind::Baidu => "百度网盘",
         }
     }
 }
@@ -106,6 +111,7 @@ pub fn open(config: &RemoteConfig) -> Result<Box<dyn Remote>, String> {
     match config.kind {
         RemoteKind::Server => Err("自建服务端模式不走文件信封".into()),
         RemoteKind::WebDav => Ok(Box::new(WebDav::new(config)?)),
+        RemoteKind::Baidu => Ok(Box::new(WebDav::from_gateway(crate::baidu_gateway::connect()?)?)),
         RemoteKind::S3 => Ok(Box::new(S3::new(config)?)),
     }
 }
@@ -182,14 +188,45 @@ fn normalize_etag(raw: &str) -> String {
 
 // ---------- WebDAV ----------
 
+// OpenList's DAV preconditions use its DAV:getetag property. A proxied Baidu
+// download can instead carry the origin's own ETag (or none at all).
+fn dav_property_etag(xml: &str) -> Option<String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    loop {
+        match reader.read_event().ok()? {
+            Event::Start(tag) if tag.local_name().as_ref() == b"getetag" => {
+                let text = reader.read_text(tag.name()).ok()?;
+                let decoded = quick_xml::escape::unescape(&text).ok()?;
+                let etag = decoded.trim();
+                let value = etag.strip_prefix('"')?.strip_suffix('"')?;
+                return (!value.is_empty() && value.bytes().all(|b| b == b'!' || (b'#'..=b'~').contains(&b)))
+                    .then(|| etag.to_owned());
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+}
+
 pub struct WebDav {
     base: String,
     user: String,
-    pass: String,
+    pass: zeroize::Zeroizing<String>,
     client: reqwest::blocking::Client,
+    gateway_lease: Option<std::sync::MutexGuard<'static, ()>>,
 }
 
 impl WebDav {
+    pub(super) fn from_gateway(session: crate::baidu_gateway::Session) -> Result<Self, String> {
+        let client = reqwest::blocking::Client::builder().no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT).timeout(TRANSFER_TIMEOUT)
+            .build().map_err(|_| "创建百度网盘本机连接失败")?;
+        Ok(Self { base: session.url, user: "admin".into(), pass: session.password,
+            client, gateway_lease: Some(session.lease) })
+    }
+
     fn new(config: &RemoteConfig) -> Result<Self, String> {
         let url = config.normalized_url();
         if !url.starts_with("http://") && !url.starts_with("https://") {
@@ -206,13 +243,30 @@ impl WebDav {
         Ok(Self {
             base: url,
             user: config.user.clone(),
-            pass: config.credential.clone(),
+            pass: zeroize::Zeroizing::new(config.credential.clone()),
             client: client()?,
+            gateway_lease: None,
         })
     }
 
     fn file_url(&self) -> String {
         format!("{}/{}/{}", self.base, VAULT_FOLDER, VAULT_FILE)
+    }
+
+    fn gateway_version(&self) -> Result<Option<String>, String> {
+        use std::io::Read;
+        let body = br#"<D:propfind xmlns:D="DAV:"><D:prop><D:getetag/></D:prop></D:propfind>"#;
+        let resp = self.send(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &self.file_url(),
+            body.to_vec(), vec![("Depth", "0".into()), ("Content-Type", "application/xml".into())])?;
+        match resp.status().as_u16() {
+            404 | 410 => Ok(None),
+            207 => {
+                let mut xml = String::new();
+                resp.take(64 * 1024).read_to_string(&mut xml).map_err(|_| "读取百度网盘文件版本失败")?;
+                dav_property_etag(&xml).map(Some).ok_or_else(|| "百度网盘未返回可用于同步的文件版本".into())
+            }
+            status => Err(format!("读取百度网盘文件版本失败（HTTP {status}）")),
+        }
     }
 
     fn folder_url(&self) -> String {
@@ -232,7 +286,7 @@ impl WebDav {
             .client
             .request(method.clone(), url)
             .timeout(request_timeout(&method))
-            .basic_auth(&self.user, Some(&self.pass));
+            .basic_auth(&self.user, Some(self.pass.as_str()));
         for (name, value) in headers {
             req = req.header(name, value);
         }
@@ -241,6 +295,7 @@ impl WebDav {
             .send()
             .map_err(|error| request_error("WebDAV", method.as_str(), body_bytes, started.elapsed(), error))?;
         match resp.status().as_u16() {
+            401 if self.gateway_lease.is_some() => Err("本机 OpenList 拒绝了网关凭据，请修复百度网盘部署".into()),
             401 => Err(
                 "WebDAV 服务端拒绝了这个用户名或密码（HTTP 401）：坚果云请填「应用密码」而不是登录密码"
                     .into(),
@@ -307,10 +362,18 @@ impl WebDav {
 
 impl Remote for WebDav {
     fn kind(&self) -> RemoteKind {
-        RemoteKind::WebDav
+        if self.gateway_lease.is_some() { RemoteKind::Baidu } else { RemoteKind::WebDav }
     }
 
     fn get(&self) -> Result<Option<(Vec<u8>, Option<String>)>, String> {
+        let gateway_version = if self.gateway_lease.is_some() {
+            match self.gateway_version()? {
+                Some(tag) => Some(tag),
+                None => return Ok(None),
+            }
+        } else {
+            None
+        };
         let resp = self.send(reqwest::Method::GET, &self.file_url(), Vec::new(), Vec::new())?;
         let status = resp.status().as_u16();
         // 404 / 409 / 410：还没有信封。坚果云对空目录里的读回 409。
@@ -326,7 +389,7 @@ impl Remote for WebDav {
         if status != 200 {
             return Err(format!("读取 WebDAV 信封失败：HTTP {status}"));
         }
-        let etag = etag_of(&resp);
+        let etag = gateway_version.or_else(|| etag_of(&resp));
         let started = std::time::Instant::now();
         let bytes = resp
             .bytes()
@@ -346,6 +409,10 @@ impl Remote for WebDav {
             // 原样回传：见 etag_of 的注释（坚果云不接受加引号的形式）。
             headers.push(("If-Match", tag.to_string()));
             true
+        } else if self.gateway_lease.is_some() {
+            // A concurrent first upload must not become an unconditional overwrite.
+            headers.push(("If-None-Match", "*".to_string()));
+            true
         } else {
             // 没有版本凭据时先看一眼远端有没有：有且它不给 ETag → 无条件覆盖；
             // 没有 → 用 If-None-Match: * 创建，避免打翻别人刚建好的库。
@@ -357,7 +424,10 @@ impl Remote for WebDav {
                 Ok(true) => false,
             }
         };
-        let mut made_dir = false;
+        let mut made_dir = self.gateway_lease.is_some() && etag.is_none();
+        if made_dir {
+            self.mkcol()?;
+        }
         let mut checked = false;
         loop {
             let resp = self.send(
@@ -416,6 +486,15 @@ impl Remote for WebDav {
     }
 
     fn probe(&self) -> Result<String, String> {
+        if self.gateway_lease.is_some() {
+            // A settings check must not spend another vault-sized download.
+            let resp = self.send(reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+                &self.base, Vec::new(), vec![("Depth", "0".into())])?;
+            return match resp.status().as_u16() {
+                200 | 207 => Ok("百度网盘的 VibeAssistant 目录可访问".into()),
+                status => Err(format!("百度网盘目录探测失败（HTTP {status}），请检查授权或重新部署")),
+            };
+        }
         match self.get()? {
             Some((bytes, _)) => Ok(format!(
                 "WebDAV 连接正常：已有信封 {} 字节",
@@ -775,6 +854,14 @@ impl Remote for S3 {
 mod tests {
     use super::*;
     use crate::test_http::fake_dav;
+
+    #[test]
+    fn openlist_uses_the_dav_version_for_conditional_writes() {
+        let properties = "<D:prop xmlns:D='DAV:'><D:getetag>&#34;drive-md5&#34;</D:getetag></D:prop>";
+        assert_eq!(dav_property_etag(properties).as_deref(), Some("\"drive-md5\""));
+        assert_eq!(dav_property_etag("<getetag>*</getetag>"), None);
+        assert_eq!(dav_property_etag("<prop/>"), None);
+    }
 
     /// AWS 官方文档的 SigV4 测试向量（GET Object，含 range 头）。
     /// 签名算法必须逐字节对上，否则所有 S3 兼容服务都会返回 403。

@@ -267,10 +267,11 @@ Aggregates real input / output / cache usage from local transcripts across Agent
 
 ### ☁️ Cloud Memory Vault (optional)
 
-Sync published L2/L3 documents (with their source provenance), custom memories, and usage stats across machines — one brain everywhere. On WebDAV/S3 targets, **all extracted L1 memories — including session-scoped ones — sync as per-device read-only mirrors**: each machine writes only its own aggregate, deletions and re-organization propagate along, receiver-side retagging and pin/recall decisions merge back across devices, and the original scope labels are preserved.
+Sync published L2/L3 documents (with their source provenance), custom memories, and usage stats across machines — one brain everywhere. On WebDAV, S3 and Baidu Netdisk targets, **all extracted L1 memories — including session-scoped ones — sync as per-device read-only mirrors**: each machine writes only its own aggregate, deletions and re-organization propagate along, receiver-side retagging and pin/recall decisions merge back across devices, and the original scope labels are preserved.
 
 - **AES-256-GCM end-to-end encryption**: keys derived from your sync password, never stored; the server only ever sees ciphertext
 - CAS conflict detection, incremental pulls, tombstone deletions; local SQLite stays authoritative, offline sync failures never block injection
+- **Baidu Netdisk** is available alongside the self-hosted, WebDAV and S3 targets. In Settings → Cloud Memory Vault, select Baidu Netdisk, authorize it, paste the refresh token and choose **Deploy in one click**. Select a private tools folder for OpenList, then save settings. Authorize the same account on each device and sync them in turn using the same sync password. The encrypted file is `/VibeAssistant/agent-manager/vault.amv`.
 - Single-file self-hostable server, open source in [`vault/`](vault/README.md) — Docker / Railway / Orange Pi + Tailscale
 
 ---

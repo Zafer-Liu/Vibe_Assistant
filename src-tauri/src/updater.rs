@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+#[cfg(not(windows))]
 use tauri_plugin_shell::ShellExt;
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -118,21 +119,111 @@ pub async fn check_for_update() -> Result<VersionInfo, String> {
     })
 }
 
-/// Open a URL with the system default browser.
-/// `window.open()` inside the WebView is silently blocked by WebView2, so the
-/// frontend calls this command instead.
-// shell::open is deprecated in favor of tauri-plugin-opener; we stay on the
-// already-registered shell plugin to avoid a new dependency for one call.
-// Called from Rust (no scope), it skips JS-side scope validation entirely.
-#[allow(deprecated)]
-#[tauri::command]
-pub async fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
-    if !url.starts_with("https://") && !url.starts_with("http://") {
-        return Err(format!("Refusing to open non-http(s) URL: {url}"));
+fn external_web_url(raw: &str) -> Result<reqwest::Url, String> {
+    const INVALID: &str = "Expected an absolute HTTP or HTTPS URL";
+    if !(raw.starts_with("https://") || raw.starts_with("http://"))
+        || raw.chars().any(|c| c.is_control() || c == '\\')
+    {
+        return Err(INVALID.into());
     }
+    let url = reqwest::Url::parse(raw).map_err(|_| INVALID)?;
+    if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
+        return Err(INVALID.into());
+    }
+    Ok(url)
+}
+
+/// Hand the web URL to Windows' protocol activation service from the foreground
+/// WebView's UI thread. Await acknowledgement without blocking its message loop.
+#[cfg(windows)]
+async fn launch_web_url(app: tauri::AppHandle, url: reqwest::Url) -> Result<(), String> {
+    use windows::{core::HSTRING, Foundation::Uri, System::Launcher};
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.run_on_main_thread(move || {
+        let pending = Uri::CreateUri(&HSTRING::from(url.as_str()))
+            .and_then(|uri| Launcher::LaunchUriAsync(&uri));
+        let _ = tx.send(pending);
+    })
+    .map_err(|_| "Browser activation could not be scheduled")?;
+    let activation_error = |e: windows::core::Error| {
+        format!(
+            "Windows browser activation failed (0x{:08X})",
+            e.code().0 as u32
+        )
+    };
+    let pending = rx
+        .await
+        .map_err(|_| "Browser activation was interrupted")?
+        .map_err(activation_error)?;
+    if pending.await.map_err(activation_error)? {
+        Ok(())
+    } else {
+        Err("Windows did not accept the web link; open it in your browser".into())
+    }
+}
+
+#[cfg(not(windows))]
+#[allow(deprecated)]
+async fn launch_web_url(app: tauri::AppHandle, url: reqwest::Url) -> Result<(), String> {
     app.shell()
-        .open(url, None)
+        .open(url.as_str(), None)
         .map_err(|e| format!("Failed to open URL: {e}"))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WebLinkAction {
+    Opened,
+    #[cfg(windows)]
+    OpenManually,
+}
+
+#[tauri::command]
+pub async fn open_external_url(
+    app: tauri::AppHandle,
+    url: String,
+) -> Result<WebLinkAction, String> {
+    let url = external_web_url(&url)?;
+    #[cfg(windows)]
+    {
+        let scheme = url.scheme().to_owned();
+        let safe = tauri::async_runtime::spawn_blocking(move || {
+            crate::windows_browser::can_activate(&scheme)
+        })
+        .await
+        .unwrap_or(false);
+        if !safe {
+            return Ok(WebLinkAction::OpenManually);
+        }
+    }
+    launch_web_url(app, url).await?;
+    Ok(WebLinkAction::Opened)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::external_web_url;
+
+    #[test]
+    fn browser_activation_accepts_web_links_only() {
+        for valid in [
+            "https://api.oplist.org/",
+            "https://github.com/a/b?x=1&y=2#asset",
+            "http://127.0.0.1:8000/",
+        ] {
+            assert_eq!(external_web_url(valid).unwrap().as_str(), valid);
+        }
+        for invalid in [
+            "file:///C:/",
+            "ms-settings:defaultapps",
+            "https://",
+            "https://user:secret@example.com/",
+            "https://example.com/\0",
+            "https://example.com/\\path",
+        ] {
+            assert!(external_web_url(invalid).is_err());
+        }
+    }
 }
 
 /// Return just the current app version (useful for the About panel without a network call).

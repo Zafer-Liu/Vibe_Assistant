@@ -7,6 +7,7 @@ import { WindowBehaviorSettings } from '../features/desktop/WindowBehaviorSettin
 import { LlmSettings } from './LlmSettings'
 import { SemanticSearchSettings } from '../features/memory/SemanticSearchSettings'
 import { ErrorRecovery } from '../components/ErrorRecovery'
+import { BaiduVaultSetup } from '../components/BaiduVaultSetup'
 
 export type SettingsSection = 'general' | 'llm' | 'memory' | 'cloud'
 
@@ -303,8 +304,7 @@ function Card({ children }: { children: ReactNode }) {
   )
 }
 
-/** `server` | `webdav` | `s3`：决定下面显示哪些字段。 */
-type VaultKind = 'server' | 'webdav' | 's3'
+type VaultKind = 'server' | 'webdav' | 's3' | 'baidu'
 
 interface VaultSettingsView {
   kind: VaultKind
@@ -342,6 +342,8 @@ function CloudVaultSettings() {
   const [region, setRegion] = useState('')
   const [pathStyle, setPathStyle] = useState(false)
   const [status, setStatus] = useState<VaultStatus>({ kind: 'idle' })
+  const [baiduReady, setBaiduReady] = useState(false)
+  const [deploying, setDeploying] = useState(false)
   const [loaded, setLoaded] = useState(false)
   /** 切换目标清空了已填字段，提示用户重填，填了地址就自动消失。 */
   const [refill, setRefill] = useState(false)
@@ -369,6 +371,9 @@ function CloudVaultSettings() {
 
   const isS3 = kind === 's3'
   const isWebdav = kind === 'webdav'
+  const isBaidu = kind === 'baidu'
+  const busy = deploying || status.kind === 'working'
+  const actionsDisabled = busy || (isBaidu && !baiduReady)
   const urlLabel = isS3
     ? t('settings.cloudVault.urlS3')
     : isWebdav
@@ -395,7 +400,7 @@ function CloudVaultSettings() {
         url,
         user: user || null,
         pat: pat || null,
-        endpoint: endpoint || null,
+        endpoint: isS3 ? endpoint : null,
         region: region || null,
         pathStyle,
       })
@@ -414,7 +419,7 @@ function CloudVaultSettings() {
 
   const handleSave = async () => {
     // url 在后端是非 Option 的 String，留空保存会把已存地址覆盖成空串，库就变成「未配置」。
-    if (!url.trim()) {
+    if (!isBaidu && !url.trim()) {
       setStatus({ kind: 'error', label: t('settings.cloudVault.needUrl') })
       return
     }
@@ -426,7 +431,7 @@ function CloudVaultSettings() {
         user: user || null,
         pat: pat || null,
         password: password || null,
-        endpoint: endpoint || null,
+        endpoint: isS3 ? endpoint : null,
         region: region || null,
         pathStyle,
         autoIntervalMin: autoInterval,
@@ -454,20 +459,25 @@ function CloudVaultSettings() {
         <label className="text-xs font-medium text-gray-600 dark:text-gray-300">
           {t('settings.cloudVault.target')}
         </label>
-        <div className="flex gap-1 rounded-lg bg-gray-100 p-1 dark:bg-gray-800">
+        <div className="grid grid-cols-2 gap-1 rounded-lg bg-gray-100 p-1 sm:grid-cols-4 dark:bg-gray-800">
           {(
             [
               ['server', t('settings.cloudVault.kindServer')],
               ['webdav', t('settings.cloudVault.kindWebdav')],
               ['s3', t('settings.cloudVault.kindS3')],
+              ['baidu', t('settings.cloudVault.kindBaidu')],
             ] as [VaultKind, string][]
           ).map(([value, label]) => (
             <button
               key={value}
               type="button"
+              aria-pressed={kind === value}
+              disabled={busy}
               onClick={() => {
                 if (value === kind) return
                 setKind(value)
+                setBaiduReady(false)
+                setStatus({ kind: 'idle' })
                 // 换目标就换语义：server 的 http://192.168.x.x:8787 落到 S3::new 里只会报
                 // 一句莫名其妙的地址错误，WebDAV 用户名也不是 Access Key ID。留空让用户重填，
                 // 免得旧目标的脏值被静默提交给后端。
@@ -499,12 +509,13 @@ function CloudVaultSettings() {
         {isS3 && (
           <p className="text-xs text-gray-500 dark:text-gray-400">{t('settings.cloudVault.s3Hint')}</p>
         )}
-        {refill && !url.trim() && (
+        {refill && !isBaidu && !url.trim() && (
           <p className="text-xs text-amber-600 dark:text-amber-400">
             {t('settings.cloudVault.refillHint')}
           </p>
         )}
       </div>
+      {isBaidu ? <BaiduVaultSetup onReady={setBaiduReady} onBusy={setDeploying} /> : <>
       <div className="space-y-1.5">
         <label className="text-xs font-medium text-gray-600 dark:text-gray-300">{urlLabel}</label>
         <input
@@ -584,6 +595,7 @@ function CloudVaultSettings() {
           </label>
         </>
       )}
+      </>}
       <div className="space-y-1.5">
         <label className="text-xs font-medium text-gray-600 dark:text-gray-300">
           {t('settings.cloudVault.password')}
@@ -646,6 +658,7 @@ function CloudVaultSettings() {
       <div className="flex flex-wrap gap-2">
         <button
           onClick={handleTest}
+          disabled={actionsDisabled}
           className="inline-flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:opacity-40 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-800"
         >
           {status.kind === 'working' ? <Loader2 size={14} className="animate-spin" /> : <Cloud size={14} />}
@@ -653,7 +666,8 @@ function CloudVaultSettings() {
         </button>
         <button
           onClick={handleSave}
-          className="inline-flex items-center gap-1.5 rounded-lg bg-cyan-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-cyan-500"
+          disabled={busy || (isBaidu && enabled && !baiduReady)}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-cyan-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-cyan-500 disabled:opacity-40"
         >
           {t('settings.cloudVault.save')}
         </button>
@@ -669,7 +683,7 @@ function CloudVaultSettings() {
           <AlertCircle size={14} className="mt-0.5 shrink-0" />
           <div className="min-w-0 flex-1">
             <p className="break-all">{status.label}</p>
-            <ErrorRecovery error={status.label} onRetry={() => { void handleTest() }} />
+            <ErrorRecovery disabled={actionsDisabled} onRetry={() => { void handleTest() }} />
           </div>
         </div>
       )}

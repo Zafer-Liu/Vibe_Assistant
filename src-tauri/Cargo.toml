@@ -47,6 +47,7 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs-next = "2"
 reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
+quick-xml = "0.39"
 futures-util = "0.3"
 aes-gcm = "0.10"
 sha2 = "0.10"
@@ -63,6 +64,9 @@ tempfile = "3"
 sysinfo = "0.37.2"
 
 [target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Foundation", "System", "Win32_UI_Shell"] }
+# The windows crate leaves the IntoFuture implementation for WinRT operations opt-in.
+windows-future = { version = "0.2", features = ["std"] }
 winreg = "0.55"
 windows-sys = { version = "0.60", features = [
   "Win32_UI_WindowsAndMessaging",

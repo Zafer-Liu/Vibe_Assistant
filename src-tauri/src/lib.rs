@@ -2,6 +2,9 @@ mod agent_cli;
 mod agent_http;
 mod agent_sources;
 mod backup;
+mod baidu_gateway;
+mod openlist_baidu;
+mod openlist_runtime;
 pub mod cloud_sync;
 mod env_manager;
 mod desktop_lifecycle;
@@ -49,6 +52,8 @@ mod test_http;
 mod thinking;
 mod updater;
 mod vault_remote;
+#[cfg(windows)]
+mod windows_browser;
 
 use llm::*;
 use mcp::*;
@@ -387,6 +392,8 @@ pub fn run() {
             backup::config_export,
             backup::config_import,
             // Cloud Memory Vault
+            baidu_gateway::cloud_vault_baidu_setup,
+            baidu_gateway::cloud_vault_baidu_deploy,
             cloud_sync::cloud_vault_get_settings,
             cloud_sync::cloud_vault_save_settings,
             cloud_sync::cloud_vault_test_connection,
@@ -417,6 +424,7 @@ pub fn run() {
             if matches!(event, tauri::RunEvent::Exit) {
                 // Hiding the window keeps collection and schedulers alive.
                 // Every real exit (including tray Quit) stops only owned children.
+                openlist_runtime::stop();
                 app.state::<memory_backend::MemoryBackend>().stop();
             }
         });
