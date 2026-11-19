@@ -1137,7 +1137,6 @@ const zh = {
     injectDisconnected: '未连接客户端',
     injectChecking: '检测中',
     overviewTokenUsage: 'Token 用量',
-    overviewOrganized: '已整理对话',
     overviewPending: '待提取记忆',
     overviewInjection: '记忆注入',
     overviewCapture: '记忆采集',

@@ -1139,7 +1139,6 @@ const en: TranslationSchema = {
     injectDisconnected: 'No client connected',
     injectChecking: 'Checking',
     overviewTokenUsage: 'Token usage',
-    overviewOrganized: 'Organized conversations',
     overviewPending: 'Pending memories',
     overviewInjection: 'Injection',
     overviewCapture: 'Capture',

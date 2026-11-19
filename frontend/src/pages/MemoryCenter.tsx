@@ -556,6 +556,15 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
   const overviewCardClass = 'group rounded-lg border border-gray-200 bg-white px-4 py-3 text-left transition hover:border-violet-300 hover:bg-violet-50/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:border-gray-700 dark:bg-gray-800 dark:hover:border-violet-500/60 dark:hover:bg-violet-500/10'
   const overviewLabelClass = 'text-xs text-gray-500'
   const overviewValueClass = 'mt-2 text-xl font-semibold leading-tight text-gray-800 dark:text-gray-100'
+  const organizedOverviewCard = (
+    <button key="organized" type="button" onClick={onOpenOrganized} className={overviewCardClass}>
+      <div className="flex items-center justify-between gap-2">
+        <p className={overviewLabelClass}>{t('memory.organized.title')}</p>
+        <ChevronRight size={14} className="text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-violet-500 dark:text-gray-400 dark:group-hover:text-violet-300" />
+      </div>
+      <p className={`${overviewValueClass} tabular-nums`}>{memoryCacheReady ? memories.length : '—'}</p>
+    </button>
+  )
 
   // 实时运行状态：优先展示活跃会话所属的 Agent / 来源；无法识别时回退为纯会话数。
   const activeSourceNames = (telemetryLiveStatus?.active_sources ?? []).map(sourceLabel)
@@ -613,9 +622,7 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
           <button type="button" onClick={onOpenUsage} className={overviewCardClass}>
             <div className="flex items-center justify-between gap-2"><p className={overviewLabelClass}>{t('memory.overviewTokenUsage')}</p><ChevronRight size={14} className="text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-violet-500 dark:text-gray-400 dark:group-hover:text-violet-300" /></div><p className={`${overviewValueClass} tabular-nums`} title={telemetrySummary.total_tokens.toLocaleString()}>{compactTokenCount(telemetrySummary.total_tokens)}</p>
           </button>
-          <button type="button" onClick={onOpenOrganized} className={overviewCardClass}>
-            <div className="flex items-center justify-between gap-2"><p className={overviewLabelClass}>{t('memory.overviewOrganized')}</p><ChevronRight size={14} className="text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-violet-500 dark:text-gray-400 dark:group-hover:text-violet-300" /></div><p className={`${overviewValueClass} tabular-nums`}>{telemetryLiveStatus?.organized_memory_conversations ?? 0}</p>
-          </button>
+          {organizedOverviewCard}
           <button type="button" onClick={onOpenPending} className={overviewCardClass}>
             <div className="flex items-center justify-between gap-2"><p className={overviewLabelClass}>{t('memory.overviewPending')}</p><ChevronRight size={14} className="text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-violet-500 dark:text-gray-400 dark:group-hover:text-violet-300" /></div><p className={`${overviewValueClass} tabular-nums`}>{(telemetryLiveStatus?.pending_memory_sessions ?? 0) + (telemetryLiveStatus?.retrying_memory_sessions ?? 0) + (telemetryLiveStatus?.failed_memory_sessions ?? 0)}</p>
           </button>
@@ -629,9 +636,15 @@ export const MemoryCenter = memo(function MemoryCenter({ onOpenUsage, onOpenGrap
       )}
       {!telemetrySummary && (
         <section className="grid grid-cols-2 lg:grid-cols-5 gap-3" aria-live="polite">
-          {[t('memory.overviewTokenUsage'), t('memory.overviewOrganized'), t('memory.overviewPending'), t('memory.overviewCapture'), t('memory.overviewInjection')].map((label) => {
-            const handler = label === t('memory.overviewTokenUsage') ? onOpenUsage : label === t('memory.overviewPending') ? onOpenPending : label === t('memory.overviewOrganized') ? onOpenOrganized : label === t('memory.overviewCapture') ? onOpenCapture : onOpenInjection
-            return <button key={label} type="button" onClick={handler} className={overviewCardClass}><div className="flex items-center justify-between gap-2"><p className={overviewLabelClass}>{label}</p><ChevronRight size={14} className="text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-violet-500 dark:text-gray-400 dark:group-hover:text-violet-300" /></div><p className="mt-2 inline-flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400"><Loader2 className="animate-spin motion-reduce:animate-none" size={13} />{t('memory.overviewLoading')}</p></button>
+          {([
+            ['memory.overviewTokenUsage', onOpenUsage],
+            ['memory.organized.title', onOpenOrganized],
+            ['memory.overviewPending', onOpenPending],
+            ['memory.overviewCapture', onOpenCapture],
+            ['memory.overviewInjection', onOpenInjection],
+          ] as const).map(([labelKey, handler]) => {
+            if (labelKey === 'memory.organized.title') return organizedOverviewCard
+            return <button key={labelKey} type="button" onClick={handler} className={overviewCardClass}><div className="flex items-center justify-between gap-2"><p className={overviewLabelClass}>{t(labelKey)}</p><ChevronRight size={14} className="text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-violet-500 dark:text-gray-400 dark:group-hover:text-violet-300" /></div><p className="mt-2 inline-flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400"><Loader2 className="animate-spin motion-reduce:animate-none" size={13} />{t('memory.overviewLoading')}</p></button>
           })}
         </section>
       )}
